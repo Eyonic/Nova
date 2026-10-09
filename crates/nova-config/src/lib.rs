@@ -383,6 +383,15 @@ pub struct OptimizeConfig {
     pub scan_interval_secs: u64,
     /// Warn about sources larger than this after optimization.
     pub budget_bytes: Option<ByteSize>,
+    /// Script Optimizer: precompress text assets (JS, CSS, SVG, JSON, ...)
+    /// in the background and serve the stored encodings.
+    pub scripts: bool,
+    /// Minify JavaScript and CSS (conservatively, validated) before compressing.
+    pub minify: bool,
+    /// Text files larger than this are left to on-the-fly compression.
+    pub text_max_bytes: ByteSize,
+    /// React to file changes immediately (inotify) instead of only polling.
+    pub watch: bool,
 }
 
 impl Default for OptimizeConfig {
@@ -397,6 +406,10 @@ impl Default for OptimizeConfig {
             max_pixels: 50_000_000,
             scan_interval_secs: 30,
             budget_bytes: None,
+            scripts: true,
+            minify: true,
+            text_max_bytes: ByteSize(8 << 20),
+            watch: true,
         }
     }
 }

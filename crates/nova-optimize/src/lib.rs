@@ -4,14 +4,20 @@
 //! Transform → Validate → Publish (atomic manifest swap) → Serve
 //! ([`Optimizer::select`]). Work happens in the background; requests are
 //! never blocked on encoding. Until a variant exists the original is served.
+//!
+//! The same loop drives the Script Optimizer ([`text`]): JS/CSS
+//! minification and precompression of text assets, with its own manifest
+//! per site. Unreferenced objects are garbage-collected, and file changes
+//! trigger a rescan right away (inotify) in addition to periodic polling.
 
 pub mod manifest;
 pub mod negotiate;
+pub mod text;
 pub mod transform;
 
 use manifest::{Asset, AssetError, Format, Manifest, Source, Variant};
 use nova_config::OptimizeConfig;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,6 +32,8 @@ const PIPELINE_REVISION: u32 = 1;
 pub struct SiteSource {
     pub name: String,
     pub root: PathBuf,
+    /// Project directory, searched for references in the script report.
+    pub project: PathBuf,
 }
 
 /// A representation chosen for a request.
@@ -43,6 +51,8 @@ pub struct ScanStats {
     pub processed: usize,
     pub failed: usize,
     pub variants_written: usize,
+    /// Text assets (re)processed by the Script Optimizer.
+    pub text_processed: usize,
 }
 
 pub struct Optimizer {
@@ -52,7 +62,27 @@ pub struct Optimizer {
     sites: Vec<SiteSource>,
     profile: String,
     manifests: RwLock<HashMap<String, Arc<Manifest>>>,
+    text: RwLock<HashMap<String, Arc<text::TextManifest>>>,
+    text_profile: String,
+    last_gc: std::sync::Mutex<Option<std::time::Instant>>,
     permits: Arc<Semaphore>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Pass {
+    Text,
+    Images,
+}
+
+/// Bumped when minifier or compressor settings change.
+const TEXT_REVISION: u32 = 1;
+
+/// Selected text representation.
+#[derive(Debug, Clone)]
+pub struct TextSelected {
+    pub path: PathBuf,
+    /// `Content-Encoding` token, `None` for the minified identity version.
+    pub encoding: Option<&'static str>,
 }
 
 impl Optimizer {
@@ -73,6 +103,19 @@ impl Optimizer {
                 }
             }
         }
+        let text_profile = blake3::hash(format!("t{TEXT_REVISION}|{}", cfg.minify).as_bytes())
+            .to_hex()[..16]
+            .to_string();
+        let mut texts = HashMap::new();
+        for site in &sites {
+            if let Ok(bytes) = std::fs::read(text_manifest_path(&dir, &site.name))
+                && let Ok(m) = serde_json::from_slice::<text::TextManifest>(&bytes)
+                && m.version == text::TEXT_MANIFEST_VERSION
+                && m.profile == text_profile
+            {
+                texts.insert(site.name.clone(), Arc::new(m));
+            }
+        }
         let permits = Arc::new(Semaphore::new(cfg.workers));
         Self {
             cfg,
@@ -80,12 +123,41 @@ impl Optimizer {
             sites,
             profile,
             manifests: RwLock::new(manifests),
+            text: RwLock::new(texts),
+            text_profile,
+            last_gc: std::sync::Mutex::new(None),
             permits,
         }
     }
 
     pub fn manifest(&self, site: &str) -> Option<Arc<Manifest>> {
         self.manifests.read().unwrap().get(site).cloned()
+    }
+
+    pub fn text_manifest(&self, site: &str) -> Option<Arc<text::TextManifest>> {
+        self.text.read().unwrap().get(site).cloned()
+    }
+
+    /// Choose a stored representation of a text asset for a client that
+    /// accepts `accepted` encodings (preference order). `None`: serve the
+    /// original (unknown, changed since the scan, or nothing better).
+    pub fn select_text(
+        &self,
+        site: &str,
+        rel_path: &str,
+        src_meta: &std::fs::Metadata,
+        accepted: &[&str],
+    ) -> Option<TextSelected> {
+        let m = self.text_manifest(site)?;
+        let a = m.files.get(rel_path)?;
+        if a.bytes != src_meta.len() || a.mtime_ns != mtime_ns(src_meta) {
+            return None;
+        }
+        let c = text::choose(a, accepted)?;
+        Some(TextSelected {
+            path: self.objects_dir().join(c.object),
+            encoding: c.encoding.map(|e| e.token()),
+        })
     }
 
     fn objects_dir(&self) -> PathBuf {
@@ -122,22 +194,77 @@ impl Optimizer {
         }
     }
 
-    /// Scan every site once.
+    /// Scan every site once: text assets, then images.
     pub async fn scan_all(self: &Arc<Self>) -> ScanStats {
+        let mut total = self.scan_pass(Pass::Text).await;
+        let images = self.scan_pass(Pass::Images).await;
+        total.sources = images.sources;
+        total.reused = images.reused;
+        total.processed = images.processed;
+        total.failed = images.failed;
+        total.variants_written = images.variants_written;
+        total
+    }
+
+    async fn scan_pass(self: &Arc<Self>, pass: Pass) -> ScanStats {
         let mut total = ScanStats::default();
         for site in self.sites.clone() {
-            let s = self.scan_site(&site).await;
-            total.sources += s.sources;
-            total.reused += s.reused;
-            total.processed += s.processed;
-            total.failed += s.failed;
-            total.variants_written += s.variants_written;
+            match pass {
+                Pass::Text => {
+                    if self.cfg.scripts {
+                        total.text_processed += self.scan_text(&site).await;
+                    }
+                }
+                Pass::Images => {
+                    let s = self.scan_site(&site).await;
+                    total.sources += s.sources;
+                    total.reused += s.reused;
+                    total.processed += s.processed;
+                    total.failed += s.failed;
+                    total.variants_written += s.variants_written;
+                }
+            }
+        }
+        if total.processed > 0 || total.text_processed > 0 || total.failed > 0 {
+            self.maybe_gc();
         }
         total
     }
 
-    /// Background loop: scan now, then every `scan_interval_secs` until stopped.
-    pub async fn run(self: Arc<Self>, mut stop: watch::Receiver<bool>) {
+    /// Background work until stopped: a text loop and an image loop, each
+    /// scanning now, again whenever files change (inotify, debounced) and
+    /// every `scan_interval_secs`. They are independent so minutes of image
+    /// encoding never delay a changed script.
+    pub async fn run(self: Arc<Self>, stop: watch::Receiver<bool>) {
+        let wake = [
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        ];
+        let watcher = if self.cfg.watch {
+            self.watch_roots(wake.to_vec())
+        } else {
+            None
+        };
+        let polling_only = watcher.is_none();
+        tokio::join!(
+            Arc::clone(&self).pass_loop(
+                Pass::Text,
+                Arc::clone(&wake[0]),
+                polling_only,
+                stop.clone()
+            ),
+            Arc::clone(&self).pass_loop(Pass::Images, Arc::clone(&wake[1]), polling_only, stop),
+        );
+        drop(watcher);
+    }
+
+    async fn pass_loop(
+        self: Arc<Self>,
+        pass: Pass,
+        wake: Arc<tokio::sync::Notify>,
+        polling_only: bool,
+        mut stop: watch::Receiver<bool>,
+    ) {
         loop {
             let started = std::time::Instant::now();
             // Shutdown must not wait for a scan: dropping it cancels queued
@@ -145,27 +272,98 @@ impl Optimizer {
             // but are never awaited; their output is published atomically or
             // not at all.
             let s = tokio::select! {
-                s = self.scan_all() => s,
+                s = self.scan_pass(pass) => s,
                 _ = stop.changed() => return,
             };
-            if s.processed > 0 || s.failed > 0 {
+            if s.processed > 0 || s.failed > 0 || s.text_processed > 0 {
                 tracing::info!(
+                    pass = ?pass,
                     sources = s.sources,
                     processed = s.processed,
                     reused = s.reused,
                     failed = s.failed,
                     variants = s.variants_written,
+                    text = s.text_processed,
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "optimize scan complete"
                 );
             }
-            if self.cfg.scan_interval_secs == 0 {
+            if self.cfg.scan_interval_secs == 0 && polling_only {
                 return;
             }
+            let interval = match self.cfg.scan_interval_secs {
+                0 => Duration::from_secs(365 * 24 * 3600),
+                n => Duration::from_secs(n),
+            };
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(self.cfg.scan_interval_secs)) => {}
+                _ = tokio::time::sleep(interval) => {}
+                _ = wake.notified() => {
+                    // Let editors and deploys finish writing before rescanning.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
                 _ = stop.changed() => return,
             }
+        }
+    }
+
+    /// Watch every document root; any event wakes the scan loop.
+    fn watch_roots(
+        &self,
+        wake: Vec<Arc<tokio::sync::Notify>>,
+    ) -> Option<notify::RecommendedWatcher> {
+        use notify::Watcher;
+        let mut w = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(ev) = res
+                && !matches!(ev.kind, notify::EventKind::Access(_))
+            {
+                // notify_one stores a permit, so a change during a scan
+                // triggers one more scan right after it.
+                for w in &wake {
+                    w.notify_one();
+                }
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(error = %e, "file watching unavailable; polling only");
+                return None;
+            }
+        };
+        for site in &self.sites {
+            if let Err(e) = w.watch(&site.root, notify::RecursiveMode::Recursive) {
+                tracing::warn!(site = site.name, error = %e, "cannot watch document root; polling only");
+            }
+        }
+        Some(w)
+    }
+
+    /// Delete objects no manifest references any more. Runs at most every
+    /// 10 minutes and spares files younger than an hour, so a manifest that
+    /// is being replaced never points at a deleted object.
+    fn maybe_gc(&self) {
+        {
+            let mut last = self.last_gc.lock().unwrap();
+            if last.is_some_and(|t| t.elapsed() < Duration::from_secs(600)) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let mut keep: HashSet<String> = HashSet::new();
+        for m in self.manifests.read().unwrap().values() {
+            for a in m.assets.values() {
+                keep.extend(a.variants.iter().map(|v| v.object.clone()));
+            }
+        }
+        for m in self.text.read().unwrap().values() {
+            for a in m.files.values() {
+                keep.extend(a.minified.iter().map(|o| o.object.clone()));
+                keep.extend(a.encoded.values().map(|o| o.object.clone()));
+            }
+        }
+        let dir = self.objects_dir();
+        let (removed, bytes) = gc_objects(&dir, &keep, Duration::from_secs(3600));
+        if removed > 0 {
+            tracing::info!(removed, bytes, "optimizer objects garbage-collected");
         }
     }
 
@@ -300,6 +498,128 @@ impl Optimizer {
         stats
     }
 
+    /// Script Optimizer pass for one site; returns files (re)processed.
+    async fn scan_text(self: &Arc<Self>, site: &SiteSource) -> usize {
+        let previous = self.text_manifest(&site.name);
+        let root = site.root.clone();
+        let max = self.cfg.text_max_bytes.0;
+        let found = tokio::task::spawn_blocking(move || discover_text(&root, max))
+            .await
+            .unwrap_or_default();
+        let mut files = BTreeMap::new();
+        let mut errors = BTreeMap::new();
+        let mut jobs = tokio::task::JoinSet::new();
+        let objects = self.objects_dir();
+        for d in found {
+            let prev = previous.as_ref().and_then(|m| m.files.get(&d.rel)).cloned();
+            if let Some(a) = &prev
+                && a.bytes == d.bytes
+                && a.mtime_ns == d.mtime_ns
+                && text_objects_present(&objects, a)
+            {
+                files.insert(d.rel, a.clone());
+                continue;
+            }
+            let permit = Arc::clone(&self.permits);
+            let (profile, minify, objects) =
+                (self.text_profile.clone(), self.cfg.minify, objects.clone());
+            jobs.spawn(async move {
+                let _permit = permit.acquire_owned().await;
+                let rel = d.rel.clone();
+                let res =
+                    tokio::task::spawn_blocking(move || -> std::io::Result<text::TextAsset> {
+                        let data = std::fs::read(&d.path)?;
+                        let hash = blake3::hash(&data).to_hex().to_string();
+                        if let Some(mut a) = prev
+                            && a.hash == hash
+                            && text_objects_present(&objects, &a)
+                        {
+                            a.bytes = d.bytes;
+                            a.mtime_ns = d.mtime_ns;
+                            return Ok(a);
+                        }
+                        let p = text::process(&d.rel, d.kind, &data, d.mtime_ns, &profile, minify);
+                        for (name, content) in p.objects {
+                            let path = objects.join(&name);
+                            if !path.is_file() {
+                                manifest::write_atomic(&path, &content)?;
+                            }
+                        }
+                        Ok(p.asset)
+                    })
+                    .await;
+                (rel, d.mtime_ns, res)
+            });
+        }
+        let mut processed = 0;
+        while let Some(joined) = jobs.join_next().await {
+            let Ok((rel, mtime, res)) = joined else {
+                continue;
+            };
+            match res {
+                Ok(Ok(asset)) => {
+                    processed += 1;
+                    files.insert(rel, asset);
+                }
+                Ok(Err(e)) => {
+                    errors.insert(
+                        rel,
+                        AssetError {
+                            message: e.to_string(),
+                            mtime_ns: mtime,
+                        },
+                    );
+                }
+                Err(e) => {
+                    errors.insert(
+                        rel,
+                        AssetError {
+                            message: format!("worker panicked: {e}"),
+                            mtime_ns: mtime,
+                        },
+                    );
+                }
+            }
+        }
+        let changed = previous
+            .as_ref()
+            .is_none_or(|p| processed > 0 || p.files.len() != files.len() || p.errors != errors);
+        if !changed {
+            return 0;
+        }
+        let (project, root) = (site.project.clone(), site.root.clone());
+        let report_files = files.clone();
+        let report =
+            tokio::task::spawn_blocking(move || text::build_report(&report_files, &project, &root))
+                .await
+                .unwrap_or_default();
+        let manifest = text::TextManifest {
+            version: text::TEXT_MANIFEST_VERSION,
+            site: site.name.clone(),
+            profile: self.text_profile.clone(),
+            generated_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            files,
+            errors,
+            report,
+        };
+        let path = text_manifest_path(&self.dir, &site.name);
+        let json = serde_json::to_vec_pretty(&manifest).unwrap_or_default();
+        if let Err(e) = tokio::task::spawn_blocking(move || manifest::write_atomic(&path, &json))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+        {
+            tracing::error!(site = site.name, error = %e, "cannot write script manifest");
+        }
+        self.text
+            .write()
+            .unwrap()
+            .insert(site.name.clone(), Arc::new(manifest));
+        processed
+    }
+
     fn objects_present(&self, a: &Asset) -> bool {
         a.variants
             .iter()
@@ -375,6 +695,98 @@ impl Optimizer {
 
 fn manifest_path(dir: &Path, site: &str) -> PathBuf {
     dir.join("sites").join(site).join("manifest.json")
+}
+
+fn text_manifest_path(dir: &Path, site: &str) -> PathBuf {
+    dir.join("sites").join(site).join("text.json")
+}
+
+fn text_objects_present(objects: &Path, a: &text::TextAsset) -> bool {
+    a.minified
+        .iter()
+        .chain(a.encoded.values())
+        .all(|o| objects.join(&o.object).is_file())
+}
+
+/// Remove files under `dir` that are not in `keep` (paths relative to
+/// `dir`) and older than `min_age`. Returns (files, bytes) removed.
+fn gc_objects(dir: &Path, keep: &HashSet<String>, min_age: Duration) -> (usize, u64) {
+    let now = SystemTime::now();
+    let (mut n, mut bytes) = (0, 0);
+    for entry in walkdir::WalkDir::new(dir)
+        .min_depth(1)
+        .into_iter()
+        .flatten()
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(dir) else {
+            continue;
+        };
+        let rel = rel
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if keep.contains(&rel) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age >= min_age);
+        if old && std::fs::remove_file(entry.path()).is_ok() {
+            n += 1;
+            bytes += meta.len();
+        }
+    }
+    (n, bytes)
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveredText {
+    rel: String,
+    path: PathBuf,
+    kind: text::TextKind,
+    bytes: u64,
+    mtime_ns: u128,
+}
+
+/// Text assets under a document root (no dot-directories, no symlinks).
+fn discover_text(root: &Path, max_bytes: u64) -> Vec<DiscoveredText> {
+    let mut out = Vec::new();
+    let walker = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            e.depth() == 0 || !e.file_name().to_str().is_some_and(|n| n.starts_with('.'))
+        });
+    for entry in walker.flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Some(kind) = text::TextKind::from_path(entry.path()) else {
+            continue;
+        };
+        let Ok(meta) = entry.metadata() else { continue };
+        // Tiny files are not worth a stored copy; huge ones stay on-the-fly.
+        if meta.len() < 256 || meta.len() > max_bytes {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        let Some(rel) = rel.to_str() else { continue };
+        out.push(DiscoveredText {
+            rel: rel.replace(std::path::MAIN_SEPARATOR, "/"),
+            path: entry.path().to_owned(),
+            kind,
+            bytes: meta.len(),
+            mtime_ns: mtime_ns(&meta),
+        });
+    }
+    out
 }
 
 fn profile_hash(cfg: &OptimizeConfig) -> String {
@@ -470,6 +882,7 @@ mod tests {
             vec![SiteSource {
                 name: "s".into(),
                 root: root.clone(),
+                project: base.clone(),
             }],
         ));
         let s = opt.scan_all().await;
@@ -496,6 +909,7 @@ mod tests {
             vec![SiteSource {
                 name: "s".into(),
                 root,
+                project: base.clone(),
             }],
         );
         assert!(reloaded.manifest("s").is_some());

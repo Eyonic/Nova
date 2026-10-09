@@ -40,9 +40,15 @@ pub struct Metrics {
     php_count: AtomicU64,
     php_errors: AtomicU64,
     bytes_saved: AtomicU64,
+    text_saved: AtomicU64,
 }
 
 impl Metrics {
+    /// Bytes not sent thanks to stored minified/precompressed text assets.
+    pub fn text_saved(&self, bytes: u64) {
+        self.text_saved.fetch_add(bytes, Relaxed);
+    }
+
     pub fn record(&self, kind: Kind, status: u16) {
         self.requests[kind as usize].fetch_add(1, Relaxed);
         self.status[(status / 100).min(5) as usize].fetch_add(1, Relaxed);
@@ -97,6 +103,12 @@ impl Metrics {
             s,
             "nova_image_bytes_saved_total {}",
             self.bytes_saved.load(Relaxed)
+        );
+        let _ = writeln!(s, "# TYPE nova_text_bytes_saved_total counter");
+        let _ = writeln!(
+            s,
+            "nova_text_bytes_saved_total {}",
+            self.text_saved.load(Relaxed)
         );
         for (name, help, v) in extra {
             let _ = writeln!(s, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}");

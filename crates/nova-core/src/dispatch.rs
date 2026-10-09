@@ -507,6 +507,48 @@ impl App {
             }
         }
 
+        // Script Optimizer output: minified and precompressed in the background.
+        if site.optimize
+            && !rel.is_empty()
+            && !req.headers().contains_key(header::RANGE)
+            && let Some(opt) = &self.optimizer
+            && nova_optimize::text::TextKind::from_path(file).is_some()
+        {
+            let accepted = if self.compression.is_some() {
+                compress::accepted(
+                    req.headers()
+                        .get(header::ACCEPT_ENCODING)
+                        .and_then(|v| v.to_str().ok()),
+                )
+            } else {
+                Vec::new()
+            };
+            let tokens: Vec<&str> = accepted.iter().map(|e| e.token()).collect();
+            if let Some(sel) = opt.select_text(&site.name, rel, meta, &tokens)
+                && let Ok(vmeta) = tokio::fs::metadata(&sel.path).await
+            {
+                let ctype = static_files::guess_mime(file);
+                let fr = FileResponse {
+                    path: &sel.path,
+                    meta: &vmeta,
+                    content_type: Some(&ctype),
+                    cache_control: cache,
+                };
+                let mut resp = static_files::respond(fr, req.method(), req.headers()).await;
+                let h = resp.headers_mut();
+                h.remove(header::ACCEPT_RANGES);
+                if let Some(enc) = sel.encoding {
+                    h.insert(header::CONTENT_ENCODING, HeaderValue::from_static(enc));
+                }
+                compress::add_vary(h, "Accept-Encoding");
+                if resp.status() == StatusCode::OK {
+                    self.metrics
+                        .text_saved(meta.len().saturating_sub(vmeta.len()));
+                }
+                return (resp, Kind::Static);
+            }
+        }
+
         if let Some((enc, path, pmeta)) = self.precompressed_sibling(site, req, file, meta).await {
             let ctype = static_files::guess_mime(file);
             let fr = FileResponse {
@@ -859,6 +901,15 @@ impl App {
                             }),
                             None => serde_json::json!({ "assets": 0, "pending": true }),
                         };
+                        let mut v = v;
+                        if let Some(t) = opt.text_manifest(&site.name) {
+                            v["scripts"] = serde_json::json!({
+                                "files": t.files.len(),
+                                "minified": t.files.values().filter(|f| f.minified.is_some()).count(),
+                                "errors": t.errors.len(),
+                                "report": t.report,
+                            });
+                        }
                         out.insert(site.name.clone(), v);
                     }
                 }

@@ -83,7 +83,8 @@ section "Compression"
 H=$(curl -s -o /dev/null -D - -H 'Accept-Encoding: br, gzip' "$BASE/" | tr -d '\r')
 has "static HTML compressed with brotli" "$H" "content-encoding: br"
 has "compressed response varies on Accept-Encoding" "$H" "vary: Accept-Encoding"
-hasnt "no identity length on compressed body" "$H" "content-length:"
+hasnt "on-the-fly compression drops the identity length" "$(curl -s -o /dev/null -D - -H 'Accept-Encoding: br' "$BASE/info.php" | tr -d '\r')" "content-length:"
+eq "stored encoding carries its exact length" "$(curl -s -o /dev/null -w '%header{content-length}' -H 'Accept-Encoding: br' "$BASE/")" "$(curl -s -o /dev/null -w '%{size_download}' -H 'Accept-Encoding: br' "$BASE/")"
 eq "gzip body decodes to the original" "$(curl -s --compressed -H 'Accept-Encoding: gzip' "$BASE/" | md5sum)" "$(curl -s "$BASE/" | md5sum)"
 hasnt "identity when the client asks for nothing" "$(curl -sI "$BASE/" | tr -d '\r')" "content-encoding"
 hasnt "images are not recompressed" "$(curl -s -o /dev/null -D - -H 'Accept-Encoding: br' "$BASE/images/hero.jpg" | tr -d '\r')" "content-encoding"
@@ -129,6 +130,29 @@ eq "HTTP/3 over QUIC" "$(curl -sk --http3-only -o /dev/null -w '%{http_code} %{h
 eq "HTTP/3 PHP request with a body" "$(curl -sk --http3-only -d 'a=1' "$TBASE/info.php" | grep -c '"a": "1"')" 1
 eq "plain HTTP not forced to HTTPS for local hosts" "$(code "$BASE/")" 200
 check "self-signed certificate persisted" dc exec -T nova test -s /var/lib/nova/tls/self-signed/cert.pem
+
+section "Script Optimizer"
+text_ready() { for _ in $(seq 30); do curl -s "$BASE/_nova/optimize/status" | grep -q '"scripts"' && return 0; sleep 1; done; return 1; }
+check "script manifest published" text_ready
+ORIG=$(wc -c < sites/example/public/js/cart.js)
+H=$(curl -s -D - -o /dev/null -H 'Accept-Encoding: br' "$BASE/js/cart.js" | tr -d '\r')
+has "script served from stored brotli" "$H" "content-encoding: br"
+MIN=$(curl -s --compressed "$BASE/js/cart.js")
+check "minified script smaller than the source (${#MIN} < $ORIG)" [ "${#MIN}" -lt "$ORIG" ]
+has "license comment kept" "$MIN" "NOVA demo cart | MIT"
+hasnt "plain comments removed" "$MIN" "readable script"
+has "public API intact" "$MIN" "novaCart"
+check "identity request gets the minified file" [ "$(curl -s "$BASE/js/cart.js" | wc -c)" -lt "$ORIG" ]
+STATUS=$(curl -s "$BASE/_nova/optimize/status")
+UNREF=$(echo "$STATUS" | grep -o '"unreferenced":\[[^]]*\]' | head -1)
+has "report lists the unreferenced script" "$UNREF" "js/legacy-slider.js"
+hasnt "referenced script not reported" "$UNREF" "js/cart.js"
+WATCH=sites/example/public/js/zz-watch-test.js
+trap 'rm -f "$WATCH"; cleanup' EXIT
+printf '// watch test\nfunction watchedFunction(longParameterName) {\n  return longParameterName * 2;\n}\n%.0s' $(seq 8) > "$WATCH"
+watched() { for _ in $(seq 8); do curl -s -D - -o /dev/null -H 'Accept-Encoding: br' "$BASE/js/zz-watch-test.js" | grep -qi 'content-encoding: br' && return 0; sleep 0.5; done; return 1; }
+check "new file optimized within seconds (inotify)" watched
+rm -f "$WATCH"
 
 section "PHP runtime"
 INFO=$(curl -s "$BASE/info.php?x=1")

@@ -172,7 +172,8 @@ fn spawn(spec: &ProcSpec) -> std::io::Result<Child> {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stream).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if is_err {
+                // The sandbox wrapper announces itself on stderr; that is not a warning.
+                if is_err && !line.starts_with("nova sandbox:") {
                     tracing::warn!(target: "nova::task", site, task = name, "{line}");
                 } else {
                     tracing::info!(target: "nova::task", site, task = name, "{line}");

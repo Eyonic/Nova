@@ -243,15 +243,46 @@ async fn optimize(cfg: Config) -> Result<()> {
     let started = std::time::Instant::now();
     let s = opt.scan_all().await;
     println!(
-        "{} sources: {} processed, {} unchanged, {} failed, {} variants written in {:.1}s",
+        "{} images: {} processed, {} unchanged, {} failed, {} variants written; {} text assets processed in {:.1}s",
         s.sources,
         s.processed,
         s.reused,
         s.failed,
         s.variants_written,
+        s.text_processed,
         started.elapsed().as_secs_f64()
     );
+    let kb = |b: u64| b as f64 / 1024.0;
     for site in &cfg.sites {
+        if let Some(t) = opt.text_manifest(&site.name) {
+            let r = &t.report;
+            for (label, x) in [("JavaScript", &r.js), ("CSS", &r.css)] {
+                if x.files > 0 {
+                    println!(
+                        "  {}: {label}: {} files, {:.0} KiB → {:.0} KiB minified → {:.0} KiB brotli",
+                        site.name,
+                        x.files,
+                        kb(x.original),
+                        kb(x.minified),
+                        kb(x.brotli)
+                    );
+                }
+            }
+            for group in &r.duplicates {
+                println!("  {}: duplicate content: {}", site.name, group.join(", "));
+            }
+            for f in &r.unreferenced {
+                println!(
+                    "  {}: no reference found (review, do not delete blindly): {f}",
+                    site.name
+                );
+            }
+            for (f, a) in &t.files {
+                if let Some(note) = a.note.as_deref().filter(|n| n.starts_with("not minified")) {
+                    println!("  {}: {f}: {note}", site.name);
+                }
+            }
+        }
         if let Some(m) = opt.manifest(&site.name) {
             for (asset, err) in &m.errors {
                 println!("  {}: {asset}: {}", site.name, err.message);

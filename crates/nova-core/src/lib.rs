@@ -48,6 +48,7 @@ pub fn optimizer_for(cfg: &Config) -> Option<Arc<Optimizer>> {
         .map(|s| SiteSource {
             name: s.name.clone(),
             root: s.document_root(),
+            project: s.path.clone(),
         })
         .collect();
     Some(Arc::new(Optimizer::new(
