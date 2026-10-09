@@ -6,6 +6,7 @@
 //! file itself; fields ending in `_env` name an environment variable that is
 //! resolved at startup.
 
+pub mod cron;
 pub mod http;
 
 pub use http::{
@@ -231,14 +232,39 @@ impl Default for PathsConfig {
 pub struct PhpConfig {
     /// The php-fpm binary NOVA supervises.
     pub fpm_binary: PathBuf,
+    /// The PHP CLI used for `[[site.task]]` / `[[site.worker]]` commands
+    /// starting with `php`.
+    pub cli_binary: PathBuf,
     /// Functions disabled in every pool unless a site overrides the list.
     pub disable_functions: Vec<String>,
+    /// OPcache shared memory per site.
+    pub opcache_memory: ByteSize,
+    /// Seconds between file timestamp checks in production (development
+    /// always checks). 0 checks on every request.
+    pub opcache_revalidate_secs: u32,
+    /// PHP JIT: `off`, `tracing` or `function`.
+    pub jit: JitMode,
+    pub jit_buffer: ByteSize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum JitMode {
+    #[default]
+    Off,
+    Tracing,
+    Function,
 }
 
 impl Default for PhpConfig {
     fn default() -> Self {
         Self {
             fpm_binary: "php-fpm".into(),
+            cli_binary: "php".into(),
+            opcache_memory: ByteSize(128 << 20),
+            opcache_revalidate_secs: 2,
+            jit: JitMode::Off,
+            jit_buffer: ByteSize(64 << 20),
             disable_functions: [
                 "exec",
                 "passthru",
@@ -486,6 +512,44 @@ pub struct SiteConfig {
     /// HTTP basic authentication.
     #[serde(default)]
     pub auth: Option<SiteAuth>,
+    /// Commands run on a cron schedule (e.g. `php artisan schedule:run`).
+    #[serde(default, rename = "task")]
+    pub tasks: Vec<SiteTask>,
+    /// Long-running commands kept alive (e.g. `php artisan queue:work`).
+    #[serde(default, rename = "worker")]
+    pub workers: Vec<SiteWorker>,
+}
+
+/// `[[site.task]]`: a scheduled command, run as the site inside its sandbox.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SiteTask {
+    pub name: String,
+    /// Cron expression in the container's local time (`TZ`).
+    pub schedule: String,
+    pub command: Vec<String>,
+    /// Kill a run that takes longer than this.
+    #[serde(default = "default_task_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_task_timeout() -> u64 {
+    3600
+}
+
+/// `[[site.worker]]`: a supervised long-running command.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SiteWorker {
+    pub name: String,
+    pub command: Vec<String>,
+    /// Parallel copies.
+    #[serde(default = "default_processes")]
+    pub processes: u32,
+}
+
+fn default_processes() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -684,6 +748,35 @@ impl Config {
                 }
             }
             http::validate_site(site, &mut errs);
+            let mut proc_names = HashSet::new();
+            for (name, command) in site
+                .tasks
+                .iter()
+                .map(|t| (&t.name, &t.command))
+                .chain(site.workers.iter().map(|w| (&w.name, &w.command)))
+            {
+                if !valid_ident(name) || !proc_names.insert(name.as_str()) {
+                    errs.push(format!(
+                        "site {n:?}: task/worker name {name:?} must be unique and match [a-z0-9][a-z0-9-]*"
+                    ));
+                }
+                if command.is_empty() || command[0].is_empty() {
+                    errs.push(format!("site {n:?}: {name:?} needs a command"));
+                }
+            }
+            for t in &site.tasks {
+                if let Err(e) = t.schedule.parse::<cron::Schedule>() {
+                    errs.push(format!("site {n:?}: task {:?}: {e}", t.name));
+                }
+            }
+            for w in &site.workers {
+                if w.processes == 0 || w.processes > 64 {
+                    errs.push(format!(
+                        "site {n:?}: worker {:?}: processes must be 1..=64",
+                        w.name
+                    ));
+                }
+            }
             if let Some(db) = &site.database {
                 if !self.services.database.contains_key(&db.service) {
                     errs.push(format!(

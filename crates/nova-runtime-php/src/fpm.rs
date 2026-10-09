@@ -41,6 +41,9 @@ pub struct PoolSpec {
     pub upload_max: String,
     pub disable_functions: Vec<String>,
     pub ini: BTreeMap<String, String>,
+    /// Startup-only settings (OPcache, JIT, realpath cache) passed to the
+    /// master as `-d key=value`; pools cannot change them per request.
+    pub master_ini: BTreeMap<String, String>,
     pub display_errors: bool,
     /// Also set PHP's `open_basedir`. Only needed when the kernel sandbox is
     /// not guaranteed: open_basedir disables PHP's realpath cache, which
@@ -125,6 +128,9 @@ impl FpmConfig {
             }
             None => Command::new(&self.binary),
         };
+        for (k, v) in &self.pool.master_ini {
+            cmd.arg("-d").arg(format!("{k}={v}"));
+        }
         if let Some((uid, gid)) = self.launch.user {
             cmd.uid(uid).gid(gid);
         }
@@ -425,6 +431,7 @@ mod tests {
             upload_max: "64M".into(),
             disable_functions: vec!["exec".into(), "system".into()],
             ini: BTreeMap::from([("memory_limit".into(), "512M".into())]),
+            master_ini: BTreeMap::new(),
             display_errors: false,
             open_basedir: true,
         }

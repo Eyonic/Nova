@@ -77,6 +77,18 @@ realm = "NOVA demo"
 users_file = "/srv/sites/example/config/htpasswd"
 paths = ["/private/**"]
 
+# Background processes run as the site, inside its sandbox. For Laravel:
+#   command = ["php", "artisan", "schedule:run"]   (task, every minute)
+#   command = ["php", "artisan", "queue:work"]     (worker)
+[[site.task]]
+name = "heartbeat"
+schedule = "* * * * *"
+command = ["php", "-r", "file_put_contents(getenv('HOME') . '/tmp/task-ran', date('c'));"]
+
+[[site.worker]]
+name = "ticker"
+command = ["php", "-r", "while (true) { file_put_contents(getenv('HOME') . '/tmp/worker-alive', getmypid()); sleep(2); }"]
+
 [[site]]
 name = "second"
 hosts = ["second.localhost"]

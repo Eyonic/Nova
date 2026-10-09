@@ -3,8 +3,9 @@
 use crate::isolation::{self, Effective};
 use crate::sites;
 use anyhow::{Context, Result};
-use nova_config::{Config, SiteConfig};
+use nova_config::{Config, JitMode, SiteConfig};
 use nova_runtime_php::{Fpm, FpmConfig, Launch, PoolSpec};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::time::Duration;
 
@@ -27,11 +28,88 @@ pub fn pool_spec(cfg: &Config, site: &SiteConfig) -> Result<Option<PoolSpec>> {
             .disable_functions
             .clone()
             .unwrap_or_else(|| cfg.php.disable_functions.clone()),
-        ini: php.ini.clone(),
+        ini: php
+            .ini
+            .iter()
+            .filter(|(k, _)| !is_startup_ini(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        master_ini: master_ini(cfg, site),
         display_errors: cfg.mode.is_dev(),
         // Landlock (required by default) enforces the same boundary in the kernel.
         open_basedir: !cfg.isolation.require_landlock,
     }))
+}
+
+/// Settings PHP only reads at startup; they go to the FPM master.
+fn is_startup_ini(key: &str) -> bool {
+    key.starts_with("opcache.") || key.starts_with("realpath_cache")
+}
+
+/// OPcache, JIT and realpath-cache tuning for a site's FPM master. Site
+/// `ini` entries for these keys override the defaults.
+pub fn master_ini(cfg: &Config, site: &SiteConfig) -> BTreeMap<String, String> {
+    let dev = cfg.mode.is_dev();
+    let php = &cfg.php;
+    let mut ini = BTreeMap::new();
+    let mut set = |k: &str, v: String| {
+        ini.insert(k.to_string(), v);
+    };
+    set("opcache.enable", "1".into());
+    set(
+        "opcache.memory_consumption",
+        (php.opcache_memory.0 >> 20).max(8).to_string(),
+    );
+    set("opcache.interned_strings_buffer", "16".into());
+    set("opcache.max_accelerated_files", "20000".into());
+    set("opcache.validate_timestamps", "1".into());
+    set(
+        "opcache.revalidate_freq",
+        if dev { 0 } else { php.opcache_revalidate_secs }.to_string(),
+    );
+    set("opcache.save_comments", "1".into());
+    set("realpath_cache_size", "4096K".into());
+    set("realpath_cache_ttl", if dev { "2" } else { "600" }.into());
+    match php.jit {
+        JitMode::Off => set("opcache.jit", "disable".into()),
+        mode => {
+            set(
+                "opcache.jit",
+                if mode == JitMode::Tracing {
+                    "tracing"
+                } else {
+                    "function"
+                }
+                .into(),
+            );
+            set(
+                "opcache.jit_buffer_size",
+                format!("{}M", php.jit_buffer.0 >> 20),
+            );
+        }
+    }
+    if let Some(p) = &site.php {
+        for (k, v) in p.ini.iter().filter(|(k, _)| is_startup_ini(k)) {
+            ini.insert(k.clone(), v.clone());
+        }
+    }
+    ini
+}
+
+/// `nova sandbox <site policy> --`: the prefix every site process runs behind.
+pub fn sandbox_wrapper(cfg: &Config, site: &SiteConfig, nova: &std::path::Path) -> Vec<OsString> {
+    let mut wrapper: Vec<OsString> = vec![nova.as_os_str().to_owned(), "sandbox".into()];
+    wrapper.extend(
+        isolation::site_sandbox(cfg, site)
+            .to_args()
+            .into_iter()
+            .map(OsString::from),
+    );
+    if cfg.isolation.require_landlock {
+        wrapper.push("--require".into());
+    }
+    wrapper.push("--".into());
+    wrapper
 }
 
 /// FPM configuration for every PHP-enabled site, including how to launch it.
@@ -42,17 +120,7 @@ pub fn fpm_configs(cfg: &Config, mode: Effective) -> Result<Vec<FpmConfig>> {
         let Some(pool) = pool_spec(cfg, site)? else {
             continue;
         };
-        let mut wrapper: Vec<OsString> = vec![nova.clone().into(), "sandbox".into()];
-        wrapper.extend(
-            isolation::site_sandbox(cfg, site)
-                .to_args()
-                .into_iter()
-                .map(OsString::from),
-        );
-        if cfg.isolation.require_landlock {
-            wrapper.push("--require".into());
-        }
-        wrapper.push("--".into());
+        let wrapper = sandbox_wrapper(cfg, site, &nova);
         let uid = cfg.site_uid(site);
         out.push(FpmConfig {
             binary: cfg.php.fpm_binary.clone(),

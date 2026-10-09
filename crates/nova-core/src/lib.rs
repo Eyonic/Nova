@@ -22,6 +22,7 @@ pub mod php;
 pub mod ratelimit;
 pub mod rules;
 pub mod sites;
+pub mod tasks;
 pub mod tls;
 
 use anyhow::{Context, Result};
@@ -72,11 +73,15 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
     } else {
         Vec::new()
     };
+    let tasks = tasks::start_all(&cfg, mode)?;
 
     let result = match mode {
         Effective::Strict => supervise_worker(&cfg, &config_path).await,
         Effective::Shared => run_worker(cfg.clone(), wait_for_signal()).await,
     };
+    if !tasks.is_empty() {
+        tasks.stop().await;
+    }
     php::stop_all(fpms).await;
     tracing::info!("NOVA stopped");
     result

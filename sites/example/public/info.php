@@ -21,5 +21,6 @@ echo json_encode([
     'request_id' => $_SERVER['NOVA_REQUEST_ID'] ?? null,
     'https' => $_SERVER['HTTPS'] ?? null,
     'remote_addr' => $_SERVER['REMOTE_ADDR'] ?? null,
+    'opcache' => function_exists('opcache_get_status') && (opcache_get_status(false)['opcache_enabled'] ?? false),
     'extensions' => array_values(array_intersect(['pdo_mysql', 'mysqli', 'Zend OPcache'], get_loaded_extensions(false) + get_loaded_extensions(true))),
 ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);

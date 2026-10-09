@@ -137,6 +137,7 @@ has "query string" "$INFO" '"x": "1"'
 has "site env injected" "$INFO" '"app_name": "NOVA Example"'
 has "request id passed to PHP" "$INFO" '"request_id": "'
 has "pdo_mysql loaded" "$INFO" 'pdo_mysql'
+has "OPcache enabled" "$INFO" '"opcache": true'
 hasnt "PHP source never exposed" "$(curl -s "$BASE/info.php")" '<?php'
 has "PATH_INFO" "$(curl -s "$BASE/info.php/extra/path")" '"path_info": "/extra/path"'
 has "front controller route" "$(curl -s "$BASE/hello/nova")" '"name":"nova"'
@@ -263,6 +264,16 @@ eq "files left by another uid are re-owned to the site" "$(dc exec -T nova stat 
 has "database rows survived" "$(curl -s "$BASE/db.php")" "\"visits\":$V2"
 eq "optimized assets served immediately after restart" \
   "$(curl -s -o /dev/null -H 'Accept: image/avif' -w '%{content_type}' "$BASE/images/hero.jpg")" image/avif
+
+section "Background tasks and workers"
+U_EX=$(dc exec -T nova stat -c %u /var/lib/nova/sites/example)
+check "worker keeps running" dc exec -T nova test -s /var/lib/nova/sites/example/tmp/worker-alive
+eq "worker runs as the site's uid" "$(dc exec -T nova stat -c %u /var/lib/nova/sites/example/tmp/worker-alive)" "$U_EX"
+ran_task() { for _ in $(seq 70); do dc exec -T nova test -s /var/lib/nova/sites/example/tmp/task-ran && return 0; sleep 1; done; return 1; }
+check "scheduled task ran (within a minute)" ran_task
+eq "task runs as the site's uid" "$(dc exec -T nova stat -c %u /var/lib/nova/sites/example/tmp/task-ran)" "$U_EX"
+has "worker started inside the Landlock sandbox" "$(dc logs nova 2>&1 | grep '"task":"ticker"' | grep 'nova sandbox' | tail -1)" 'landlock='
+has "task output logged" "$(dc logs nova 2>&1 | grep 'task finished' | tail -1)" 'heartbeat'
 
 section "Observability"
 METRICS=$(curl -s "$BASE/_nova/metrics")
