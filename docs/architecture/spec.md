@@ -7,11 +7,11 @@ Status: implemented and covered by `tests/integration/run.sh`.
 | Crate | Owns | Depends on | Must not |
 |---|---|---|---|
 | `nova-config` | `nova.toml` schema, defaults, validation | — | touch the filesystem beyond reading the file |
-| `nova-http` | accept loop, connection limits, header timeouts, graceful drain, safe path lexing, static file responses (ETag, 304, Range, HEAD) | hyper (protocol only) | know about sites, PHP or images |
+| `nova-http` | TCP/TLS/QUIC listeners, HTTP/1.1, HTTP/2, HTTP/3, PROXY protocol, connection limits, header timeouts, graceful drain, safe path lexing, static file responses (ETag, 304, Range, HEAD), response compression | hyper, rustls, quinn/h3 (protocol only) | know about sites, PHP or images |
 | `nova-runtime-php` | FastCGI client, CGI environment, PHP-FPM config generation and supervision | tokio | depend on hyper or config types |
-| `nova-optimize` | discover → analyze → plan → transform → validate → publish → serve; manifest format; object store | image, libwebp, rav1e (ravif) | block a request on encoding |
+| `nova-optimize` | images and text assets: discover → analyze → plan → transform → validate → publish → serve; manifests; object store and GC; change watching | image, libwebp, rav1e (ravif), oxc, lightningcss, brotli/zstd/flate2 | block a request on encoding |
 | `nova-security` | Landlock sandbox policies, directory ownership helpers | landlock, libc | know about sites or PHP |
-| `nova-core` | site registry, dispatch (request lifecycle), isolation planning, supervisor/worker lifecycle, health, metrics | all of the above | contain protocol or codec code |
+| `nova-core` | site registry and rules, dispatch (request lifecycle), client/proxy resolution, rate limits, TLS certificates (ACME, self-signed), isolation planning, supervisor/worker lifecycle and reload, tasks/workers, health, metrics | all of the above | contain protocol or codec code |
 | `nova-cli` | `nova serve / check / optimize / health`, internal `worker` and `sandbox` | core | — |
 
 Mature engines are used behind each boundary (hyper for HTTP parsing, the
@@ -34,12 +34,18 @@ Sections: `[server]`, `[paths]`, `[php]`, `[optimize]`,
 
 ## 3. Request lifecycle (`nova-core/src/dispatch.rs`)
 
+0. Client resolution: real IP and scheme from the connection, the PROXY
+   header and trusted `X-Forwarded-*` / `Forwarded` headers.
 1. `/_nova/*` internal endpoints: `live.js` and `live/events` (NOVA Live, see
    [live.md](live.md)), `health/live`, `health/ready`
    (PHP pools ping + database TCP + not draining), `metrics` (Prometheus),
    `optimize/status`.
+   Metrics and optimizer status only for `server.admin_allow` clients.
+   Then the per-client rate limit (429).
 2. Site lookup by `Host` / `:authority` (port and trailing dot ignored),
-   falling back to the `default` site.
+   falling back to the `default` site. Site rules follow: HTTPS redirect,
+   canonical host, configured redirects, basic auth
+   (see [http.md](http.md)).
 3. Lexical path check: percent-decode, reject `..`, NUL, backslash, invalid
    UTF-8 (400); dot-segments other than `.well-known` are 404.
 4. Target resolution, in order: existing file → directory (301 to add the
@@ -49,7 +55,10 @@ Sections: `[server]`, `[paths]`, `[php]`, `[optimize]`,
 5. Execution: `.php` → PHP (404 if the site has PHP disabled, so source is
    never served); optimizable image → negotiated variant or original;
    anything else → static file (GET/HEAD only, else 405).
-6. Every response gets `server: nova` and `x-request-id`; one structured
+6. Site error pages replace NOVA's own error bodies; site headers and the
+   security baseline (HSTS for trusted hosts) are added; `Alt-Svc`
+   advertises HTTP/3; the response is compressed when worthwhile.
+7. Every response gets `server: nova` and `x-request-id`; one structured
    access-log line and metrics per request.
 
 ## 4. PHP integration
@@ -130,6 +139,13 @@ inside its policy, so PHP's own restrictions play no part.
   A stale manifest entry (source changed) falls back to the original.
 * Workers are bounded by `optimize.workers`; AVIF encoding is single-threaded
   per job. Requests are never blocked on encoding.
+* **Script Optimizer** (same object store, `text.json` manifest per site):
+  conservative JS/CSS minification, re-parse validation, precompression,
+  and a report of savings, duplicates and unreferenced scripts. Details in
+  [http.md](http.md#script-optimizer).
+* Text and image passes run as two independent loops, each woken by inotify
+  (debounced) and by `scan_interval_secs`; unreferenced objects are
+  garbage-collected.
 
 ### Manifest format (`<state>/optimize/sites/<site>/manifest.json`)
 
@@ -173,7 +189,7 @@ Objects live in `<state>/optimize/objects/<2 hex>/<32 hex>.<ext>`.
 |---|---|---|
 | Unit | `cargo test` (via `scripts/cargo.sh test`) | config validation, FastCGI encoding, CGI params, path security, ranges, dispatch resolution order and symlink escapes, planning, negotiation, encoder output validation, incremental scans |
 | Browser | `tests/browser/run.sh` | 14 NOVA Live tests in headless Chromium |
-| Integration | `tests/integration/run.sh` | 102 checks against a real Compose stack: static, PHP, uploads, limits, images, DB, isolation probe, graceful shutdown, restart persistence, metrics/logs |
+| Integration | `tests/integration/run.sh` | 167 checks against a real Compose stack: static, compression, caching, site rules, proxies, HTTPS/HTTP2/HTTP3, Script Optimizer, PHP, uploads, limits, images, DB, isolation probe, tasks/workers, live reload, graceful shutdown, restart persistence, metrics/logs |
 | Next | `tests/compatibility`, `tests/performance` | WordPress/Laravel/Symfony suites, load tests (phase 11) |
 
 ## 8. Known limitations
@@ -184,6 +200,8 @@ Objects live in `<state>/optimize/objects/<2 hex>/<32 hex>.<ext>`.
   namespaces (future).
 * Application code is mounted read-only and readable by the worker; the
   worker is trusted (Rust, sandboxed, no secrets, no capabilities).
-* Generated objects are never garbage-collected yet.
-* Change detection is polling (`scan_interval_secs`), not inotify.
-* Animated images and GIF are served unmodified.
+* Animated images and GIF are served unmodified; SVG is compressed but not minified.
+* `103 Early Hints` are not sent (hyper's server API has no informational responses).
+* Live reload needs strict isolation; in shared mode SIGHUP only logs a hint.
+* A QUIC connection open during a reload may be routed to the new worker
+  and has to reconnect (TCP connections are unaffected).
