@@ -1,0 +1,25 @@
+[package]
+name = "nova-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+bytes = "1.12.1"
+futures-util = "0.3.34"
+http = "1.5.0"
+http-body-util = "0.1.5"
+hyper = "1.12.0"
+libc = "0.2.190"
+nova-config = { version = "0.1.0", path = "../nova-config" }
+nova-http = { version = "0.1.0", path = "../nova-http" }
+nova-optimize = { version = "0.1.0", path = "../nova-optimize" }
+nova-runtime-php = { version = "0.1.0", path = "../nova-runtime-php" }
+nova-security = { version = "0.1.0", path = "../nova-security" }
+percent-encoding = "2.3.2"
+serde_json = "1.0.151"
+tokio = { version = "1.53.2", features = ["full"] }
+tracing = "0.1.44"

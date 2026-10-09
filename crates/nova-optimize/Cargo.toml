@@ -1,0 +1,21 @@
+[package]
+name = "nova-optimize"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+blake3 = "1.8.7"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+nova-config = { version = "0.1.0", path = "../nova-config" }
+ravif = "0.13.0"
+rgb = "0.8.53"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tracing = "0.1.44"
+walkdir = "2.5.0"
+webp = "0.3.1"

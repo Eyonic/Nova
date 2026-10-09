@@ -1,0 +1,21 @@
+[package]
+name = "nova-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes = "1.12.1"
+futures-util = "0.3.34"
+http = "1.5.0"
+http-body-util = "0.1.5"
+httpdate = "1.0.3"
+hyper = { version = "1.12.0", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "server", "server-auto", "server-graceful", "http1", "http2"] }
+mime_guess = "2.0.5"
+percent-encoding = "2.3.2"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "fs", "io-util", "macros", "signal", "sync", "time"] }
+tokio-util = "0.7.20"
+tracing = "0.1.44"

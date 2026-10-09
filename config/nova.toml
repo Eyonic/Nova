@@ -1,0 +1,71 @@
+# NOVA platform configuration (schema version 1).
+# Secrets never live here: `*_env` fields name environment variables.
+version = 1
+mode = "production"          # overridden by NOVA_MODE
+
+[server]
+listen = "0.0.0.0:8080"
+shutdown_grace_secs = 20
+max_request_body = "32MiB"
+metrics = true
+
+[paths]
+state_dir = "/var/lib/nova"
+run_dir = "/run/nova"
+
+[optimize]
+enabled = true
+widths = [320, 640, 960, 1280, 1920]
+formats = ["avif", "webp"]
+quality = { avif = 60, webp = 78, jpeg = 82 }
+workers = 2
+scan_interval_secs = 10
+budget_bytes = "500KiB"
+
+[services.database.main]
+driver = "mariadb"
+host = "db"
+port = 3306
+
+[[site]]
+name = "example"
+hosts = ["localhost", "example.localhost"]
+default = true
+path = "/srv/sites/example"
+
+[site.php]
+front_controller = "router.php"
+max_children = 8
+timeout_secs = 30
+
+[site.database]
+service = "main"
+name = "nova_example"
+user = "nova_example"
+password_env = "NOVA_DB_EXAMPLE_PASSWORD"
+
+[site.env]
+APP_NAME = "NOVA Example"
+
+[[site]]
+name = "second"
+hosts = ["second.localhost"]
+path = "/srv/sites/second"
+
+[site.php]
+max_children = 4
+
+[site.database]
+service = "main"
+name = "nova_second"
+user = "nova_second"
+password_env = "NOVA_DB_SECOND_PASSWORD"
+
+# Demo site for trying NOVA in a browser: http://showcase.localhost:8088/
+[[site]]
+name = "showcase"
+hosts = ["showcase.localhost"]
+path = "/srv/sites/showcase"
+
+[site.php]
+max_children = 4

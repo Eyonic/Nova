@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NOVA example site</title>
+  <style>
+    body { font: 17px/1.6 system-ui, sans-serif; max-width: 52rem; margin: 3rem auto; padding: 0 1rem; color: #1f2937; }
+    img { max-width: 100%; height: auto; border-radius: 8px; }
+    code { background: #f3f4f6; padding: .1rem .3rem; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Served by NOVA</h1>
+  <p>This page is a static file served by the NOVA server core.</p>
+  <!-- One URL; NOVA picks AVIF/WebP by Accept and a width variant by ?w=. -->
+  <img src="/images/hero.jpg"
+       srcset="/images/hero.jpg?w=640 640w, /images/hero.jpg?w=1280 1280w, /images/hero.jpg 2400w"
+       sizes="(max-width: 52rem) 100vw, 52rem" width="2400" height="1600" alt="Gradient hero image">
+  <p><img src="/images/logo.png?w=320" width="160" height="160" alt="NOVA logo"></p>
+  <ul>
+    <li><a href="/info.php">PHP runtime info</a></li>
+    <li><a href="/db.php">Database visit counter</a></li>
+    <li><a href="/hello/world">Front controller route</a></li>
+    <li><a href="/_nova/optimize/status">Optimizer status</a></li>
+  </ul>
+</body>
+</html>

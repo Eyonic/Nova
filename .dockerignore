@@ -1,0 +1,15 @@
+target
+.git
+data
+docs
+tests
+scripts
+*.md
+# Secrets must never be baked into an image: every .env at any depth.
+**/.env
+**/.env.*
+!**/.env.example
+# Development-only trees inside sites.
+**/node_modules
+**/.phpunit.result.cache
+sites/*/storage/logs

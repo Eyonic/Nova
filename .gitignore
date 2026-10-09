@@ -1,0 +1,17 @@
+# Build output
+/target
+
+# Secrets and local configuration
+.env
+config/nova.local.toml
+docker/mariadb/init/*local*
+
+# Local-only sites (private code and data)
+/sites/xxlgifts/
+
+# Dumps, runtime data, tooling caches
+*.sql
+*.sql.gz
+/data
+node_modules/
+compose.override.yaml

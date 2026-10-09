@@ -1,0 +1,70 @@
+# NOVA platform: the runtime plus a persistent database.
+# Local additions (private sites, their passwords) belong in a gitignored
+# compose.override.yaml, which Compose loads automatically.
+#
+#   cp .env.example .env    # then set real passwords
+#   docker compose up -d --build --wait
+#
+name: nova
+
+services:
+  nova:
+    build: .
+    image: nova:dev
+    ports:
+      - "${NOVA_HTTP_PORT:-8080}:8080"
+    environment:
+      NOVA_MODE: ${NOVA_MODE:-development}
+      NOVA_LOG: ${NOVA_LOG:-info}
+      NOVA_DB_EXAMPLE_PASSWORD: ${NOVA_DB_EXAMPLE_PASSWORD:?set NOVA_DB_EXAMPLE_PASSWORD in .env}
+      NOVA_DB_SECOND_PASSWORD: ${NOVA_DB_SECOND_PASSWORD:?set NOVA_DB_SECOND_PASSWORD in .env}
+    volumes:
+      # Persistent: generated assets, sessions, per-site tmp.
+      - nova-state:/var/lib/nova
+      # Development: live-edit sites and config without rebuilding.
+      - ./sites:/srv/sites:ro
+      - ./config/nova.toml:/etc/nova/nova.toml:ro
+    read_only: true
+    tmpfs:
+      - /run/nova:mode=0755
+      - /tmp
+    # The supervisor (root) keeps only what it needs to hand out identities;
+    # the worker and PHP processes run under other uids with no capabilities.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      db:
+        condition: service_healthy
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 1g
+          pids: 512
+
+  db:
+    image: mariadb:11.8
+    environment:
+      MARIADB_ROOT_PASSWORD: ${NOVA_DB_ROOT_PASSWORD:?set NOVA_DB_ROOT_PASSWORD in .env}
+      NOVA_DB_EXAMPLE_PASSWORD: ${NOVA_DB_EXAMPLE_PASSWORD}
+      NOVA_DB_SECOND_PASSWORD: ${NOVA_DB_SECOND_PASSWORD}
+    volumes:
+      - db-data:/var/lib/mysql
+      - ./docker/mariadb/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+volumes:
+  nova-state:
+  db-data:
