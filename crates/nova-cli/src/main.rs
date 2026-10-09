@@ -69,16 +69,7 @@ enum Command {
 }
 
 fn load(path: &Path) -> Result<Config> {
-    let mut cfg = Config::load(path).with_context(|| format!("loading {}", path.display()))?;
-    // NOVA_MODE lets one image run in either mode without editing the file.
-    if let Ok(m) = std::env::var("NOVA_MODE") {
-        cfg.mode = match m.as_str() {
-            "development" | "dev" => Mode::Development,
-            "production" | "prod" => Mode::Production,
-            other => bail!("NOVA_MODE must be development or production, got {other:?}"),
-        };
-    }
-    Ok(cfg)
+    Config::load_env(path).with_context(|| format!("loading {}", path.display()))
 }
 
 fn init_logging(mode: Mode) {

@@ -69,38 +69,45 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
         "starting NOVA"
     );
     isolation::prepare_dirs(&cfg, mode)?;
-    let fpms = if cfg.php_enabled() {
-        php::start_all(&cfg, mode).await?
-    } else {
-        Vec::new()
+    let mut rt = Runtime {
+        pools: php::start_all(&cfg, mode).await?,
+        tasks: tasks::start_all(&cfg, mode)?,
+        cfg,
+        mode,
     };
-    let tasks = tasks::start_all(&cfg, mode)?;
 
     let result = match mode {
-        Effective::Strict => supervise_worker(&cfg, &config_path).await,
-        Effective::Shared => run_worker(cfg.clone(), wait_for_signal()).await,
+        Effective::Strict => supervise(&mut rt, &config_path).await,
+        Effective::Shared => run_worker(rt.cfg.clone(), wait_for_signal(), true).await,
     };
-    if !tasks.is_empty() {
-        tasks.stop().await;
-    }
-    php::stop_all(fpms).await;
+    rt.tasks.stop().await;
+    php::stop_all(rt.pools).await;
     tracing::info!("NOVA stopped");
     result
 }
 
-/// Strict mode: run `nova worker` as the unprivileged worker uid, restart it
-/// if it crashes, forward SIGTERM and wait for it to drain.
-async fn supervise_worker(cfg: &Config, config_path: &Path) -> Result<()> {
-    let exe = std::env::current_exe().context("locating the nova binary")?;
-    let (uid, gid) = isolation::worker_ids(cfg);
-    let grace = Duration::from_secs(cfg.server.shutdown_grace_secs + 5);
-    let mut backoff = Duration::from_millis(500);
-    let signal = wait_for_signal();
-    tokio::pin!(signal);
+/// What the supervisor owns besides the worker.
+struct Runtime {
+    cfg: Config,
+    mode: Effective,
+    pools: Vec<php::Pool>,
+    tasks: tasks::Tasks,
+}
 
-    loop {
-        // The worker never receives secrets: only logging and mode settings pass through.
+/// A running `nova worker` process.
+struct Worker {
+    child: tokio::process::Child,
+    started: std::time::Instant,
+}
+
+impl Worker {
+    /// Start `nova worker` as the unprivileged worker uid. With `wait_ready`,
+    /// return only once it listens on every port (or fail).
+    async fn spawn(cfg: &Config, config_path: &Path, wait_ready: bool) -> Result<Self> {
+        let exe = std::env::current_exe().context("locating the nova binary")?;
+        let (uid, gid) = isolation::worker_ids(cfg);
         let mut cmd = tokio::process::Command::new(&exe);
+        // The worker never receives secrets: only logging and mode settings pass through.
         cmd.arg("--config")
             .arg(config_path)
             .arg("worker")
@@ -122,41 +129,149 @@ async fn supervise_worker(cfg: &Config, config_path: &Path) -> Result<()> {
                 cmd.env(var, v);
             }
         }
-        let mut child = cmd
+        // Readiness pipe: the worker writes one byte once it accepts connections.
+        let mut fds = [0; 2];
+        // SAFETY: pipe2 fills two descriptors on success; ownership is taken below.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("creating the ready pipe");
+        }
+        // SAFETY: both descriptors were just created and are owned here.
+        let (read, write) = unsafe {
+            use std::os::fd::FromRawFd;
+            (
+                std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+            )
+        };
+        let write_fd = std::os::fd::AsRawFd::as_raw_fd(&write);
+        cmd.env("NOVA_READY_FD", READY_FD.to_string());
+        // SAFETY: dup2 is async-signal-safe; it only places the inherited
+        // write end at a fixed descriptor number without CLOEXEC.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(write_fd, READY_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd
             .kill_on_drop(true)
             .spawn()
             .context("starting the worker")?;
-        let started = std::time::Instant::now();
+        drop(write);
         tracing::info!(pid = child.id(), uid, "worker started");
+        let mut w = Worker {
+            child,
+            started: std::time::Instant::now(),
+        };
+        if wait_ready {
+            let mut pipe =
+                tokio::net::unix::pipe::Receiver::from_owned_fd(read).context("ready pipe")?;
+            let mut byte = [0u8; 1];
+            let ready = tokio::time::timeout(
+                Duration::from_secs(30),
+                tokio::io::AsyncReadExt::read(&mut pipe, &mut byte),
+            )
+            .await;
+            if !matches!(ready, Ok(Ok(1))) {
+                w.stop(Duration::from_secs(1)).await;
+                anyhow::bail!("the new worker did not become ready");
+            }
+        }
+        Ok(w)
+    }
 
+    /// SIGTERM (drain), then SIGKILL after `grace`.
+    async fn stop(&mut self, grace: Duration) {
+        if let Some(pid) = self.child.id() {
+            // SAFETY: kill(2) on our own child.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        }
+        match tokio::time::timeout(grace, self.child.wait()).await {
+            Ok(status) => tracing::info!(?status, "worker stopped"),
+            Err(_) => {
+                tracing::warn!("worker did not stop in time; killing");
+                let _ = self.child.kill().await;
+            }
+        }
+    }
+}
+
+/// Descriptor number of the readiness pipe inside the worker.
+const READY_FD: i32 = 3;
+
+/// Strict mode: run the worker, restart it if it crashes, reload on SIGHUP
+/// without dropping connections, and drain on SIGTERM/SIGINT.
+async fn supervise(rt: &mut Runtime, config_path: &Path) -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let mut hup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
+    let mut backoff = Duration::from_millis(500);
+    let mut worker = Worker::spawn(&rt.cfg, config_path, false).await?;
+
+    loop {
+        let grace = Duration::from_secs(rt.cfg.server.shutdown_grace_secs + 5);
         tokio::select! {
-            status = child.wait() => {
+            status = worker.child.wait() => {
                 tracing::error!(?status, "worker exited unexpectedly; restarting");
-                if started.elapsed() > Duration::from_secs(30) {
+                if worker.started.elapsed() > Duration::from_secs(30) {
                     backoff = Duration::from_millis(500);
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
-                    _ = &mut signal => return Ok(()),
+                    _ = term.recv() => return Ok(()),
+                    _ = tokio::signal::ctrl_c() => return Ok(()),
                 }
                 backoff = (backoff * 2).min(Duration::from_secs(30));
+                worker = Worker::spawn(&rt.cfg, config_path, false).await?;
             }
-            _ = &mut signal => {
-                if let Some(pid) = child.id() {
-                    // SAFETY: kill(2) on our own child.
-                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-                }
-                match tokio::time::timeout(grace, child.wait()).await {
-                    Ok(status) => tracing::info!(?status, "worker stopped"),
-                    Err(_) => {
-                        tracing::warn!("worker did not stop in time; killing");
-                        let _ = child.kill().await;
-                    }
-                }
+            _ = term.recv() => {
+                tracing::info!("received SIGTERM");
+                worker.stop(grace).await;
                 return Ok(());
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received SIGINT");
+                worker.stop(grace).await;
+                return Ok(());
+            }
+            _ = hup.recv() => {
+                tracing::info!("received SIGHUP; reloading configuration");
+                match reload(rt, config_path).await {
+                    Ok(()) => match Worker::spawn(&rt.cfg, config_path, true).await {
+                        Ok(new) => {
+                            // The new worker shares the ports (SO_REUSEPORT);
+                            // the old one stops accepting and drains.
+                            let mut old = std::mem::replace(&mut worker, new);
+                            tokio::spawn(async move { old.stop(grace).await });
+                            tracing::info!("configuration reloaded");
+                        }
+                        Err(e) => tracing::error!(error = %e, "reload: keeping the previous worker"),
+                    },
+                    Err(e) => tracing::error!(error = format!("{e:#}"), "reload rejected; nothing changed"),
+                }
             }
         }
     }
+}
+
+/// Validate the new configuration, then apply it to directories, PHP pools
+/// and background tasks. An invalid file changes nothing.
+async fn reload(rt: &mut Runtime, config_path: &Path) -> Result<()> {
+    let cfg = Config::load_env(config_path)?;
+    let mode = isolation::effective_mode(&cfg)?;
+    if mode != rt.mode {
+        anyhow::bail!("the isolation mode cannot change on reload; restart instead");
+    }
+    // Catch site errors (paths, auth files, ...) before touching anything.
+    Sites::new(&cfg).map_err(anyhow::Error::msg)?;
+    isolation::prepare_dirs(&cfg, mode)?;
+    php::reconcile(&cfg, mode, &mut rt.pools).await?;
+    let old_tasks = std::mem::replace(&mut rt.tasks, tasks::start_all(&cfg, mode)?);
+    old_tasks.stop().await;
+    rt.cfg = cfg;
+    Ok(())
 }
 
 /// Entry point for `nova worker` (strict mode child): sandbox self, then serve.
@@ -170,11 +285,28 @@ pub async fn worker_main(cfg: Config, config_path: PathBuf) -> Result<()> {
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     tracing::info!(uid, landlock = level.as_str(), "worker sandboxed");
-    run_worker(cfg, wait_for_signal()).await
+    run_worker(cfg, wait_for_signal(), false).await
 }
 
 /// HTTP server + optimizer, until `shutdown` resolves.
-async fn run_worker(cfg: Config, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
+async fn run_worker(
+    cfg: Config,
+    shutdown: impl std::future::Future<Output = ()>,
+    in_process: bool,
+) -> Result<()> {
+    if in_process {
+        // Shared mode has no separate supervisor to hand a reload to.
+        tokio::spawn(async {
+            use tokio::signal::unix::{SignalKind, signal};
+            if let Ok(mut hup) = signal(SignalKind::hangup()) {
+                while hup.recv().await.is_some() {
+                    tracing::warn!(
+                        "SIGHUP: live reload needs strict isolation (start as root); restart NOVA to apply changes"
+                    );
+                }
+            }
+        });
+    }
     let sites = Sites::new(&cfg).map_err(anyhow::Error::msg)?;
     let (stop_tx, stop_rx) = watch::channel(false);
 
@@ -243,9 +375,7 @@ async fn run_worker(cfg: Config, shutdown: impl std::future::Future<Output = ()>
     let app = Arc::new(app);
 
     let mut listeners = vec![nova_http::Listener {
-        tcp: tokio::net::TcpListener::bind(srv.listen)
-            .await
-            .with_context(|| format!("cannot listen on {}", srv.listen))?,
+        tcp: bind_tcp(srv.listen).with_context(|| format!("cannot listen on {}", srv.listen))?,
         tls: None,
         proxy_protocol: srv.proxy_protocol,
     }];
@@ -256,21 +386,29 @@ async fn run_worker(cfg: Config, shutdown: impl std::future::Future<Output = ()>
         let _ = nova_http::rustls::crypto::ring::default_provider().install_default();
         let t = tls::setup(&cfg).context("setting up TLS")?;
         listeners.push(nova_http::Listener {
-            tcp: tokio::net::TcpListener::bind(tls_cfg.listen)
-                .await
+            tcp: bind_tcp(tls_cfg.listen)
                 .with_context(|| format!("cannot listen on {}", tls_cfg.listen))?,
             tls: Some(t.settings),
             proxy_protocol: srv.proxy_protocol,
         });
         if let Some(qc) = t.quic {
+            let udp = bind_udp(tls_cfg.listen)
+                .with_context(|| format!("cannot listen on udp {}", tls_cfg.listen))?;
             quic = Some(
-                nova_http::quinn::Endpoint::server(qc, tls_cfg.listen)
-                    .with_context(|| format!("cannot listen on udp {}", tls_cfg.listen))?,
+                nova_http::quinn::Endpoint::new(
+                    nova_http::quinn::EndpointConfig::default(),
+                    Some(qc),
+                    udp,
+                    Arc::new(nova_http::quinn::TokioRuntime),
+                )
+                .context("starting the QUIC endpoint")?,
             );
         }
         acme_task = t.acme_task;
         tracing::info!(listen = %tls_cfg.listen, http3 = quic.is_some(), "accepting HTTPS connections");
     }
+
+    notify_ready();
 
     let shutdown = {
         let app = Arc::clone(&app);
@@ -330,6 +468,48 @@ async fn probe_php(
         }
         tx.send_if_modified(|v| std::mem::replace(v, all) != all);
     }
+}
+
+/// Listening sockets with SO_REUSEPORT, so a reloaded worker can bind the
+/// same ports while the previous one drains.
+fn bind_tcp(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let s = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    s.set_reuse_address(true)?;
+    s.set_reuse_port(true)?;
+    s.set_nonblocking(true)?;
+    s.bind(&addr.into())?;
+    s.listen(1024)?;
+    tokio::net::TcpListener::from_std(s.into())
+}
+
+fn bind_udp(addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let s = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    s.set_reuse_address(true)?;
+    s.set_reuse_port(true)?;
+    s.bind(&addr.into())?;
+    Ok(s.into())
+}
+
+/// Tell the supervisor (through the inherited pipe) that we accept connections.
+fn notify_ready() {
+    let Some(fd) = std::env::var("NOVA_READY_FD")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+    else {
+        return;
+    };
+    // SAFETY: the supervisor placed the pipe's write end at this descriptor;
+    // we take ownership once, write one byte and close it.
+    let mut f = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    let _ = std::io::Write::write_all(&mut f, b"1");
 }
 
 async fn wait_for_signal() {

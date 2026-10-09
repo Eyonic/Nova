@@ -185,14 +185,30 @@ where
     })
 }
 
+/// Connect to the pool. A missing or refusing socket is retried for a few
+/// seconds: that is a pool being (re)started, e.g. during a config reload,
+/// and the client should not see it.
 async fn connect(socket: &Path) -> Result<UnixStream, PhpError> {
-    match tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(socket)).await {
-        Ok(Ok(s)) => Ok(s),
-        Ok(Err(e)) => Err(PhpError::Unavailable(e)),
-        Err(_) => Err(PhpError::Unavailable(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "connect timed out",
-        ))),
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(socket)).await {
+            Ok(Ok(s)) => return Ok(s),
+            Ok(Err(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(Err(e)) => return Err(PhpError::Unavailable(e)),
+            Err(_) => {
+                return Err(PhpError::Unavailable(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "connect timed out",
+                )));
+            }
+        }
     }
 }
 

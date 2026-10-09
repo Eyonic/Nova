@@ -263,6 +263,43 @@ has "live metrics exported" "$(curl -s "$BASE/_nova/metrics")" "nova_live_publis
 # State left by another identity (e.g. from shared mode) must be re-owned on start.
 dc exec -T nova sh -c 'touch /var/lib/nova/sites/showcase/sessions/sess_legacy && chown 10001:10001 /var/lib/nova/sites/showcase/sessions/sess_legacy'
 
+section "Live reload (SIGHUP)"
+CONF=config/nova.toml
+cp "$CONF" "$WORK/nova.toml.orig"
+restore_conf() { cat "$WORK/nova.toml.orig" > "$CONF"; }
+trap 'restore_conf; rm -f "$WATCH"; cleanup' EXIT
+reloaded() { local n=$1; for _ in $(seq 60); do [ "$(dc logs nova 2>&1 | grep -c "$2")" -ge "$n" ] && return 0; sleep 0.5; done; return 1; }
+curl -s -m 20 "$BASE/slow.php?s=3" > "$WORK/reload-slow" &
+RSLOW=$!
+( for _ in $(seq 150); do curl -s -o /dev/null -w '%{http_code}\n' "$BASE/"; sleep 0.02; done ) > "$WORK/reload-codes" &
+LOAD=$!
+sleep 0.5
+# In-place edit (same inode): the file is bind-mounted into the container.
+python3 - "$CONF" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read().replace('[site.headers]\n', '[site.headers]\nX-Reload-Test = "applied"\n', 1)
+open(p, 'r+').write(s)
+PY
+BEFORE=$(dc logs nova 2>&1 | grep -c "configuration reloaded")
+dc kill -s HUP nova >/dev/null 2>&1
+check "reload completed" reloaded $((BEFORE + 1)) "configuration reloaded"
+wait $LOAD; wait $RSLOW
+eq "no failed requests during reload" "$(sort -u "$WORK/reload-codes" | tr '\n' ' ')" "200 "
+eq "in-flight request survived the reload" "$(cat "$WORK/reload-slow")" done
+has "new configuration applied" "$(curl -sI "$BASE/" | tr -d '\r')" "x-reload-test: applied"
+eq "PHP still answers after reload" "$(code "$BASE/info.php")" 200
+printf 'this is = not [valid toml\n' > "$CONF"
+REJ=$(dc logs nova 2>&1 | grep -c "reload rejected")
+dc kill -s HUP nova >/dev/null 2>&1
+check "invalid configuration rejected" reloaded $((REJ + 1)) "reload rejected"
+has "previous configuration keeps serving" "$(curl -sI "$BASE/" | tr -d '\r')" "x-reload-test: applied"
+restore_conf
+BEFORE=$(dc logs nova 2>&1 | grep -c "configuration reloaded")
+dc kill -s HUP nova >/dev/null 2>&1
+check "restored configuration reloaded" reloaded $((BEFORE + 1)) "configuration reloaded"
+hasnt "header gone again" "$(curl -sI "$BASE/" | tr -d '\r')" "x-reload-test"
+
 section "Graceful shutdown"
 curl -s -m 20 "$BASE/slow.php?s=3" > "$WORK/slow" &
 SLOW=$!
@@ -293,6 +330,7 @@ section "Background tasks and workers"
 U_EX=$(dc exec -T nova stat -c %u /var/lib/nova/sites/example)
 check "worker keeps running" dc exec -T nova test -s /var/lib/nova/sites/example/tmp/worker-alive
 eq "worker runs as the site's uid" "$(dc exec -T nova stat -c %u /var/lib/nova/sites/example/tmp/worker-alive)" "$U_EX"
+dc exec -T nova rm -f /var/lib/nova/sites/example/tmp/task-ran
 ran_task() { for _ in $(seq 70); do dc exec -T nova test -s /var/lib/nova/sites/example/tmp/task-ran && return 0; sleep 1; done; return 1; }
 check "scheduled task ran (within a minute)" ran_task
 eq "task runs as the site's uid" "$(dc exec -T nova stat -c %u /var/lib/nova/sites/example/tmp/task-ran)" "$U_EX"

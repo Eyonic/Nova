@@ -137,28 +137,87 @@ pub fn fpm_configs(cfg: &Config, mode: Effective) -> Result<Vec<FpmConfig>> {
     Ok(out)
 }
 
-/// Start every site's PHP. A site that fails to start is an error: running
-/// with a missing site would silently serve 503s.
-pub async fn start_all(cfg: &Config, mode: Effective) -> Result<Vec<Fpm>> {
+/// A running FPM master and what it was started from.
+pub struct Pool {
+    pub site: String,
+    fingerprint: String,
+    pub fpm: Fpm,
+}
+
+/// Everything that, when changed, requires restarting the master.
+fn fingerprint(fc: &FpmConfig) -> String {
+    format!(
+        "{}|{:?}|{:?}|{:?}|{}",
+        fc.render(),
+        fc.master_env(),
+        fc.launch.wrapper,
+        fc.launch.user,
+        fc.binary.display()
+    )
+}
+
+async fn start_pools(configs: Vec<FpmConfig>) -> Result<Vec<Pool>> {
     let mut started = Vec::new();
-    for fc in fpm_configs(cfg, mode)? {
+    for fc in configs {
         let site = fc.pool.site.clone();
+        let fp = fingerprint(&fc);
         let fpm = Fpm::start(fc)
             .await
             .with_context(|| format!("starting PHP for site {site:?}"))?;
-        started.push((site, fpm));
+        started.push(Pool {
+            site,
+            fingerprint: fp,
+            fpm,
+        });
     }
-    for (site, fpm) in &started {
-        if !fpm.wait_ready(Duration::from_secs(20)).await {
+    for p in &started {
+        if !p.fpm.wait_ready(Duration::from_secs(20)).await {
             tracing::warn!(
-                site,
+                site = p.site,
                 "PHP not ready after 20s; continuing, readiness will report it"
             );
         }
     }
-    Ok(started.into_iter().map(|(_, f)| f).collect())
+    Ok(started)
 }
 
-pub async fn stop_all(fpms: Vec<Fpm>) {
-    futures_util::future::join_all(fpms.into_iter().map(Fpm::shutdown)).await;
+/// Start every site's PHP. A site that fails to start is an error: running
+/// with a missing site would silently serve 503s.
+pub async fn start_all(cfg: &Config, mode: Effective) -> Result<Vec<Pool>> {
+    start_pools(fpm_configs(cfg, mode)?).await
+}
+
+/// Bring running pools in line with a new configuration: unchanged pools
+/// keep running, changed ones restart, removed ones stop, new ones start.
+pub async fn reconcile(cfg: &Config, mode: Effective, pools: &mut Vec<Pool>) -> Result<()> {
+    let wanted = fpm_configs(cfg, mode)?;
+    let mut keep = Vec::new();
+    for p in pools.drain(..) {
+        match wanted.iter().find(|fc| fc.pool.site == p.site) {
+            Some(fc) if fingerprint(fc) == p.fingerprint => keep.push(p),
+            other => {
+                tracing::info!(
+                    site = p.site,
+                    change = if other.is_some() {
+                        "changed"
+                    } else {
+                        "removed"
+                    },
+                    "stopping PHP pool"
+                );
+                p.fpm.shutdown().await;
+            }
+        }
+    }
+    let start: Vec<FpmConfig> = wanted
+        .into_iter()
+        .filter(|fc| !keep.iter().any(|p| p.site == fc.pool.site))
+        .collect();
+    keep.extend(start_pools(start).await?);
+    *pools = keep;
+    Ok(())
+}
+
+pub async fn stop_all(pools: Vec<Pool>) {
+    futures_util::future::join_all(pools.into_iter().map(|p| p.fpm.shutdown())).await;
 }
