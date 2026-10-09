@@ -12,13 +12,17 @@
 //! Shutdown (SIGTERM/SIGINT): readiness turns 503, the listener closes,
 //! in-flight requests drain, then the optimizer and PHP stop.
 
+pub mod client;
 pub mod dispatch;
 pub mod framework;
 pub mod isolation;
 pub mod live;
 pub mod metrics;
 pub mod php;
+pub mod ratelimit;
+pub mod rules;
 pub mod sites;
+pub mod tls;
 
 use anyhow::{Context, Result};
 use dispatch::App;
@@ -102,6 +106,16 @@ async fn supervise_worker(cfg: &Config, config_path: &Path) -> Result<()> {
                 cmd.env(key, v);
             }
         }
+        // Basic-auth password hashes (not secrets in themselves) the worker checks.
+        for var in cfg
+            .sites
+            .iter()
+            .filter_map(|s| s.auth.as_ref()?.users_env.as_ref())
+        {
+            if let Ok(v) = std::env::var(var) {
+                cmd.env(var, v);
+            }
+        }
         let mut child = cmd
             .kill_on_drop(true)
             .spawn()
@@ -181,7 +195,7 @@ async fn run_worker(cfg: Config, shutdown: impl std::future::Future<Output = ()>
         .iter()
         .map(|(name, d)| (name.clone(), d.host.clone(), d.port))
         .collect();
-    let app = Arc::new(App::new(
+    let mut app = App::new(
         cfg.mode,
         sites,
         optimizer,
@@ -191,12 +205,66 @@ async fn run_worker(cfg: Config, shutdown: impl std::future::Future<Output = ()>
         php_ready,
         databases,
         Arc::new(live::LiveHub::new(cfg.live.clone())),
-    ));
+    );
+    let comp = &cfg.server.compression;
+    if comp.enabled {
+        app.compression = Some(nova_http::compress::Options {
+            min_size: comp.min_size.0,
+        });
+        app.precompressed = comp.precompressed;
+    }
+    let srv = &cfg.server;
+    let rl = &srv.rate_limit;
+    let mut rate_exempt = srv.admin_allow.clone();
+    rate_exempt.extend(rl.exempt.iter().copied());
+    let tls_cfg = &srv.tls;
+    app.http = dispatch::HttpSettings {
+        trusted_proxies: srv.trusted_proxies.clone(),
+        admin_allow: srv.admin_allow.clone(),
+        rate_limit: rl
+            .enabled
+            .then(|| ratelimit::RateLimiter::new(rl.requests_per_sec, rl.burst)),
+        rate_exempt: rate_exempt.clone(),
+        body_timeout: Duration::from_secs(srv.request_body_timeout_secs.max(1)),
+        access_log: srv.access_log,
+        tls: tls_cfg.enabled.then_some(dispatch::TlsPublic {
+            port: tls_cfg.public_port,
+            hsts_max_age: tls_cfg.hsts_max_age_secs,
+            http3: tls_cfg.http3,
+            trusted_certs: tls_cfg.acme || !tls_cfg.certs.is_empty(),
+        }),
+    };
+    let app = Arc::new(app);
 
-    let listener = tokio::net::TcpListener::bind(cfg.server.listen)
-        .await
-        .with_context(|| format!("cannot listen on {}", cfg.server.listen))?;
-    tracing::info!(listen = %cfg.server.listen, "accepting connections");
+    let mut listeners = vec![nova_http::Listener {
+        tcp: tokio::net::TcpListener::bind(srv.listen)
+            .await
+            .with_context(|| format!("cannot listen on {}", srv.listen))?,
+        tls: None,
+        proxy_protocol: srv.proxy_protocol,
+    }];
+    tracing::info!(listen = %srv.listen, "accepting HTTP connections");
+    let mut quic = None;
+    let mut acme_task = None;
+    if tls_cfg.enabled {
+        let _ = nova_http::rustls::crypto::ring::default_provider().install_default();
+        let t = tls::setup(&cfg).context("setting up TLS")?;
+        listeners.push(nova_http::Listener {
+            tcp: tokio::net::TcpListener::bind(tls_cfg.listen)
+                .await
+                .with_context(|| format!("cannot listen on {}", tls_cfg.listen))?,
+            tls: Some(t.settings),
+            proxy_protocol: srv.proxy_protocol,
+        });
+        if let Some(qc) = t.quic {
+            quic = Some(
+                nova_http::quinn::Endpoint::server(qc, tls_cfg.listen)
+                    .with_context(|| format!("cannot listen on udp {}", tls_cfg.listen))?,
+            );
+        }
+        acme_task = t.acme_task;
+        tracing::info!(listen = %tls_cfg.listen, http3 = quic.is_some(), "accepting HTTPS connections");
+    }
 
     let shutdown = {
         let app = Arc::clone(&app);
@@ -207,12 +275,24 @@ async fn run_worker(cfg: Config, shutdown: impl std::future::Future<Output = ()>
             app.live.close();
         }
     };
+    // Trusted proxies multiplex many clients over few connections.
+    let mut conn_exempt = rate_exempt;
+    conn_exempt.extend(srv.trusted_proxies.iter().copied());
     let opts = nova_http::ServerOptions {
-        max_connections: cfg.server.max_connections,
-        header_read_timeout: Duration::from_secs(cfg.server.header_read_timeout_secs),
-        shutdown_grace: Duration::from_secs(cfg.server.shutdown_grace_secs),
+        max_connections: srv.max_connections,
+        max_connections_per_ip: if rl.enabled {
+            rl.max_connections_per_ip
+        } else {
+            0
+        },
+        per_ip_exempt: Arc::new(move |ip| nova_config::Cidr::any_contains(&conn_exempt, ip)),
+        header_read_timeout: Duration::from_secs(srv.header_read_timeout_secs),
+        shutdown_grace: Duration::from_secs(srv.shutdown_grace_secs),
     };
-    nova_http::serve(listener, opts, Arc::clone(&app), shutdown).await?;
+    nova_http::serve(listeners, quic, opts, Arc::clone(&app), shutdown).await?;
+    if let Some(t) = acme_task {
+        t.abort();
+    }
 
     let _ = stop_tx.send(true);
     if let Some(t) = optimize_task {

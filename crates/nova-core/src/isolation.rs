@@ -75,6 +75,7 @@ pub fn prepare_dirs(cfg: &Config, mode: Effective) -> Result<()> {
             framework::prepare_state(cfg, site).with_context(|| ctx(&sdir))?;
         }
         std::fs::create_dir_all(state.join("optimize"))?;
+        std::fs::create_dir_all(state.join("tls"))?;
         std::fs::create_dir_all(run.join("conf"))?;
         return Ok(());
     }
@@ -94,6 +95,10 @@ pub fn prepare_dirs(cfg: &Config, mode: Effective) -> Result<()> {
     if n > 0 {
         tracing::info!(changed = n, "re-owned optimizer state for the worker");
     }
+    // Certificates and ACME account keys: the worker's alone.
+    let tls = crate::tls::tls_dir(cfg);
+    ensure_dir(&tls, wuid, wgid, 0o700).with_context(|| ctx(&tls))?;
+    chown_tree(&tls, wuid, wgid).with_context(|| ctx(&tls))?;
     for site in &cfg.sites {
         let uid = cfg.site_uid(site);
         let sdir = sites::site_state_dir(cfg, site);
@@ -137,23 +142,42 @@ pub fn site_sandbox(cfg: &Config, site: &SiteConfig) -> Sandbox {
 }
 
 /// Landlock policy for the HTTP worker: read every site and the config,
-/// write optimizer state, reach PHP sockets, listen on the HTTP port and
-/// connect only to database ports (readiness checks).
+/// write optimizer and TLS state, reach PHP sockets, listen on the HTTP(S)
+/// ports and connect only to database ports (readiness checks) and, with
+/// ACME, to the certificate authority (443).
 pub fn worker_sandbox(cfg: &Config, config_path: &std::path::Path) -> Sandbox {
     let mut read = system_read_paths();
     read.push(config_path.to_path_buf());
     read.extend(cfg.sites.iter().map(|s| s.path.clone()));
     read.push(PathBuf::from("/proc/self"));
+    let tls = &cfg.server.tls;
+    for c in &tls.certs {
+        read.push(c.cert.clone());
+        read.push(c.key.clone());
+    }
+    read.extend(
+        cfg.sites
+            .iter()
+            .filter_map(|s| s.auth.as_ref()?.users_file.clone()),
+    );
     let mut write = safe_devices();
     write.push(cfg.paths.state_dir.join("optimize"));
+    write.push(crate::tls::tls_dir(cfg));
     write.push(cfg.paths.run_dir.join("php"));
     let mut connect: Vec<u16> = cfg.services.database.values().map(|d| d.port).collect();
+    let mut bind = vec![cfg.server.listen.port()];
+    if tls.enabled {
+        bind.push(tls.listen.port());
+        if tls.acme {
+            connect.push(443);
+        }
+    }
     connect.sort_unstable();
     connect.dedup();
     Sandbox {
         read,
         write,
         connect_tcp: connect,
-        bind_tcp: vec![cfg.server.listen.port()],
+        bind_tcp: bind,
     }
 }

@@ -8,18 +8,21 @@
 //! 5. execution: optimized image, static file, or PHP via FastCGI
 //! 6. response headers, metrics and the access log line
 
+use crate::client::{self, Client};
 use crate::live::{self, LiveHub};
 use crate::metrics::{Kind, Metrics};
+use crate::ratelimit::RateLimiter;
 use crate::sites::{Site, SitePhp, Sites, strip_port};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http::{HeaderValue, Method, Request, Response, StatusCode, Version, header};
-use http_body_util::{BodyExt, BodyStream, Limited, StreamBody};
-use hyper::body::{Body as _, Frame, Incoming};
-use nova_config::Mode;
+use http_body_util::{BodyExt, BodyStream, StreamBody};
+use hyper::body::{Body as _, Frame};
+use nova_config::{Cidr, Mode};
+use nova_http::compress::{self, Encoding};
 use nova_http::path::{self, PathError, SafePath};
 use nova_http::static_files::{self, FileResponse};
-use nova_http::{Body, empty, full};
+use nova_http::{Body, ConnInfo, ReqBody, empty, full};
 use nova_optimize::Optimizer;
 use nova_optimize::manifest::Format;
 use nova_runtime_php::{CgiRequest, PhpError, PhpRequest};
@@ -46,6 +49,11 @@ pub struct App {
     pub databases: Vec<(String, String, u16)>,
     pub shutting_down: AtomicBool,
     pub live: Arc<LiveHub>,
+    /// `None` disables response compression.
+    pub compression: Option<compress::Options>,
+    /// Serve precompressed siblings (`app.css.br`) of static files.
+    pub precompressed: bool,
+    pub http: HttpSettings,
     boot: u32,
     seq: AtomicU64,
 }
@@ -79,6 +87,9 @@ impl App {
             databases,
             shutting_down: AtomicBool::new(false),
             live,
+            compression: None,
+            precompressed: false,
+            http: HttpSettings::default(),
             boot,
             seq: AtomicU64::new(0),
         }
@@ -92,6 +103,58 @@ impl App {
         )
     }
 }
+
+/// Server-wide HTTP behaviour (proxies, limits, TLS facts for headers).
+pub struct HttpSettings {
+    pub trusted_proxies: Vec<Cidr>,
+    /// Clients allowed to read metrics and optimizer status.
+    pub admin_allow: Vec<Cidr>,
+    pub rate_limit: Option<RateLimiter>,
+    /// Clients the rate limit never applies to.
+    pub rate_exempt: Vec<Cidr>,
+    /// Abort a request body that sends nothing for this long.
+    pub body_timeout: Duration,
+    pub access_log: bool,
+    pub tls: Option<TlsPublic>,
+}
+
+impl Default for HttpSettings {
+    fn default() -> Self {
+        Self {
+            trusted_proxies: Vec::new(),
+            admin_allow: Cidr::private_ranges(),
+            rate_limit: None,
+            rate_exempt: Vec::new(),
+            body_timeout: Duration::from_secs(60),
+            access_log: true,
+            tls: None,
+        }
+    }
+}
+
+/// What clients need to know about NOVA's HTTPS endpoint.
+#[derive(Debug, Clone)]
+pub struct TlsPublic {
+    /// Port in `https://` redirects and `Alt-Svc`.
+    pub port: u16,
+    pub hsts_max_age: u64,
+    pub http3: bool,
+    /// Publicly trusted certificates exist (ACME or configured files), so
+    /// public hosts are redirected to HTTPS and get HSTS by default.
+    pub trusted_certs: bool,
+}
+
+impl TlsPublic {
+    /// Only hosts with a publicly trusted certificate: HSTS or a forced
+    /// redirect on a self-signed `localhost` would lock browsers out.
+    fn trusted(&self, host: &str) -> bool {
+        self.trusted_certs && crate::tls::acme_eligible(host)
+    }
+}
+
+/// Marks error responses NOVA generated itself (eligible for site error pages).
+#[derive(Debug, Clone, Copy)]
+struct NovaError;
 
 /// Where a request ends up after resolution.
 #[derive(Debug)]
@@ -107,12 +170,55 @@ enum Target {
 }
 
 impl nova_http::Handler for App {
-    async fn handle(&self, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
+    async fn handle(&self, req: Request<ReqBody>, conn: ConnInfo) -> Response<Body> {
         let start = Instant::now();
         let id = self.next_request_id();
         let method = req.method().clone();
+        let version = req.version();
         let uri_path = req.uri().path().to_owned();
-        let (mut resp, kind, site) = self.route(req, peer, &id).await;
+        let client = client::resolve(req.headers(), &conn, &self.http.trusted_proxies);
+        let (accept_encoding, host, user_agent, referer) = {
+            let header = |name: header::HeaderName| {
+                req.headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            };
+            (
+                header(header::ACCEPT_ENCODING),
+                request_host(&req).map(str::to_owned),
+                header(header::USER_AGENT),
+                header(header::REFERER),
+            )
+        };
+        let (mut resp, kind, site) = self.route(req, client, &id).await;
+
+        if let Some(site) = site {
+            if resp.extensions().get::<NovaError>().is_some()
+                && let Some(page) = site.rules.error_pages.get(&resp.status().as_u16())
+            {
+                resp = error_page(site, page, resp).await;
+            }
+            let bare = host.as_deref().map(strip_port).unwrap_or("");
+            let hsts = self
+                .http
+                .tls
+                .as_ref()
+                .filter(|t| t.trusted(&bare.to_ascii_lowercase()))
+                .map_or(0, |t| t.hsts_max_age);
+            site.rules
+                .apply_headers(resp.headers_mut(), client.https, hsts);
+        }
+        if let Some(tls) = &self.http.tls
+            && tls.http3
+            && conn.tls
+            && let Ok(v) = HeaderValue::from_str(&format!("h3=\":{}\"; ma=86400", tls.port))
+        {
+            resp.headers_mut().insert(header::ALT_SVC, v);
+        }
+        if let Some(opts) = &self.compression {
+            resp = compress::apply(resp, &method, accept_encoding.as_deref(), opts);
+        }
 
         let h = resp.headers_mut();
         h.insert(header::SERVER, HeaderValue::from_static("nova"));
@@ -121,16 +227,29 @@ impl nova_http::Handler for App {
         }
         let status = resp.status().as_u16();
         self.metrics.record(kind, status);
-        if kind != Kind::Internal {
+        if kind != Kind::Internal && self.http.access_log {
+            let bytes = resp
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
             tracing::info!(
                 target: "nova::access",
                 request_id = %id,
-                site = site.unwrap_or("-"),
-                %peer,
+                site = site.map_or("-", |s| s.name.as_str()),
+                client = %client.ip,
+                peer = %conn.peer,
+                host = host.as_deref().unwrap_or("-"),
                 method = %method,
                 path = %uri_path,
+                protocol = if conn.http3 { "HTTP/3" } else { protocol_name(version) },
+                tls = client.https,
                 status,
+                bytes,
                 kind = kind.as_str(),
+                encoding = resp.headers().get(header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()),
+                referer = referer.as_deref(),
+                user_agent = user_agent.as_deref(),
                 duration_ms = start.elapsed().as_secs_f64() * 1e3,
             );
         }
@@ -138,19 +257,53 @@ impl nova_http::Handler for App {
     }
 }
 
+/// `Host` (HTTP/1.1) or `:authority` (HTTP/2, HTTP/3).
+fn request_host<B>(req: &Request<B>) -> Option<&str> {
+    req.headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()))
+}
+
+fn protocol_name(v: Version) -> &'static str {
+    match v {
+        Version::HTTP_09 => "HTTP/0.9",
+        Version::HTTP_10 => "HTTP/1.0",
+        Version::HTTP_2 => "HTTP/2.0",
+        Version::HTTP_3 => "HTTP/3.0",
+        _ => "HTTP/1.1",
+    }
+}
+
+/// Replace NOVA's built-in error body with the site's own page.
+async fn error_page(site: &Site, page: &str, resp: Response<Body>) -> Response<Body> {
+    let path = site.root.join(page.trim_start_matches('/'));
+    let Some(file) = contained(site, &path).await else {
+        return resp;
+    };
+    match tokio::fs::read(&file).await {
+        Ok(bytes) if bytes.len() <= 1 << 20 => {
+            let (mut parts, _) = resp.into_parts();
+            if let Ok(ct) = HeaderValue::from_str(&static_files::guess_mime(&file)) {
+                parts.headers.insert(header::CONTENT_TYPE, ct);
+            }
+            parts
+                .headers
+                .insert(header::CONTENT_LENGTH, bytes.len().into());
+            Response::from_parts(parts, full(bytes))
+        }
+        _ => resp,
+    }
+}
+
 impl App {
     async fn route<'a>(
         &'a self,
-        req: Request<Incoming>,
-        peer: SocketAddr,
+        req: Request<ReqBody>,
+        client: Client,
         id: &str,
-    ) -> (Response<Body>, Kind, Option<&'a str>) {
-        // HTTP/2 carries the host in :authority, HTTP/1.1 in Host.
-        let host = req
-            .headers()
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    ) -> (Response<Body>, Kind, Option<&'a Site>) {
+        let host = request_host(&req);
 
         if req.uri().path().starts_with("/_nova/live") && self.live.enabled() {
             if req.method() != Method::GET && req.method() != Method::HEAD {
@@ -179,17 +332,31 @@ impl App {
                                 .into_owned()
                         })
                         .unwrap_or_default();
-                    let resp = match self.live.subscribe(&site.name, &channels, peer.ip()) {
+                    let resp = match self.live.subscribe(&site.name, &channels, client.ip) {
                         Ok(r) => r,
                         Err(e) => LiveHub::error_response(e),
                     };
-                    return (resp, Kind::Internal, Some(site.name.as_str()));
+                    return (resp, Kind::Internal, Some(site));
                 }
                 _ => {}
             }
         }
         if req.uri().path().starts_with("/_nova/") {
-            return (self.internal(&req).await, Kind::Internal, None);
+            return (self.internal(&req, client).await, Kind::Internal, None);
+        }
+
+        if let Some(rl) = &self.http.rate_limit
+            && !Cidr::any_contains(&self.http.rate_exempt, client.ip)
+            && let Err(wait) = rl.check(client.ip)
+        {
+            let mut resp = self.error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many requests. Please slow down.",
+                None,
+            );
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, (wait.as_secs() + 1).into());
+            return (resp, Kind::Error, None);
         }
 
         let Some(site) = self.sites.lookup(host) else {
@@ -203,7 +370,30 @@ impl App {
                 None,
             );
         };
-        let name = Some(site.name.as_str());
+        let name = Some(site);
+
+        if let Some(resp) = self.site_redirect(site, &req, client) {
+            return (resp, Kind::Static, name);
+        }
+        if let Some(auth) = &site.rules.auth
+            && auth.applies(req.uri().path())
+        {
+            let given = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok());
+            if !auth.check(given).await {
+                let mut resp =
+                    self.error(StatusCode::UNAUTHORIZED, "Authentication required.", None);
+                if let Ok(v) = HeaderValue::from_str(&format!(
+                    "Basic realm=\"{}\", charset=\"UTF-8\"",
+                    auth.realm
+                )) {
+                    resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+                }
+                return (resp, Kind::Error, name);
+            }
+        }
 
         let safe = match path::resolve(req.uri().path()) {
             Ok(p) => p,
@@ -234,7 +424,16 @@ impl App {
             } => match &site.php {
                 Some(php) => {
                     let resp = self
-                        .run_php(site, php, req, peer, id, &script, &script_name, &path_info)
+                        .run_php(
+                            site,
+                            php,
+                            req,
+                            client,
+                            id,
+                            &script,
+                            &script_name,
+                            &path_info,
+                        )
                         .await;
                     (resp, Kind::Php, name)
                 }
@@ -252,9 +451,8 @@ impl App {
                         .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
                     return (resp, Kind::Error, name);
                 }
-                self.serve_static(site, &req, &file, &meta)
-                    .await
-                    .map_name(name)
+                let (resp, kind) = self.serve_static(site, &req, &file, &meta).await;
+                (resp, kind, name)
             }
         }
     }
@@ -262,15 +460,20 @@ impl App {
     async fn serve_static(
         &self,
         site: &Site,
-        req: &Request<Incoming>,
+        req: &Request<ReqBody>,
         file: &Path,
         meta: &Metadata,
     ) -> (Response<Body>, Kind) {
-        let cache = if self.mode.is_dev() {
-            "no-cache"
-        } else {
-            "public, max-age=0, must-revalidate"
-        };
+        let rel = file
+            .strip_prefix(&site.root)
+            .ok()
+            .and_then(|r| r.to_str())
+            .unwrap_or("");
+        let cache_control =
+            site.rules
+                .cache
+                .cache_control(rel, req.uri().query(), self.mode.is_dev());
+        let cache = cache_control.as_str();
         let optimizable = Format::from_path(file).is_some();
 
         if optimizable
@@ -304,6 +507,26 @@ impl App {
             }
         }
 
+        if let Some((enc, path, pmeta)) = self.precompressed_sibling(site, req, file, meta).await {
+            let ctype = static_files::guess_mime(file);
+            let fr = FileResponse {
+                path: &path,
+                meta: &pmeta,
+                content_type: Some(&ctype),
+                cache_control: cache,
+            };
+            let mut resp = static_files::respond(fr, req.method(), req.headers()).await;
+            let h = resp.headers_mut();
+            // Byte ranges would address the encoded file, not the original.
+            h.remove(header::ACCEPT_RANGES);
+            h.insert(
+                header::CONTENT_ENCODING,
+                HeaderValue::from_static(enc.token()),
+            );
+            compress::add_vary(h, "Accept-Encoding");
+            return (resp, Kind::Static);
+        }
+
         let fr = FileResponse {
             path: file,
             meta,
@@ -318,13 +541,50 @@ impl App {
         (resp, Kind::Static)
     }
 
+    /// A precompressed sibling (`app.css.br`) produced by the site's build,
+    /// in the client's preferred encoding. It must be at least as new as the
+    /// original so a stale build artifact is never served.
+    async fn precompressed_sibling(
+        &self,
+        site: &Site,
+        req: &Request<ReqBody>,
+        file: &Path,
+        meta: &Metadata,
+    ) -> Option<(Encoding, PathBuf, Metadata)> {
+        if !self.precompressed
+            || self.compression.is_none()
+            || req.headers().contains_key(header::RANGE)
+            || !compress::is_compressible(&static_files::guess_mime(file))
+        {
+            return None;
+        }
+        let accept = req
+            .headers()
+            .get(header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok());
+        let modified = meta.modified().ok()?;
+        for enc in compress::accepted(accept) {
+            let mut name = file.as_os_str().to_owned();
+            name.push(".");
+            name.push(enc.extension());
+            let sibling = PathBuf::from(name);
+            if let Some(m) = file_meta(&sibling).await
+                && m.modified().is_ok_and(|t| t >= modified)
+                && let Some(c) = contained(site, &sibling).await
+            {
+                return Some((enc, c, m));
+            }
+        }
+        None
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn run_php(
         &self,
         site: &Site,
         php: &SitePhp,
-        req: Request<Incoming>,
-        peer: SocketAddr,
+        req: Request<ReqBody>,
+        client: Client,
         id: &str,
         script: &Path,
         script_name: &str,
@@ -347,42 +607,51 @@ impl App {
 
         // PHP needs CONTENT_LENGTH up front. With a declared length the body
         // is streamed; otherwise (chunked) it is buffered up to the limit.
+        // Either way a client that stalls mid-upload is cut off.
         type BodyStreamBox =
             std::pin::Pin<Box<dyn futures_util::Stream<Item = io::Result<Bytes>> + Send>>;
+        let end_stream = body.is_end_stream();
+        let frames = BodyStream::new(body).filter_map(|frame| async move {
+            match frame {
+                Ok(f) => f.into_data().ok().map(Ok),
+                Err(e) => Some(Err(e)),
+            }
+        });
+        let mut timed: BodyStreamBox = Box::pin(idle_timeout(frames, self.http.body_timeout));
         let (stream, content_length): (BodyStreamBox, Option<u64>) =
-            if declared.is_some() || body.is_end_stream() {
-                let s = BodyStream::new(body).filter_map(|frame| async move {
-                    match frame {
-                        Ok(f) => f.into_data().ok().map(Ok),
-                        Err(e) => Some(Err(io::Error::other(e))),
-                    }
-                });
-                (Box::pin(s), declared)
+            if declared.is_some() || end_stream {
+                (timed, declared)
             } else {
-                match Limited::new(body, self.max_body as usize).collect().await {
-                    Ok(c) => {
-                        let bytes = c.to_bytes();
-                        let len = bytes.len() as u64;
-                        (Box::pin(futures_util::stream::iter([Ok(bytes)])), Some(len))
-                    }
-                    Err(e)
-                        if e.downcast_ref::<http_body_util::LengthLimitError>()
-                            .is_some() =>
-                    {
-                        return self.error(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            "Request body too large.",
-                            None,
-                        );
-                    }
-                    Err(_) => {
-                        return self.error(
-                            StatusCode::BAD_REQUEST,
-                            "Could not read request body.",
-                            None,
-                        );
+                let mut buf = bytes::BytesMut::new();
+                while let Some(chunk) = timed.next().await {
+                    match chunk {
+                        Ok(c) if (buf.len() + c.len()) as u64 > self.max_body => {
+                            return self.error(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "Request body too large.",
+                                None,
+                            );
+                        }
+                        Ok(c) => buf.extend_from_slice(&c),
+                        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                            return self.error(
+                                StatusCode::REQUEST_TIMEOUT,
+                                "The request body was not received in time.",
+                                None,
+                            );
+                        }
+                        Err(_) => {
+                            return self.error(
+                                StatusCode::BAD_REQUEST,
+                                "Could not read request body.",
+                                None,
+                            );
+                        }
                     }
                 }
+                let bytes = buf.freeze();
+                let len = bytes.len() as u64;
+                (Box::pin(futures_util::stream::iter([Ok(bytes)])), Some(len))
             };
 
         let host = parts
@@ -391,6 +660,12 @@ impl App {
             .and_then(|v| v.to_str().ok())
             .or_else(|| parts.uri.authority().map(|a| a.as_str()))
             .unwrap_or("");
+        // The port the client used: explicit in Host, else the scheme's default.
+        let server_port = host
+            .rsplit_once(':')
+            .filter(|(h, _)| !h.ends_with(']') || host.starts_with('['))
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .unwrap_or(if client.https { 443 } else { 80 });
         let request_uri = parts
             .uri
             .path_and_query()
@@ -411,10 +686,10 @@ impl App {
             path_info,
             document_root: &site.root,
             server_name: strip_port(host),
-            server_port: self.server_port,
+            server_port,
             server_protocol: protocol,
-            remote_addr: peer,
-            https: false,
+            remote_addr: SocketAddr::new(client.ip, 0),
+            https: client.https,
             headers: &parts.headers,
             content_length,
             request_id: id,
@@ -496,7 +771,8 @@ impl App {
         resp
     }
 
-    async fn internal(&self, req: &Request<Incoming>) -> Response<Body> {
+    async fn internal(&self, req: &Request<ReqBody>, client: Client) -> Response<Body> {
+        let admin = Cidr::any_contains(&self.http.admin_allow, client.ip);
         let json = |status: StatusCode, v: serde_json::Value| {
             Response::builder()
                 .status(status)
@@ -519,7 +795,7 @@ impl App {
                     serde_json::json!({ "status": if ok { "ready" } else { "not_ready" }, "checks": checks }),
                 )
             }
-            "/_nova/metrics" if self.metrics_enabled => {
+            "/_nova/metrics" if self.metrics_enabled && admin => {
                 let (mut assets, mut variants, mut errors) = (0u64, 0u64, 0u64);
                 if let Some(opt) = &self.optimizer {
                     for site in self.sites.iter() {
@@ -569,7 +845,7 @@ impl App {
                     .body(full(body))
                     .unwrap()
             }
-            "/_nova/optimize/status" if self.metrics_enabled => {
+            "/_nova/optimize/status" if self.metrics_enabled && admin => {
                 let mut out = serde_json::Map::new();
                 if let Some(opt) = &self.optimizer {
                     for site in self.sites.iter() {
@@ -645,19 +921,97 @@ impl App {
             .status(status)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(header::CACHE_CONTROL, "no-store")
+            .extension(NovaError)
             .body(full(body))
             .unwrap()
     }
-}
 
-trait WithName<'a> {
-    fn map_name(self, name: Option<&'a str>) -> (Response<Body>, Kind, Option<&'a str>);
-}
+    /// HTTPS upgrade, canonical host and configured redirects, in that order.
+    fn site_redirect(
+        &self,
+        site: &Site,
+        req: &Request<ReqBody>,
+        client: Client,
+    ) -> Option<Response<Body>> {
+        let uri = req.uri();
+        let path_q = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        let host = request_host(req).unwrap_or("");
+        let bare = strip_port(host).trim_end_matches('.').to_ascii_lowercase();
+        let port = host
+            .strip_prefix(strip_port(host))
+            .and_then(|p| p.strip_prefix(':'));
+        let rules = &site.rules;
+        let redirect = |status: StatusCode, location: String| {
+            let mut r = Response::builder()
+                .status(status)
+                .header(header::CACHE_CONTROL, "no-cache");
+            if let Ok(v) = HeaderValue::from_str(&location) {
+                r = r.header(header::LOCATION, v);
+            }
+            r.body(empty()).unwrap()
+        };
+        // Keep 301/302 semantics for GET/HEAD; 308 preserves other methods.
+        let permanent = if matches!(*req.method(), Method::GET | Method::HEAD) {
+            StatusCode::MOVED_PERMANENTLY
+        } else {
+            StatusCode::PERMANENT_REDIRECT
+        };
 
-impl<'a> WithName<'a> for (Response<Body>, Kind) {
-    fn map_name(self, name: Option<&'a str>) -> (Response<Body>, Kind, Option<&'a str>) {
-        (self.0, self.1, name)
+        let target_host = rules.canonical_host.clone().unwrap_or_else(|| bare.clone());
+        if let Some(tls) = &self.http.tls
+            && !client.https
+            && rules.https_redirect.unwrap_or_else(|| tls.trusted(&bare))
+            && !uri.path().starts_with("/.well-known/acme-challenge/")
+        {
+            let port = if tls.port == 443 {
+                String::new()
+            } else {
+                format!(":{}", tls.port)
+            };
+            return Some(redirect(
+                permanent,
+                format!("https://{target_host}{port}{path_q}"),
+            ));
+        }
+        if let Some(canonical) = &rules.canonical_host
+            && *canonical != bare
+            && !bare.is_empty()
+        {
+            let scheme = if client.https { "https" } else { "http" };
+            let port = port.map(|p| format!(":{p}")).unwrap_or_default();
+            return Some(redirect(
+                permanent,
+                format!("{scheme}://{canonical}{port}{path_q}"),
+            ));
+        }
+        rules
+            .redirect(uri.path(), uri.query())
+            .map(|(status, location)| redirect(status, location))
     }
+}
+
+/// Fail a body stream that delivers nothing for `timeout`.
+fn idle_timeout<S>(
+    stream: S,
+    timeout: Duration,
+) -> impl futures_util::Stream<Item = io::Result<Bytes>>
+where
+    S: futures_util::Stream<Item = io::Result<Bytes>> + Send + 'static,
+{
+    futures_util::stream::unfold(Some(Box::pin(stream)), move |state| async move {
+        let mut s = state?;
+        match tokio::time::timeout(timeout, s.next()).await {
+            Ok(Some(item)) => Some((item, Some(s))),
+            Ok(None) => None,
+            Err(_) => Some((
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "request body timed out",
+                )),
+                None,
+            )),
+        }
+    })
 }
 
 fn is_php(p: &Path) -> bool {
@@ -789,7 +1143,12 @@ mod tests {
     use super::*;
 
     fn site(root: &Path, php: bool, fc: Option<&str>) -> Site {
+        let cfg = nova_config::Config::from_toml(
+            "version = 1\n[[site]]\nname = \"t\"\ndefault = true\npath = \"/srv\"\n",
+        )
+        .unwrap();
         Site {
+            rules: crate::rules::SiteRules::new(&cfg.sites[0], root).unwrap(),
             name: "t".into(),
             root: std::fs::canonicalize(root).unwrap(),
             project_dir: root.to_owned(),

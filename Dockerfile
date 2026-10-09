@@ -70,7 +70,7 @@ COPY sites /srv/sites
 # compose.yaml), prepares ownership, then runs the HTTP worker as `nova`
 # (uid 10001) and every site's PHP under its own uid, all without capabilities.
 ENV NOVA_CONFIG=/etc/nova/nova.toml
-EXPOSE 8080
+EXPOSE 8080 8443 8443/udp
 VOLUME ["/var/lib/nova"]
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=3 CMD ["nova", "health"]

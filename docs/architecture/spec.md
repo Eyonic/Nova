@@ -184,9 +184,6 @@ Objects live in `<state>/optimize/objects/<2 hex>/<32 hex>.<ext>`.
   namespaces (future).
 * Application code is mounted read-only and readable by the worker; the
   worker is trusted (Rust, sandboxed, no secrets, no capabilities).
-* No TLS termination yet (phase 10); `HTTPS` is never set for PHP, and
-  `X-Forwarded-*` is not trusted.
-* No response compression or long-lived caching for hashed assets (phase 8).
 * Generated objects are never garbage-collected yet.
 * Change detection is polling (`scan_interval_secs`), not inotify.
 * Animated images and GIF are served unmodified.

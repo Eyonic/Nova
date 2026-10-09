@@ -20,5 +20,6 @@ echo json_encode([
     'raw_body_bytes' => strlen(file_get_contents('php://input')),
     'request_id' => $_SERVER['NOVA_REQUEST_ID'] ?? null,
     'https' => $_SERVER['HTTPS'] ?? null,
+    'remote_addr' => $_SERVER['REMOTE_ADDR'] ?? null,
     'extensions' => array_values(array_intersect(['pdo_mysql', 'mysqli', 'Zend OPcache'], get_loaded_extensions(false) + get_loaded_extensions(true))),
 ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);

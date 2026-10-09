@@ -13,6 +13,8 @@ services:
     image: nova:dev
     ports:
       - "${NOVA_HTTP_PORT:-8080}:8080"
+      - "${NOVA_HTTPS_PORT:-8443}:8443"
+      - "${NOVA_HTTPS_PORT:-8443}:8443/udp"   # HTTP/3 (QUIC)
     environment:
       NOVA_MODE: ${NOVA_MODE:-development}
       NOVA_LOG: ${NOVA_LOG:-info}

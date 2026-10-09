@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+bcrypt = "0.19.3"
 bytes = "1.12.1"
 futures-util = "0.3.34"
 http = "1.5.0"
@@ -20,6 +21,9 @@ nova-optimize = { version = "0.1.0", path = "../nova-optimize" }
 nova-runtime-php = { version = "0.1.0", path = "../nova-runtime-php" }
 nova-security = { version = "0.1.0", path = "../nova-security" }
 percent-encoding = "2.3.2"
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-acme = { version = "0.15.4", default-features = false, features = ["ring", "tokio", "webpki-roots", "tls12"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.2", features = ["full"] }
 tracing = "0.1.44"

@@ -12,11 +12,14 @@ cd "$(dirname "$0")/../.."
 
 PROJECT=nova-test
 PORT=${NOVA_TEST_PORT:-18088}
+TLS_PORT=${NOVA_TEST_TLS_PORT:-18443}
 BASE="http://127.0.0.1:$PORT"
+TBASE="https://127.0.0.1:$TLS_PORT"
 WORK=$(mktemp -d)
 rnd() { head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 20; }
 cat > "$WORK/env" <<EOF
 NOVA_HTTP_PORT=$PORT
+NOVA_HTTPS_PORT=$TLS_PORT
 NOVA_MODE=production
 NOVA_DB_ROOT_PASSWORD=$(rnd)
 NOVA_DB_EXAMPLE_PASSWORD=$(rnd)
@@ -75,6 +78,57 @@ eq "encoded traversal rejected" "$(code --path-as-is "$BASE/images/%2e%2e/%2e%2e
 eq "dotfiles hidden" "$(code "$BASE/.env")" 404
 eq "POST to static file → 405" "$(code -X POST "$BASE/index.html")" 405
 eq "unknown host falls back to default site" "$(code -H 'Host: nowhere.test' "$BASE/")" 200
+
+section "Compression"
+H=$(curl -s -o /dev/null -D - -H 'Accept-Encoding: br, gzip' "$BASE/" | tr -d '\r')
+has "static HTML compressed with brotli" "$H" "content-encoding: br"
+has "compressed response varies on Accept-Encoding" "$H" "vary: Accept-Encoding"
+hasnt "no identity length on compressed body" "$H" "content-length:"
+eq "gzip body decodes to the original" "$(curl -s --compressed -H 'Accept-Encoding: gzip' "$BASE/" | md5sum)" "$(curl -s "$BASE/" | md5sum)"
+hasnt "identity when the client asks for nothing" "$(curl -sI "$BASE/" | tr -d '\r')" "content-encoding"
+hasnt "images are not recompressed" "$(curl -s -o /dev/null -D - -H 'Accept-Encoding: br' "$BASE/images/hero.jpg" | tr -d '\r')" "content-encoding"
+eq "range requests stay uncompressed" "$(curl -s -H 'Accept-Encoding: br' -H 'Range: bytes=0-9' "$BASE/" | wc -c | tr -d ' ')" 10
+has "PHP output compressed" "$(curl -s -o /dev/null -D - -H 'Accept-Encoding: zstd' "$BASE/info.php" | tr -d '\r')" "content-encoding: zstd"
+
+section "Caching"
+eq "fingerprinted bundle (Vite manifest) is immutable" \
+  "$(curl -s -o /dev/null -w '%header{cache-control}' "$BASE/build/assets/app-Bx7Kq2Lm.js")" "public, max-age=31536000, immutable"
+eq "other files revalidate" "$(curl -s -o /dev/null -w '%header{cache-control}' "$BASE/index.html")" "public, max-age=0, must-revalidate"
+H=$(curl -s -D - -o "$WORK/bundle" -H 'Accept-Encoding: gzip' "$BASE/build/assets/app-Bx7Kq2Lm.js" | tr -d '\r')
+has "precompressed sibling served" "$H" "content-encoding: gzip"
+eq "precompressed body is the .gz file" "$(md5sum < "$WORK/bundle")" "$(md5sum < sites/example/public/build/assets/app-Bx7Kq2Lm.js.gz)"
+
+section "Site rules"
+H=$(curl -sI "$BASE/" | tr -d '\r')
+has "configured header" "$H" "permissions-policy: camera=()"
+has "security baseline header" "$H" "x-frame-options: SAMEORIGIN"
+hasnt "no HSTS for a self-signed local host" "$(curl -skI "$TBASE/" | tr -d '\r')" "strict-transport-security"
+eq "redirect rule keeps the query" "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE/old-home?a=1")" "301 $BASE/?a=1"
+eq "wildcard redirect" "$(curl -s -o /dev/null -w '%{http_code} %header{location}' "$BASE/docs/spec.md")" "302 https://github.com/Eyonic/Nova/tree/main/docs/spec.md"
+has "site error page for NOVA's 404" "$(curl -s "$BASE/.env")" "Lost in space"
+eq "error page keeps the status" "$(code "$BASE/.env")" 404
+eq "basic auth required" "$(code "$BASE/private/")" 401
+has "auth challenge" "$(curl -sI "$BASE/private/" | tr -d '\r')" 'www-authenticate: Basic realm="NOVA demo"'
+eq "wrong password rejected" "$(code -u nova:wrong "$BASE/private/")" 401
+eq "right password accepted" "$(code -u nova:demo "$BASE/private/")" 200
+eq "auth limited to its paths" "$(code "$BASE/index.html")" 200
+
+section "Proxies and admin endpoints"
+has "trusted proxy: client IP from X-Forwarded-For" \
+  "$(curl -s -H 'X-Forwarded-For: 6.6.6.6, 198.51.100.23' "$BASE/info.php")" '"remote_addr": "198.51.100.23"'
+has "trusted proxy: HTTPS from X-Forwarded-Proto" "$(curl -s -H 'X-Forwarded-Proto: https' "$BASE/info.php")" '"https": "on"'
+eq "metrics allowed from the private network" "$(code "$BASE/_nova/metrics")" 200
+eq "metrics hidden from public clients" "$(code -H 'X-Forwarded-For: 203.0.113.9' "$BASE/_nova/metrics")" 404
+eq "health stays public" "$(code -H 'X-Forwarded-For: 203.0.113.9' "$BASE/_nova/health/live")" 200
+
+section "HTTPS, HTTP/2, HTTP/3"
+eq "HTTPS with HTTP/2" "$(curl -sk -o /dev/null -w '%{http_code} %{http_version}' "$TBASE/")" "200 2"
+has "PHP sees HTTPS" "$(curl -sk "$TBASE/info.php")" '"https": "on"'
+has "HTTP/3 advertised" "$(curl -skI "$TBASE/" | tr -d '\r')" 'alt-svc: h3=":'
+eq "HTTP/3 over QUIC" "$(curl -sk --http3-only -o /dev/null -w '%{http_code} %{http_version}' "$TBASE/")" "200 3"
+eq "HTTP/3 PHP request with a body" "$(curl -sk --http3-only -d 'a=1' "$TBASE/info.php" | grep -c '"a": "1"')" 1
+eq "plain HTTP not forced to HTTPS for local hosts" "$(code "$BASE/")" 200
+check "self-signed certificate persisted" dc exec -T nova test -s /var/lib/nova/tls/self-signed/cert.pem
 
 section "PHP runtime"
 INFO=$(curl -s "$BASE/info.php?x=1")

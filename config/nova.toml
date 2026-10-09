@@ -8,6 +8,16 @@ listen = "0.0.0.0:8080"
 shutdown_grace_secs = 20
 max_request_body = "32MiB"
 metrics = true
+# Inside Compose every client reaches NOVA through Docker's network; trust
+# X-Forwarded-* only from private ranges (put your real proxy here).
+trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+# HTTPS + HTTP/2 + HTTP/3. Local hosts get a persistent self-signed
+# certificate; set acme = true and acme_email for Let's Encrypt on public hosts.
+[server.tls]
+enabled = true
+listen = "0.0.0.0:8443"
+public_port = 8443           # the host port in compose.yaml (443 in production)
 
 [paths]
 state_dir = "/var/lib/nova"
@@ -46,6 +56,26 @@ password_env = "NOVA_DB_EXAMPLE_PASSWORD"
 
 [site.env]
 APP_NAME = "NOVA Example"
+
+[site.headers]
+Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+
+[site.error_pages]
+404 = "/404.html"
+
+[[site.redirect]]
+from = "/old-home"
+to = "/"
+
+[[site.redirect]]
+from = "/docs/*"
+to = "https://github.com/Eyonic/Nova/tree/main/docs/$1"
+status = 302
+
+[site.auth]
+realm = "NOVA demo"
+users_file = "/srv/sites/example/config/htpasswd"
+paths = ["/private/**"]
 
 [[site]]
 name = "second"

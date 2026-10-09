@@ -1,5 +1,6 @@
 //! Runtime view of configured sites and Host-based routing.
 
+use crate::rules::SiteRules;
 use nova_config::{Config, Mode, SiteConfig};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -13,6 +14,13 @@ pub struct Site {
     pub project_dir: PathBuf,
     pub php: Option<SitePhp>,
     pub optimize: bool,
+    pub rules: SiteRules,
+}
+
+impl std::fmt::Debug for SiteRules {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SiteRules").finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -64,12 +72,14 @@ impl Sites {
             if s.default {
                 default = Some(i);
             }
+            let rules = SiteRules::new(s, &root)?;
             sites.push(Site {
                 name: s.name.clone(),
                 root,
                 project_dir,
                 php,
                 optimize: s.optimize,
+                rules,
             });
         }
         Ok(Self {

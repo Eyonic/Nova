@@ -6,6 +6,12 @@
 //! file itself; fields ending in `_env` name an environment variable that is
 //! resolved at startup.
 
+pub mod http;
+
+pub use http::{
+    CacheRule, CertFiles, Cidr, RateLimitConfig, Redirect, SiteAuth, SiteCache, TlsConfig,
+    glob_match,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -145,6 +151,40 @@ pub struct ServerConfig {
     pub header_read_timeout_secs: u64,
     /// Expose `/_nova/metrics`. Health endpoints are always available.
     pub metrics: bool,
+    pub compression: CompressionConfig,
+    /// Clients allowed to read `/_nova/metrics` and `/_nova/optimize/status`.
+    pub admin_allow: Vec<Cidr>,
+    /// Reverse proxies whose `X-Forwarded-*` / `Forwarded` headers are trusted.
+    pub trusted_proxies: Vec<Cidr>,
+    /// Expect a PROXY protocol (v1/v2) header on every connection.
+    pub proxy_protocol: bool,
+    /// Abort uploads that send nothing for this long.
+    pub request_body_timeout_secs: u64,
+    /// One structured access-log line per request.
+    pub access_log: bool,
+    pub rate_limit: RateLimitConfig,
+    pub tls: TlsConfig,
+}
+
+/// `[server.compression]`: brotli / zstd / gzip for text responses.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CompressionConfig {
+    pub enabled: bool,
+    /// Responses with a known length below this are sent uncompressed.
+    pub min_size: ByteSize,
+    /// Serve `file.br` / `file.zst` / `file.gz` built next to a static file.
+    pub precompressed: bool,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_size: ByteSize(1024),
+            precompressed: true,
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -156,6 +196,14 @@ impl Default for ServerConfig {
             max_request_body: ByteSize(64 << 20),
             header_read_timeout_secs: 15,
             metrics: true,
+            compression: CompressionConfig::default(),
+            admin_allow: http::default_admin_allow(),
+            trusted_proxies: Vec::new(),
+            proxy_protocol: false,
+            request_body_timeout_secs: http::DEFAULT_BODY_TIMEOUT_SECS,
+            access_log: true,
+            rate_limit: RateLimitConfig::default(),
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -412,6 +460,32 @@ pub struct SiteConfig {
     /// Framework integration; `auto` detects it from the project files.
     #[serde(default)]
     pub framework: FrameworkSetting,
+    /// `Cache-Control` for static files.
+    #[serde(default)]
+    pub cache: SiteCache,
+    /// Response headers added when the application has not set them.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Baseline security headers (nosniff, Referrer-Policy, X-Frame-Options,
+    /// HSTS over HTTPS) unless the response sets them.
+    #[serde(default = "default_true")]
+    pub security_headers: bool,
+    /// Redirect every other host of this site here (308).
+    #[serde(default)]
+    pub canonical_host: Option<String>,
+    /// Redirect plain HTTP to HTTPS (default: on for public hosts with an
+    /// ACME or configured certificate; off for self-signed local hosts).
+    #[serde(default)]
+    pub https_redirect: Option<bool>,
+    #[serde(default, rename = "redirect")]
+    pub redirects: Vec<Redirect>,
+    /// Status code → page (URL path in the document root) used for NOVA's
+    /// own errors and for empty error responses from PHP.
+    #[serde(default)]
+    pub error_pages: BTreeMap<String, String>,
+    /// HTTP basic authentication.
+    #[serde(default)]
+    pub auth: Option<SiteAuth>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -427,7 +501,7 @@ fn default_public() -> PathBuf {
     "public".into()
 }
 
-fn default_true() -> bool {
+pub(crate) fn default_true() -> bool {
     true
 }
 
@@ -609,6 +683,7 @@ impl Config {
                     }
                 }
             }
+            http::validate_site(site, &mut errs);
             if let Some(db) = &site.database {
                 if !self.services.database.contains_key(&db.service) {
                     errs.push(format!(
@@ -636,6 +711,24 @@ impl Config {
         }
         if self.live.heartbeat_secs == 0 || self.live.max_channels == 0 {
             errs.push("live.heartbeat_secs and live.max_channels must be > 0".into());
+        }
+        let tls = &self.server.tls;
+        if tls.enabled {
+            if tls.listen.port() == self.server.listen.port() {
+                errs.push("server.tls.listen must use another port than server.listen".into());
+            }
+            if tls.acme && tls.acme_email.as_deref().is_none_or(|e| !e.contains('@')) {
+                errs.push("server.tls.acme needs server.tls.acme_email".into());
+            }
+            if !tls.acme && !tls.self_signed && tls.certs.is_empty() {
+                errs.push(
+                    "server.tls needs acme, self_signed or at least one [[server.tls.cert]]".into(),
+                );
+            }
+        }
+        let rl = &self.server.rate_limit;
+        if rl.enabled && (rl.requests_per_sec <= 0.0 || rl.burst == 0) {
+            errs.push("server.rate_limit needs requests_per_sec > 0 and burst > 0".into());
         }
         if self.isolation.worker_uid == 0 {
             errs.push("isolation.worker_uid must not be 0".into());
@@ -696,7 +789,7 @@ fn valid_ident(s: &str) -> bool {
         && !s.starts_with('-')
 }
 
-fn valid_env_name(s: &str) -> bool {
+pub(crate) fn valid_env_name(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with(|c: char| c.is_ascii_digit())
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
