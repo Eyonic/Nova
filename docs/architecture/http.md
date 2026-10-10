@@ -249,13 +249,16 @@ pool. Runs never overlap; output goes to the log (`nova::task`).
 
 Every FPM master starts with OPcache (128 MiB, 20 000 files, interned
 strings, timestamps checked every 2 s in production and on every request in
-development) and a 4 MiB realpath cache. JIT is opt-in:
+development), a 4 MiB realpath cache and the tracing JIT (default since it
+measured +7% on uncached WordPress; `jit = "off"` disables it). Workers are
+recycled every 10 000 requests (`[site.php] max_requests`; +5% on WordPress
+compared with 1 000):
 
 ```toml
 [php]
 opcache_memory = "128MiB"
 opcache_revalidate_secs = 2
-jit = "tracing"                  # off (default), tracing, function
+jit = "tracing"                  # tracing (default), function, off
 jit_buffer = "64MiB"
 ```
 
@@ -280,6 +283,12 @@ Only responses that are the same for everyone are stored:
 * response: `200`, no `Set-Cookie`, no `Cache-Control: private`,
   `no-store` or `no-cache`, no `Vary` other than `Accept-Encoding`, not
   `text/event-stream`, at most 1 MiB (32 MiB in total).
+
+After expiry a page stays usable for `micro_cache_grace_secs` (default
+10): the first request refreshes it while everyone else gets the previous
+version immediately (`nova-cache: stale`), and if PHP fails (5xx, timeout,
+pool down) the last good page is served instead of an error. A purge
+(`Nova-Publish`, database change) removes pages completely, grace included.
 
 PHP opts a page out with `header('Cache-Control: no-store')`. A
 `Nova-Publish` from the site clears its cached pages, so NOVA Live
@@ -307,6 +316,25 @@ Measured on a naive 12-image gallery (Chromium, Fast 4G): load 1.2 s ->
 0.37 s, phone LCP 0.72 s -> 0.35 s, desktop CLS 0.24-0.27 -> 0, image
 bytes before load 974 KB -> 59 KB, whole page on a phone 974 KB -> 110 KB.
 Reproduce: `tests/browser/rewrite/` (page + Playwright script).
+
+## Instant navigation (`speculation_rules`, opt-in)
+
+```toml
+[[site]]
+speculation_rules = true
+```
+
+HTML pages get a Speculation Rules block (Chromium browsers): same-site
+links are prefetched when the visitor is about to click them (moderate
+eagerness: hover or pointer-down), never links to logout, login, admin,
+API, cart, checkout or `?action=`/`?add-to-cart=` URLs, and never links
+marked `rel=nofollow`, `download`, `target=_blank` or
+`data-nova-noprefetch`. A page that ships its own `<script
+type="speculationrules">` is left alone. `No-Vary-Search` keeps prefetched
+pages usable when links carry `utm_*`, `gclid` or `fbclid`.
+
+Measured (Chromium, Fast 4G, a 300 ms PHP page): hover 400 ms then click,
+326 ms -> 107 ms to the loaded page; a 100 ms hover is unchanged.
 
 ## Reverse proxy to an application server
 

@@ -234,7 +234,7 @@ impl nova_http::Handler for App {
             resp.headers_mut().insert(header::ALT_SVC, v);
         }
         if let Some(site) = site
-            && site.html_rewrite
+            && (site.html_rewrite || site.speculation_rules)
             && method == Method::GET
             && resp.status() == StatusCode::OK
             && !resp.headers().contains_key(header::CONTENT_ENCODING)
@@ -734,19 +734,32 @@ impl App {
         // Held until this response is stored (or found uncacheable), so
         // concurrent misses for the same page wait instead of all running PHP.
         let mut _lead = None;
+        // An expired entry this request refreshes; served instead of an error.
+        let mut stale = None;
         if let Some(k) = &cache_key {
-            if let Some(e) = self.micro.get(k) {
-                return self.micro_hit(e, &parts.headers).await;
-            }
-            match self.micro.lead_or_wait(k, php.timeout).await {
-                Some(lead) => _lead = Some(lead),
-                None => {
-                    if let Some(e) = self.micro.get(k) {
-                        return self.micro_hit(e, &parts.headers).await;
+            use crate::microcache::Lookup;
+            match self.micro.lookup(k) {
+                Lookup::Fresh(e) => return self.micro_hit(e, &parts.headers).await,
+                // Grace: one request refreshes, everyone else gets the
+                // previous version at once instead of waiting.
+                Lookup::Stale(e) => match self.micro.try_lead(k) {
+                    Some(lead) => {
+                        _lead = Some(lead);
+                        stale = Some(e);
                     }
-                }
+                    None => return self.micro_stale(e, &parts.headers).await,
+                },
+                Lookup::Miss => match self.micro.lead_or_wait(k, php.timeout).await {
+                    Some(lead) => _lead = Some(lead),
+                    None => {
+                        if let Some(e) = self.micro.get(k) {
+                            return self.micro_hit(e, &parts.headers).await;
+                        }
+                    }
+                },
             }
         }
+        let req_headers = parts.headers.clone();
         let declared = parts
             .headers
             .get(header::CONTENT_LENGTH)
@@ -864,6 +877,15 @@ impl App {
         let micros = started.elapsed().as_micros() as u64;
 
         let r = match result {
+            // stale-if-error: a failing PHP keeps the last good page online.
+            Ok(r) if r.status.is_server_error() && stale.is_some() => {
+                self.metrics.php_done(micros, false);
+                return self.micro_stale(stale.take().unwrap(), &req_headers).await;
+            }
+            Err(_) if stale.is_some() => {
+                self.metrics.php_done(micros, false);
+                return self.micro_stale(stale.take().unwrap(), &req_headers).await;
+            }
             Ok(r) => r,
             Err(e) => {
                 self.metrics.php_done(micros, false);
@@ -954,8 +976,14 @@ impl App {
                             body.extend_from_slice(b);
                         }
                         let body = body.freeze();
-                        self.micro
-                            .put(key, r.status, headers.clone(), body.clone(), ttl);
+                        self.micro.put(
+                            key,
+                            r.status,
+                            headers.clone(),
+                            body.clone(),
+                            ttl,
+                            php.micro_cache_grace,
+                        );
                         let mut resp = Response::new(full(body));
                         *resp.status_mut() = r.status;
                         *resp.headers_mut() = headers;
@@ -1003,8 +1031,33 @@ impl App {
         // The body changes: its length and strong validator no longer apply.
         parts.headers.remove(header::CONTENT_LENGTH);
         parts.headers.remove(header::ETAG);
-        let body = crate::htmlrewrite::rewrite(body, path.to_string(), lookup);
+        if site.speculation_rules && !parts.headers.contains_key("no-vary-search") {
+            // Prefetched pages stay usable when the link carries tracking parameters.
+            parts.headers.insert(
+                "no-vary-search",
+                HeaderValue::from_static(
+                    r#"params=("utm_source" "utm_medium" "utm_campaign" "utm_term" "utm_content" "gclid" "fbclid")"#,
+                ),
+            );
+        }
+        let opts = crate::htmlrewrite::Options {
+            images: site.html_rewrite,
+            speculation: site.speculation_rules,
+        };
+        let body = crate::htmlrewrite::rewrite(body, path.to_string(), opts, lookup);
         Response::from_parts(parts, body)
+    }
+
+    /// An expired entry served within its grace period.
+    async fn micro_stale(
+        &self,
+        e: crate::microcache::Entry,
+        req_headers: &http::HeaderMap,
+    ) -> Response<Body> {
+        let mut resp = self.micro_hit(e, req_headers).await;
+        resp.headers_mut()
+            .insert("nova-cache", HeaderValue::from_static("stale"));
+        resp
     }
 
     /// A micro-cache hit, compressed for this client from the entry's
@@ -1560,11 +1613,13 @@ mod tests {
                 front_controller: fc.map(String::from),
                 timeout: Duration::from_secs(1),
                 micro_cache: None,
+                micro_cache_grace: Duration::ZERO,
                 pool: nova_runtime_php::Pool::new("/nonexistent", 2),
             }),
             proxy: None,
             optimize: false,
             html_rewrite: false,
+            speculation_rules: false,
         }
     }
 

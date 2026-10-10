@@ -26,6 +26,9 @@ clearly better (or a deliberate trade-off). Stable baseline: tag
 | 10 | HTTP/3 without a body pump for GET/HEAD | per-request task + channel even without a body; UDP buffers ruled out (no drops) | local x2, integration | 132.6k -> 141.8k req/s (+7%); POST bodies intact | kept |
 | 11 | HTML rewriting for `<img>` (vision phase A) | naive pages load every full-size image and shift layout | Chromium Fast 4G x2, integration | load 1.2 -> 0.37 s, CLS 0.27 -> 0, bytes at load 974 -> 59 KB, phone total 974 -> 110 KB | kept (opt-in) |
 | 12 | sendfile(2) for static files (vendored hyper with PR #4214, closed pending a HIP; hyper-util Rewind forwards it) | biggest remaining gap vs nginx; user-space copy of every byte | local, Unraid x2 | 4 MB: local 2.9k -> 13.1k req/s (x4.5), Unraid 927 -> 3,027 (x3.3, p99 76 -> 19 ms); 477 KB from the memory cache: local +91% but Unraid -8% | kept for files > 1 MiB (not in the memory cache); not used for cached files |
+| 13 | Micro-cache grace + stale-if-error (Varnish grace, Cloudflare SWR) | expiry made visitors wait on PHP; PHP errors reached visitors | local x2, integration | healthy PHP: unchanged; flaky PHP (500 half the time): errors 1,975 -> 0, 5.6x more responses | kept |
+| 14 | Speculation Rules + No-Vary-Search (opt-in) | Chrome/web.dev case studies: tens of % faster navigations | Chromium x2, integration | hover-then-click 326 -> 107 ms; quick clicks unchanged; logout/delete never prefetched | kept |
+| 15 | PHP defaults: JIT tracing, max_requests 10 000 (timestamp checks kept) | research: JIT small for web apps, fewer respawns | Unraid WordPress x3 | full profile 104 -> 118% of stable; without validate_timestamps=0: 117%; JIT alone 111%; memory unchanged | kept (defaults) |
 
 ## Real applications (Unraid, both stacks, 4 CPUs each)
 

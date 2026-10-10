@@ -269,7 +269,7 @@ impl Default for PhpConfig {
             cli_binary: "php".into(),
             opcache_memory: ByteSize(128 << 20),
             opcache_revalidate_secs: 2,
-            jit: JitMode::Off,
+            jit: JitMode::Tracing,
             jit_buffer: ByteSize(64 << 20),
             disable_functions: [
                 "exec",
@@ -527,6 +527,10 @@ pub struct SiteConfig {
     /// dimensions and srcset from the Optimizer (never overriding markup).
     #[serde(default)]
     pub html_rewrite: bool,
+    /// Add Speculation Rules (prefetch same-site links before the click)
+    /// to HTML pages, unless the page has its own.
+    #[serde(default)]
+    pub speculation_rules: bool,
     #[serde(default)]
     pub isolation: SiteIsolation,
     /// Framework integration; `auto` detects it from the project files.
@@ -642,6 +646,9 @@ pub struct SitePhpConfig {
     /// Share anonymous GET responses for this many seconds (0 = off). See
     /// docs/architecture/http.md "PHP micro-cache" for what is cached.
     pub micro_cache_secs: u64,
+    /// After expiry, keep serving a cached page for this long while one
+    /// request refreshes it, and whenever PHP fails (stale-if-error).
+    pub micro_cache_grace_secs: u64,
 }
 
 impl Default for SitePhpConfig {
@@ -650,12 +657,13 @@ impl Default for SitePhpConfig {
             enabled: true,
             front_controller: None,
             max_children: 8,
-            max_requests: 1000,
+            max_requests: 10_000,
             memory_limit: ByteSize(256 << 20),
             timeout_secs: 30,
             disable_functions: None,
             ini: BTreeMap::new(),
             micro_cache_secs: 0,
+            micro_cache_grace_secs: 10,
         }
     }
 }

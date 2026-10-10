@@ -32,6 +32,9 @@ pub struct Entry {
     pub body: Bytes,
     stored: Instant,
     expires: Instant,
+    /// After `expires`, the entry may still be served while one request
+    /// refreshes it, or when PHP fails (grace).
+    stale_until: Instant,
     /// Compressed renditions (by `Content-Encoding` token), made on the
     /// first hit that asks for one: later hits send stored bytes instead
     /// of compressing the page again.
@@ -144,7 +147,45 @@ pub fn cacheable(status: StatusCode, headers: &HeaderMap) -> bool {
     !(no_cache || odd_vary || stream)
 }
 
+/// Result of [`MicroCache::lookup`].
+pub enum Lookup {
+    Fresh(Entry),
+    /// Expired but within its grace period.
+    Stale(Entry),
+    Miss,
+}
+
 impl MicroCache {
+    /// Fresh, stale (within grace) or missing; entries past their grace are dropped.
+    pub fn lookup(&self, key: &str) -> Lookup {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        match inner.map.get(key) {
+            Some(e) if e.expires > now => Lookup::Fresh(e.clone()),
+            Some(e) if e.stale_until > now => Lookup::Stale(e.clone()),
+            Some(_) => {
+                if let Some(old) = inner.map.remove(key) {
+                    inner.bytes -= old.body.len();
+                }
+                Lookup::Miss
+            }
+            None => Lookup::Miss,
+        }
+    }
+
+    /// Become the request that refreshes `key`, unless one already is.
+    pub fn try_lead(&self, key: &str) -> Option<Lead<'_>> {
+        let mut filling = self.filling.lock().unwrap();
+        if filling.contains_key(key) {
+            return None;
+        }
+        filling.insert(key.to_owned(), Arc::new(Notify::new()));
+        Some(Lead {
+            cache: self,
+            key: key.to_owned(),
+        })
+    }
+
     pub fn get(&self, key: &str) -> Option<Entry> {
         let mut inner = self.inner.lock().unwrap();
         match inner.map.get(key) {
@@ -166,6 +207,7 @@ impl MicroCache {
         headers: HeaderMap,
         body: Bytes,
         ttl: Duration,
+        grace: Duration,
     ) {
         if body.len() > MAX_ENTRY {
             return;
@@ -177,7 +219,7 @@ impl MicroCache {
         }
         if inner.bytes + body.len() > BUDGET {
             // Expired entries first, then anything (entries live seconds).
-            inner.map.retain(|_, e| e.expires > now);
+            inner.map.retain(|_, e| e.stale_until > now);
             inner.bytes = inner.map.values().map(|e| e.body.len()).sum();
             while inner.bytes + body.len() > BUDGET {
                 let Some(k) = inner.map.keys().next().cloned() else {
@@ -197,6 +239,7 @@ impl MicroCache {
                 body,
                 stored: now,
                 expires: now + ttl,
+                stale_until: now + ttl + grace,
                 encoded: Arc::default(),
             },
         );
@@ -328,6 +371,7 @@ mod tests {
             HeaderMap::new(),
             body.clone(),
             Duration::from_secs(60),
+            Duration::ZERO,
         );
         c.put(
             "b\n1".into(),
@@ -335,12 +379,14 @@ mod tests {
             HeaderMap::new(),
             body.clone(),
             Duration::from_secs(60),
+            Duration::ZERO,
         );
         c.put(
             "a\n2".into(),
             StatusCode::OK,
             HeaderMap::new(),
             body.clone(),
+            Duration::ZERO,
             Duration::ZERO,
         );
         assert!(c.get("a\n1").is_some());
@@ -355,6 +401,7 @@ mod tests {
             HeaderMap::new(),
             big,
             Duration::from_secs(60),
+            Duration::ZERO,
         );
         assert!(c.get("b\n2").is_none(), "too large");
     }
@@ -382,6 +429,7 @@ mod tests {
                                 HeaderMap::new(),
                                 Bytes::from_static(b"x"),
                                 Duration::from_secs(60),
+                                Duration::ZERO,
                             );
                             "rendered"
                         }
@@ -417,5 +465,41 @@ mod tests {
         drop(lead); // finished without storing anything
         assert!(waiter.await.unwrap());
         assert!(c.get("s\nprivate").is_none());
+    }
+
+    #[test]
+    fn grace_serves_stale_while_one_request_refreshes() {
+        let c = MicroCache::default();
+        let b = Bytes::from_static(b"old");
+        c.put(
+            "s\np".into(),
+            StatusCode::OK,
+            HeaderMap::new(),
+            b,
+            Duration::ZERO,
+            Duration::from_secs(60),
+        );
+        assert!(
+            matches!(c.lookup("s\np"), Lookup::Stale(_)),
+            "expired but within grace"
+        );
+        let lead = c.try_lead("s\np");
+        assert!(lead.is_some(), "first request refreshes");
+        assert!(c.try_lead("s\np").is_none(), "others are served stale");
+        drop(lead);
+        c.put(
+            "s\nq".into(),
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::new(),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        assert!(matches!(c.lookup("s\nq"), Lookup::Miss), "past grace");
+        c.purge_site("s");
+        assert!(
+            matches!(c.lookup("s\np"), Lookup::Miss),
+            "purge drops stale entries too"
+        );
     }
 }

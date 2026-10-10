@@ -34,62 +34,109 @@ pub struct ImageInfo {
     pub widths: Vec<u32>,
 }
 
+/// Speculation Rules injected with `speculation_rules = true`: prefetch
+/// same-site links when the visitor is about to click them (hover or
+/// pointer-down; "moderate" eagerness), never for links that change state
+/// or need a login, and never for links marked `rel=nofollow` or
+/// `data-nova-noprefetch`.
+pub const SPECULATION_RULES: &str = r#"<script type="speculationrules">{"prefetch":[{"where":{"and":[{"href_matches":"/*"},{"not":{"href_matches":["/wp-admin/*","/wp-login.php*","/admin/*","/login*","/logout*","/*/logout*","/api/*","/cart*","/checkout*","/*?*action=*","/*?*add-to-cart=*"]}},{"not":{"selector_matches":"[rel~=nofollow], [data-nova-noprefetch], [download], [target=_blank]"}}]},"eagerness":"moderate"}]}</script>"#;
+
+/// What to rewrite.
+pub struct Options {
+    /// `<img>` attributes (`html_rewrite`).
+    pub images: bool,
+    /// Append [`SPECULATION_RULES`] before `</body>` unless the page has
+    /// its own `<script type="speculationrules">` (`speculation_rules`).
+    pub speculation: bool,
+}
+
 /// Rewrite an HTML body. `lookup` maps an image URL path (`/images/a.jpg`)
 /// to its metadata; `base` is the request path, for relative `src`.
 pub fn rewrite(
     body: Body,
     base: String,
+    opts: Options,
     lookup: impl Fn(&str) -> Option<ImageInfo> + Send + 'static,
 ) -> Body {
     let out = Arc::new(Mutex::new(Vec::<u8>::new()));
     let sink = Arc::clone(&out);
     let mut index = 0usize;
-    let rewriter = HtmlRewriter::new(
-        Settings {
-            element_content_handlers: vec![element!("img", move |el| {
-                let i = index;
-                index += 1;
-                if el.has_attribute("data-nova-keep") {
-                    return Ok(());
-                }
-                let eager = i < EAGER;
-                if !el.has_attribute("loading") && !eager {
-                    el.set_attribute("loading", "lazy")?;
-                }
-                if !el.has_attribute("decoding") {
-                    el.set_attribute("decoding", "async")?;
-                }
-                if i == 0 && !el.has_attribute("fetchpriority") {
-                    el.set_attribute("fetchpriority", "high")?;
-                }
-                let Some(src) = el.get_attribute("src") else {
-                    return Ok(());
-                };
-                let Some(path) = local_path(&src, &base) else {
-                    return Ok(());
-                };
-                let Some(info) = lookup(&path) else {
-                    return Ok(());
-                };
-                if !el.has_attribute("width") && !el.has_attribute("height") {
-                    el.set_attribute("width", &info.width.to_string())?;
-                    el.set_attribute("height", &info.height.to_string())?;
-                }
-                if !el.has_attribute("srcset") && !src.contains('?') && !info.widths.is_empty() {
-                    let mut set: Vec<String> = info
-                        .widths
-                        .iter()
-                        .map(|w| format!("{src}?w={w} {w}w"))
-                        .collect();
-                    set.push(format!("{src} {}w", info.width));
-                    el.set_attribute("srcset", &set.join(", "))?;
-                    if !el.has_attribute("sizes") {
-                        let lazy = el.get_attribute("loading").as_deref() == Some("lazy");
-                        el.set_attribute("sizes", if lazy { "auto, 100vw" } else { "100vw" })?;
-                    }
+    let has_rules = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut handlers = Vec::new();
+    if opts.speculation {
+        let seen = Arc::clone(&has_rules);
+        handlers.push(element!("script[type=speculationrules]", move |_el| {
+            seen.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }));
+        let seen = Arc::clone(&has_rules);
+        handlers.push(element!("body", move |el| {
+            let seen = Arc::clone(&seen);
+            type EndTagHandler = Box<
+                dyn FnOnce(&mut lol_html::html_content::EndTag<'_>) -> lol_html::HandlerResult
+                    + Send,
+            >;
+            let insert: EndTagHandler = Box::new(move |end| {
+                if !seen.load(std::sync::atomic::Ordering::Relaxed) {
+                    end.before(SPECULATION_RULES, lol_html::html_content::ContentType::Html);
                 }
                 Ok(())
-            })],
+            });
+            if let Some(handlers) = el.end_tag_handlers() {
+                handlers.push(insert);
+            }
+            Ok(())
+        }));
+    }
+    if opts.images {
+        handlers.push(element!("img", move |el| {
+            let i = index;
+            index += 1;
+            if el.has_attribute("data-nova-keep") {
+                return Ok(());
+            }
+            let eager = i < EAGER;
+            if !el.has_attribute("loading") && !eager {
+                el.set_attribute("loading", "lazy")?;
+            }
+            if !el.has_attribute("decoding") {
+                el.set_attribute("decoding", "async")?;
+            }
+            if i == 0 && !el.has_attribute("fetchpriority") {
+                el.set_attribute("fetchpriority", "high")?;
+            }
+            let Some(src) = el.get_attribute("src") else {
+                return Ok(());
+            };
+            let Some(path) = local_path(&src, &base) else {
+                return Ok(());
+            };
+            let Some(info) = lookup(&path) else {
+                return Ok(());
+            };
+            if !el.has_attribute("width") && !el.has_attribute("height") {
+                el.set_attribute("width", &info.width.to_string())?;
+                el.set_attribute("height", &info.height.to_string())?;
+            }
+            if !el.has_attribute("srcset") && !src.contains('?') && !info.widths.is_empty() {
+                let mut set: Vec<String> = info
+                    .widths
+                    .iter()
+                    .map(|w| format!("{src}?w={w} {w}w"))
+                    .collect();
+                set.push(format!("{src} {}w", info.width));
+                el.set_attribute("srcset", &set.join(", "))?;
+                if !el.has_attribute("sizes") {
+                    let lazy = el.get_attribute("loading").as_deref() == Some("lazy");
+                    el.set_attribute("sizes", if lazy { "auto, 100vw" } else { "100vw" })?;
+                }
+            }
+            Ok(())
+        }));
+    }
+    let rewriter = HtmlRewriter::new(
+        Settings {
+            element_content_handlers: handlers,
             ..Settings::new_send()
         },
         move |chunk: &[u8]| sink.lock().unwrap().extend_from_slice(chunk),
@@ -155,7 +202,11 @@ mod tests {
                 widths: vec![320, 640],
             })
         };
-        let body = rewrite(full(html), "/blog/post".into(), lookup);
+        let opts = Options {
+            images: true,
+            speculation: true,
+        };
+        let body = rewrite(full(html), "/blog/post".into(), opts, lookup);
         String::from_utf8(body.collect().await.unwrap().to_bytes().to_vec()).unwrap()
     }
 
@@ -212,5 +263,27 @@ mod tests {
         assert_eq!(local_path("https://x/a.jpg", "/"), None);
         assert_eq!(local_path("//x/a.jpg", "/"), None);
         assert_eq!(local_path("data:image/png;base64,AA", "/"), None);
+    }
+
+    #[tokio::test]
+    async fn speculation_rules_once_and_respecting_the_page() {
+        let out = run("<html><body><a href=/a>a</a></body></html>").await;
+        assert_eq!(out.matches("speculationrules").count(), 1, "{out}");
+        assert!(
+            out.find("speculationrules").unwrap() < out.find("</body>").unwrap(),
+            "{out}"
+        );
+        let own =
+            run(r#"<html><body><script type="speculationrules">{}</script></body></html>"#).await;
+        assert_eq!(
+            own.matches("speculationrules").count(),
+            1,
+            "the page's own rules win: {own}"
+        );
+        let json = SPECULATION_RULES
+            .trim_start_matches(r#"<script type="speculationrules">"#)
+            .trim_end_matches("</script>");
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(v["prefetch"][0]["eagerness"], "moderate");
     }
 }
