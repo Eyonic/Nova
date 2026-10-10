@@ -26,14 +26,17 @@ dropping a request, and shuts down gracefully.
 |---|---|---|
 | Static sites, SPAs, build output (Vite, Mix, Hugo, Astro static) | **yes** | served directly, optimized |
 | PHP (Laravel, Symfony, WordPress, plain PHP) | **yes** | supervised PHP-FPM per site over FastCGI |
-| Node.js, Python (WSGI/ASGI), Go, Ruby, Java or any other HTTP app server | **no** | there is no generic reverse proxy (`proxy_pass`) yet |
-| WebSocket or gRPC backends | **no** | NOVA Live uses server-sent events served by NOVA itself |
+| Node.js, Python (ASGI/WSGI server), Go, Ruby, Java or any other HTTP app server | **yes** | `[site.proxy]`: reverse proxy over HTTP/1.1, static files still served by NOVA |
+| WebSocket backends | **yes** | tunneled through `[site.proxy]` |
+| gRPC backends, load balancing across several upstreams | **no** | one HTTP/1.1 upstream per site |
 
-For a non-PHP backend today, run it next to NOVA and put a reverse proxy
-(Traefik, Caddy, nginx) in front that routes by host or path; NOVA then
-sits behind that proxy (see `trusted_proxies` in
-[http.md](docs/architecture/http.md)). A built-in `[site.proxy]` upstream is
-on the roadmap ([vision.md](docs/architecture/vision.md)).
+```toml
+[site.proxy]
+upstream = "http://127.0.0.1:3000"
+paths = ["/api/**"]          # default: everything
+```
+
+Details: [http.md](docs/architecture/http.md#reverse-proxy-to-an-application-server).
 
 ## Quick start
 

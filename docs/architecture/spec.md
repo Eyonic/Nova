@@ -195,10 +195,10 @@ Objects live in `<state>/optimize/objects/<2 hex>/<32 hex>.<ext>`.
 
 ## 8. Known limitations
 
-* **Backends: static files and PHP-FPM (FastCGI) only.** There is no
-  reverse proxy to arbitrary HTTP application servers (Node.js, Python,
-  Go, ...), no WebSocket or gRPC proxying and no load balancing. Such apps
-  need a separate proxy in front (see README "What NOVA serves").
+* **Backends:** static files, PHP-FPM (FastCGI) and one HTTP/1.1
+  application server per site (`[site.proxy]`, WebSocket included). No
+  gRPC proxying, no HTTP/2 to upstreams, no load balancing or health checks
+  across several upstreams.
 * Landlock restricts TCP by **port**, not host: a site allowed to reach
   port 3306 could reach any host on 3306. Database credentials are per site,
   so this exposes no data, but host-level egress rules need network

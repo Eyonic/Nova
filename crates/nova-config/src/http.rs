@@ -383,6 +383,17 @@ pub(crate) fn validate_site(site: &crate::SiteConfig, errs: &mut Vec<String>) {
             ));
         }
     }
+    if let Some(p) = &site.proxy {
+        if let Err(e) = p.upstream_addr() {
+            errs.push(format!("site {n:?}: [site.proxy] {e}"));
+        }
+        if p.paths.is_empty() {
+            errs.push(format!("site {n:?}: [site.proxy] paths must not be empty"));
+        }
+        if p.timeout_secs == 0 {
+            errs.push(format!("site {n:?}: [site.proxy] timeout_secs must be > 0"));
+        }
+    }
     if let Some(a) = &site.auth {
         if a.realm.contains(['"', '\r', '\n']) {
             errs.push(format!("site {n:?}: invalid [site.auth] realm"));
@@ -394,6 +405,61 @@ pub(crate) fn validate_site(site: &crate::SiteConfig, errs: &mut Vec<String>) {
                 "site {n:?}: [site.auth] needs either users_env (a variable name) or users_file (an absolute path)"
             )),
         }
+    }
+}
+
+/// `[site.proxy]`: hand requests to an HTTP/1.1 application server
+/// (Node.js, Python, Go, ...), including WebSocket upgrades.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SiteProxy {
+    /// `http://host:port`, e.g. `http://127.0.0.1:3000` or `http://app:8000`.
+    pub upstream: String,
+    /// URL path globs sent upstream; the rest is served by NOVA.
+    #[serde(default = "default_proxy_paths")]
+    pub paths: Vec<String>,
+    /// Serve files that exist in the document root without asking the
+    /// upstream (assets, images: optimized and cached by NOVA).
+    #[serde(default = "crate::default_true")]
+    pub static_first: bool,
+    /// Time allowed for the upstream's response headers.
+    #[serde(default = "default_proxy_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_proxy_paths() -> Vec<String> {
+    vec!["/**".into()]
+}
+
+fn default_proxy_timeout() -> u64 {
+    60
+}
+
+impl SiteProxy {
+    /// `(host, port)` of `upstream`; only plain `http://host:port[/]`.
+    pub fn upstream_addr(&self) -> Result<(String, u16), String> {
+        let rest = self
+            .upstream
+            .strip_prefix("http://")
+            .ok_or_else(|| format!("upstream {:?} must start with http://", self.upstream))?;
+        let authority = rest.trim_end_matches('/');
+        if authority.contains('/') || authority.contains('@') || authority.is_empty() {
+            return Err(format!(
+                "upstream {:?} must be http://host:port",
+                self.upstream
+            ));
+        }
+        let (host, port) = authority
+            .rsplit_once(':')
+            .ok_or_else(|| format!("upstream {:?} needs an explicit port", self.upstream))?;
+        let port: u16 = port
+            .parse()
+            .map_err(|_| format!("upstream {:?} has an invalid port", self.upstream))?;
+        Ok((host.trim_matches(['[', ']']).to_string(), port))
+    }
+
+    pub fn matches(&self, path: &str) -> bool {
+        self.paths.iter().any(|g| glob_match(g, path))
     }
 }
 
@@ -440,5 +506,39 @@ mod tests {
         assert!(glob_match("/admin/**", "/admin"));
         assert!(glob_match("/admin/**", "/admin/users/1"));
         assert!(!glob_match("/admin/**", "/administrator"));
+    }
+
+    #[test]
+    fn proxy_upstreams() {
+        let p = |u: &str| SiteProxy {
+            upstream: u.into(),
+            paths: vec!["/api/**".into()],
+            static_first: true,
+            timeout_secs: 60,
+        };
+        assert_eq!(
+            p("http://127.0.0.1:3000").upstream_addr(),
+            Ok(("127.0.0.1".into(), 3000))
+        );
+        assert_eq!(
+            p("http://app:8000/").upstream_addr(),
+            Ok(("app".into(), 8000))
+        );
+        assert_eq!(
+            p("http://[::1]:9000").upstream_addr(),
+            Ok(("::1".into(), 9000))
+        );
+        for bad in [
+            "https://a:1",
+            "http://a",
+            "http://a:x",
+            "http://a:1/path",
+            "http://u@a:1",
+            "a:1",
+        ] {
+            assert!(p(bad).upstream_addr().is_err(), "{bad} accepted");
+        }
+        assert!(p("http://a:1").matches("/api/v1/items"));
+        assert!(!p("http://a:1").matches("/assets/app.js"));
     }
 }

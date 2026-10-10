@@ -11,7 +11,7 @@ pub mod http;
 
 pub use http::{
     CacheRule, CertFiles, Cidr, ForwardedHeader, RateLimitConfig, Redirect, SiteAuth, SiteCache,
-    TlsConfig, glob_match,
+    SiteProxy, TlsConfig, glob_match,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -532,6 +532,9 @@ pub struct SiteConfig {
     /// HTTP basic authentication.
     #[serde(default)]
     pub auth: Option<SiteAuth>,
+    /// Reverse proxy to an application server.
+    #[serde(default)]
+    pub proxy: Option<SiteProxy>,
     /// Commands run on a cron schedule (e.g. `php artisan schedule:run`).
     #[serde(default, rename = "task")]
     pub tasks: Vec<SiteTask>,

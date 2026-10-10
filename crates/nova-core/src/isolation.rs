@@ -165,6 +165,13 @@ pub fn worker_sandbox(cfg: &Config, config_path: &std::path::Path) -> Sandbox {
     write.push(crate::tls::tls_dir(cfg));
     write.push(cfg.paths.run_dir.join("php"));
     let mut connect: Vec<u16> = cfg.services.database.values().map(|d| d.port).collect();
+    // Reverse-proxy upstreams are reached by the worker itself.
+    connect.extend(
+        cfg.sites
+            .iter()
+            .filter_map(|s| s.proxy.as_ref()?.upstream_addr().ok())
+            .map(|(_, port)| port),
+    );
     let mut bind = vec![cfg.server.listen.port()];
     if tls.enabled {
         bind.push(tls.listen.port());

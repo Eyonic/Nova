@@ -58,6 +58,8 @@ pub struct App {
     seq: AtomicU64,
     /// `[site.php] micro_cache_secs` storage, shared by all sites.
     micro: crate::microcache::MicroCache,
+    /// Keep-alive pool for `[site.proxy]` upstreams.
+    upstream: crate::upstream::HttpClient,
 }
 
 impl App {
@@ -95,6 +97,7 @@ impl App {
             boot,
             seq: AtomicU64::new(0),
             micro: crate::microcache::MicroCache::default(),
+            upstream: crate::upstream::http_client(),
         }
     }
 
@@ -446,7 +449,21 @@ impl App {
             Err(PathError::Hidden) => return (self.not_found(), Kind::Error, name),
         };
 
-        match resolve_target(site, &safe, req.uri().query()).await {
+        // Reverse proxy: matching paths go to the application server, except
+        // files that exist in the document root when `static_first` is set.
+        let proxied = site.proxy.as_ref().filter(|p| p.matches(req.uri().path()));
+        let target = match proxied {
+            Some(p) if !p.static_first => {
+                return (self.proxy(p, req, client).await, Kind::Proxy, name);
+            }
+            _ => resolve_target(site, &safe, req.uri().query()).await,
+        };
+        if let Some(p) = proxied
+            && !matches!(target, Target::Static(..))
+        {
+            return (self.proxy(p, req, client).await, Kind::Proxy, name);
+        }
+        match target {
             Target::Redirect(location) => {
                 let resp = Response::builder()
                     .status(StatusCode::MOVED_PERMANENTLY)
@@ -920,6 +937,32 @@ impl App {
         resp
     }
 
+    async fn proxy(
+        &self,
+        p: &nova_config::SiteProxy,
+        req: Request<ReqBody>,
+        client: Client,
+    ) -> Response<Body> {
+        let base = p.upstream.trim_end_matches('/');
+        let timeout = Duration::from_secs(p.timeout_secs);
+        match crate::upstream::forward(&self.upstream, base, req, client, timeout).await {
+            Ok(resp) => resp,
+            Err(crate::upstream::ProxyError::Timeout) => self.error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "The application did not respond in time.",
+                None,
+            ),
+            Err(crate::upstream::ProxyError::Unavailable(e)) => {
+                tracing::warn!(upstream = base, error = %e, "upstream request failed");
+                self.error(
+                    StatusCode::BAD_GATEWAY,
+                    "The application is not available.",
+                    Some(e),
+                )
+            }
+        }
+    }
+
     async fn internal(&self, req: &Request<ReqBody>, client: Client) -> Response<Body> {
         let admin = Cidr::any_contains(&self.http.admin_allow, client.ip);
         let json = |status: StatusCode, v: serde_json::Value| {
@@ -1336,6 +1379,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
                 micro_cache: None,
             }),
+            proxy: None,
             optimize: false,
         }
     }

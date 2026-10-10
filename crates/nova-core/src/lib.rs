@@ -26,6 +26,7 @@ pub mod rules;
 pub mod sites;
 pub mod tasks;
 pub mod tls;
+pub mod upstream;
 
 use anyhow::{Context, Result};
 use dispatch::App;

@@ -10,15 +10,17 @@ pub enum Kind {
     Php,
     Internal,
     Error,
+    Proxy,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 5] = [
+    pub const ALL: [Kind; 6] = [
         Kind::Static,
         Kind::Image,
         Kind::Php,
         Kind::Internal,
         Kind::Error,
+        Kind::Proxy,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -28,13 +30,14 @@ impl Kind {
             Kind::Php => "php",
             Kind::Internal => "internal",
             Kind::Error => "error",
+            Kind::Proxy => "proxy",
         }
     }
 }
 
 #[derive(Default)]
 pub struct Metrics {
-    requests: [AtomicU64; 5],
+    requests: [AtomicU64; 6],
     status: [AtomicU64; 6], // index = status / 100
     php_micros: AtomicU64,
     php_count: AtomicU64,

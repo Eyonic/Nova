@@ -13,6 +13,8 @@ pub struct Site {
     pub root: PathBuf,
     pub project_dir: PathBuf,
     pub php: Option<SitePhp>,
+    /// `[site.proxy]`: application server behind this site.
+    pub proxy: Option<nova_config::SiteProxy>,
     pub optimize: bool,
     pub rules: SiteRules,
 }
@@ -82,6 +84,7 @@ impl Sites {
                 root,
                 project_dir,
                 php,
+                proxy: s.proxy.clone(),
                 optimize: s.optimize,
                 rules,
             });

@@ -267,6 +267,32 @@ refreshes always see new data. Responses carry `nova-cache: hit` (with
 `Age`) or `miss`. Cache-eligible misses are buffered before sending; pages
 that stream output with `flush()` should send `Cache-Control: no-store`.
 
+## Reverse proxy to an application server
+
+```toml
+[site.proxy]
+upstream = "http://127.0.0.1:3000"   # Node.js, Python (ASGI/WSGI server), Go, Ruby, Java...
+paths = ["/**"]                      # globs sent upstream (default: everything)
+static_first = true                  # files in the document root are served by NOVA
+timeout_secs = 60                    # time allowed for the upstream's response headers
+```
+
+Requests for matching paths are forwarded over HTTP/1.1 (keep-alive pool)
+whatever protocol the client used (HTTP/1.1, HTTP/2, HTTP/3). Bodies are
+streamed both ways (server-sent events and chunked output arrive as they
+are produced), WebSocket upgrades are tunneled (`ws://` and `wss://`).
+With `static_first`, assets in the document root get NOVA's static path:
+image negotiation, precompression, immutable caching.
+
+The upstream receives the client's `Host`, plus `X-Forwarded-For`,
+`X-Real-IP`, `X-Forwarded-Proto` and `X-Forwarded-Host` set by NOVA from the
+validated client (client-sent forwarding headers are dropped).
+Hop-by-hop headers stay on their hop. Site rules (redirects, basic auth,
+headers, compression, rate limits, access log `kind="proxy"`) apply as for
+any other response. An unreachable upstream gives `502`, a slow one `504`
+(both use the site's error pages). The worker's Landlock policy is widened
+by exactly the upstream ports.
+
 ## Reload without downtime
 
 ```sh
