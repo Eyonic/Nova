@@ -338,7 +338,11 @@ mod tests {
         }
         tokio::time::sleep(delay).await;
         let mut out = BytesMut::new();
-        fastcgi::put_stream(&mut out, RecordType::Stdout, b"Content-type: text/plain\r\n\r\nhi");
+        fastcgi::put_stream(
+            &mut out,
+            RecordType::Stdout,
+            b"Content-type: text/plain\r\n\r\nhi",
+        );
         fastcgi::put_record(&mut out, RecordType::Stdout, &[]);
         fastcgi::put_record(&mut out, RecordType::EndRequest, &[0; 8]);
         let _ = s.write_all(&out).await;
@@ -351,7 +355,9 @@ mod tests {
                 }
             }
         };
-        tokio::time::timeout(Duration::from_secs(2), eof).await.is_ok()
+        tokio::time::timeout(Duration::from_secs(2), eof)
+            .await
+            .is_ok()
     }
 
     fn request(socket: &Path) -> PhpRequest<futures_util::stream::Empty<io::Result<Bytes>>> {
@@ -378,14 +384,20 @@ mod tests {
         let call = tokio::spawn(execute(request(&sock)));
         tokio::time::sleep(Duration::from_millis(100)).await;
         call.abort(); // the HTTP request future is dropped mid-flight
-        assert!(fpm.await.unwrap(), "PHP worker never saw the connection close");
+        assert!(
+            fpm.await.unwrap(),
+            "PHP worker never saw the connection close"
+        );
 
         // And a completed request closes too.
         let listener = tokio::net::UnixListener::bind(dir.join("done.sock")).unwrap();
         let fpm = tokio::spawn(fake_fpm(listener, Duration::ZERO));
         let mut resp = execute(request(&dir.join("done.sock"))).await.unwrap();
         while resp.body.recv().await.is_some() {}
-        assert!(fpm.await.unwrap(), "PHP worker never saw the connection close");
+        assert!(
+            fpm.await.unwrap(),
+            "PHP worker never saw the connection close"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
