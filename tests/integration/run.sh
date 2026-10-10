@@ -236,12 +236,13 @@ eq "transparent PNG to AVIF" "$(curl -s -o /dev/null -H 'Accept: image/avif' -w 
 BOMB=sites/example/public/images/zz-bomb.png
 trap 'rm -f "$BOMB" "${WATCH:-}"; cleanup' EXIT
 python3 -I tests/integration/bomb.py "$BOMB"
-for _ in $(seq 1 30); do
-  BSTATUS=$(curl -s "$BASE/_nova/optimize/status")
-  [[ "$BSTATUS" == *'"errors":1'* ]] && break
+# Wait for the Optimizer to reach it (it may still be busy with other images).
+for _ in $(seq 1 60); do
+  BLOG=$(dc logs nova 2>&1 | grep zz-bomb)
+  [[ "$BLOG" == *"above the configured limit"* ]] && break
   sleep 1
 done
-has "decompression bomb rejected by the pixel limit" "$(dc logs nova 2>&1 | grep zz-bomb)" "above the configured limit"
+has "decompression bomb rejected by the pixel limit" "$BLOG" "above the configured limit"
 eq "decompression bomb served unmodified" \
   "$(curl -s -o /dev/null -H 'Accept: image/avif' -w '%{content_type} %{size_download}' "$BASE/images/zz-bomb.png?w=320")" "image/png $(stat -c %s "$BOMB")"
 eq "still ready after the bomb" "$(code "$BASE/_nova/health/ready")" 200

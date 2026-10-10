@@ -718,25 +718,18 @@ impl App {
                 client.https,
             )
         });
-        let hit = |e: crate::microcache::Entry| {
-            let mut resp = Response::new(full(e.body.clone()));
-            *resp.status_mut() = e.status;
-            *resp.headers_mut() = e.headers.clone();
-            crate::microcache::mark(resp.headers_mut(), Some(e.age()));
-            resp
-        };
         // Held until this response is stored (or found uncacheable), so
         // concurrent misses for the same page wait instead of all running PHP.
         let mut _lead = None;
         if let Some(k) = &cache_key {
             if let Some(e) = self.micro.get(k) {
-                return hit(e);
+                return self.micro_hit(e, &parts.headers).await;
             }
             match self.micro.lead_or_wait(k, php.timeout).await {
                 Some(lead) => _lead = Some(lead),
                 None => {
                     if let Some(e) = self.micro.get(k) {
-                        return hit(e);
+                        return self.micro_hit(e, &parts.headers).await;
                     }
                 }
             }
@@ -970,6 +963,57 @@ impl App {
         let mut resp = Response::new(StreamBody::new(body).boxed_unsync());
         *resp.status_mut() = r.status;
         *resp.headers_mut() = headers;
+        resp
+    }
+
+    /// A micro-cache hit, compressed for this client from the entry's
+    /// stored rendition when there is one (made once per encoding).
+    async fn micro_hit(
+        &self,
+        e: crate::microcache::Entry,
+        req_headers: &http::HeaderMap,
+    ) -> Response<Body> {
+        let plain = |e: &crate::microcache::Entry| {
+            let mut resp = Response::new(full(e.body.clone()));
+            *resp.status_mut() = e.status;
+            *resp.headers_mut() = e.headers.clone();
+            resp
+        };
+        let accept = req_headers
+            .get(header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok());
+        let encoding = self
+            .compression
+            .as_ref()
+            .and_then(|_| compress::accepted(accept).first().copied());
+        let mut resp = match (encoding, &self.compression) {
+            (Some(enc), Some(opts)) => match e.encoded(enc.token()) {
+                Some((headers, body)) => {
+                    let mut r = Response::new(full(body));
+                    *r.status_mut() = e.status;
+                    *r.headers_mut() = headers;
+                    r
+                }
+                None => {
+                    let r = compress::apply(plain(&e), &Method::GET, accept, opts);
+                    if r.headers().contains_key(header::CONTENT_ENCODING) {
+                        let (parts, body) = r.into_parts();
+                        match body.collect().await {
+                            Ok(c) => {
+                                let body = c.to_bytes();
+                                e.store_encoded(enc.token(), parts.headers.clone(), body.clone());
+                                Response::from_parts(parts, full(body))
+                            }
+                            Err(_) => plain(&e),
+                        }
+                    } else {
+                        r
+                    }
+                }
+            },
+            _ => plain(&e),
+        };
+        crate::microcache::mark(resp.headers_mut(), Some(e.age()));
         resp
     }
 

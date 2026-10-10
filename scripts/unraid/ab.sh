@@ -14,6 +14,9 @@ run() { # stack scenario -> req/s
     php)   url=http://127.0.0.1:$http/info.php; args="-c 64 --disable-compression" ;;
     phpbr) url=http://127.0.0.1:$http/info.php; args="-c 64 --disable-compression -H Accept-Encoding:br" ;;
     h2)    url=https://localhost:$https/index.html; args="--http2 -c 16 -p 8 --insecure --disable-compression" ;;
+    wp)    url=http://127.0.0.1:$http/; args="-c 32 --disable-compression -H Host:wp.nova.test -H Accept-Encoding:br" ;;
+    wpposts) url=http://127.0.0.1:$http/?posts_per_page=20; args="-c 32 --disable-compression -H Host:wp.nova.test -H Accept-Encoding:br" ;;
+    wpcookie) url=http://127.0.0.1:$http/; args="-c 32 --disable-compression -H Host:wp.nova.test -H Accept-Encoding:br -H Cookie:wp-settings-1=x" ;;
     avif)  url=http://127.0.0.1:$http/images/hero.jpg; args="-c 64 --disable-compression -H Accept:image/avif,image/webp,*/*" ;;
     htmlbr) url=http://127.0.0.1:$http/index.html; args="-c 128 --disable-compression -H Accept-Encoding:br" ;;
   esac
@@ -21,7 +24,7 @@ run() { # stack scenario -> req/s
   # -> "<req/s> <p99 ms> <non-200 count>"
   taskset -c 16-23 $OHA --no-tui -z $D $args "$url" 2>/dev/null | awk '
     /Requests\/sec:/ {rps=int($2)}
-    /99.00% in/ {p99=$3; if ($4=="secs") p99*=1000; if ($4=="us") p99/=1000}
+    /99.00% in/ {p99=$3; u=$4; if (u ~ /^sec/) p99*=1000; if (u ~ /^us/ || u ~ /^µs/) p99/=1000}
     /^ *\[[0-9]+\]/ {code=$1; gsub(/[\[\]]/,"",code); if (code!="200") bad+=$2}
     END {printf "%d %.2f %d\n", rps, p99, bad+0}'
 }

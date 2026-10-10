@@ -32,11 +32,23 @@ pub struct Entry {
     pub body: Bytes,
     stored: Instant,
     expires: Instant,
+    /// Compressed renditions (by `Content-Encoding` token), made on the
+    /// first hit that asks for one: later hits send stored bytes instead
+    /// of compressing the page again.
+    encoded: Arc<Mutex<HashMap<&'static str, (HeaderMap, Bytes)>>>,
 }
 
 impl Entry {
     pub fn age(&self) -> Duration {
         self.stored.elapsed()
+    }
+
+    pub fn encoded(&self, token: &str) -> Option<(HeaderMap, Bytes)> {
+        self.encoded.lock().unwrap().get(token).cloned()
+    }
+
+    pub fn store_encoded(&self, token: &'static str, headers: HeaderMap, body: Bytes) {
+        self.encoded.lock().unwrap().insert(token, (headers, body));
     }
 }
 
@@ -185,6 +197,7 @@ impl MicroCache {
                 body,
                 stored: now,
                 expires: now + ttl,
+                encoded: Arc::default(),
             },
         );
     }

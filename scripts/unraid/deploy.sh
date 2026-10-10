@@ -17,6 +17,7 @@ R() { ssh "${SSHOPTS[@]}" "$HOST" "$@"; }
 R=R
 scp_() { scp "${SSHOPTS[@]}" "$@"; }
 dir=/mnt/user/appdata/$name
+pool=/mnt/cache/appdata/$name   # same files, bypassing the shfs FUSE layer
 $R "mkdir -p $dir/config /mnt/user/appdata/nova-images"
 echo "copying image"; scp_ -q "$tar" "$HOST:/mnt/user/appdata/nova-images/$(basename "$tar")"
 $R "docker load -q -i /mnt/user/appdata/nova-images/$(basename "$tar")"
@@ -41,8 +42,10 @@ services:
       NOVA_DB_SECOND_PASSWORD: \${NOVA_DB_SECOND_PASSWORD}
     volumes:
       - nova-state:/var/lib/nova
-      - ./sites:/srv/sites:ro
-      - ./config/nova.toml:/etc/nova/nova.toml:ro
+      # The direct pool path, not /mnt/user (FUSE): file lookups through
+      # shfs are ~23x slower and made WordPress take 2.6 s per page.
+      - $pool/sites:/srv/sites:ro
+      - $pool/config/nova.toml:/etc/nova/nova.toml:ro
     read_only: true
     tmpfs: [/run/nova:mode=0755, /tmp]
     cap_drop: [ALL]
