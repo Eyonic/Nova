@@ -57,7 +57,7 @@ pub struct App {
     boot: u32,
     seq: AtomicU64,
     /// `[site.php] micro_cache_secs` storage, shared by all sites.
-    micro: crate::microcache::MicroCache,
+    pub micro: Arc<crate::microcache::MicroCache>,
     /// Keep-alive pool for `[site.proxy]` upstreams.
     upstream: crate::upstream::HttpClient,
     /// ACME HTTP-01 key authorizations (`acme_challenge = "http-01"`).
@@ -99,7 +99,7 @@ impl App {
             http: HttpSettings::default(),
             boot,
             seq: AtomicU64::new(0),
-            micro: crate::microcache::MicroCache::default(),
+            micro: Arc::default(),
             upstream: crate::upstream::http_client(),
             acme_http01: std::sync::OnceLock::new(),
         }

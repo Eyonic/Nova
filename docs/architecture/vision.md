@@ -178,7 +178,7 @@ or another app are invisible.
 |---|---|---|
 | A | HTML rewriting: img dimensions, lazy, srcset, fetchpriority; `Nova-Optimize: off`; status explanations | — |
 | B | Embedded MariaDB supervisor, per-site provisioning, `nova backup` | — |
-| C | Binlog → `db:` channels, coalescing, micro-cache for refetch storms | B |
+| C | Binlog → `db:` channels, coalescing, micro-cache for refetch storms (**prototype on `experimental`**: 68 ms average, micro-cache purge, single flight) | B |
 | D | DOM morphing, View Transitions, prefetch in `live.js` | — |
 | E | Per-route usage learning, Early Hints, weight report | A |
 | F | Compression dictionaries, CSS pruning (opt-in), font subsetting | E |

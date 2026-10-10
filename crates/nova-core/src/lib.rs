@@ -14,6 +14,7 @@
 
 pub mod access;
 pub mod client;
+pub mod dbchanges;
 pub mod dispatch;
 pub mod framework;
 pub mod isolation;
@@ -120,6 +121,17 @@ impl Worker {
         for key in ["PATH", "NOVA_MODE", "NOVA_LOG", "NOVA_LOG_FORMAT", "TZ"] {
             if let Ok(v) = std::env::var(key) {
                 cmd.env(key, v);
+            }
+        }
+        // Replication logins for database change feeds (the worker follows them).
+        for c in cfg
+            .services
+            .database
+            .values()
+            .filter_map(|d| d.changes.as_ref())
+        {
+            if let Ok(v) = std::env::var(&c.password_env) {
+                cmd.env(&c.password_env, v);
             }
         }
         // Basic-auth password hashes (not secrets in themselves) the worker checks.
@@ -378,6 +390,7 @@ async fn run_worker(
         }),
     };
     let app = Arc::new(app);
+    let change_tasks = change_feeds(&cfg, &app, &stop_rx);
 
     let mut listeners = vec![nova_http::Listener {
         tcp: bind_tcp(srv.listen).with_context(|| format!("cannot listen on {}", srv.listen))?,
@@ -449,11 +462,62 @@ async fn run_worker(
     }
 
     let _ = stop_tx.send(true);
+    for t in change_tasks {
+        let _ = tokio::time::timeout(Duration::from_secs(2), t).await;
+    }
     if let Some(t) = optimize_task {
         // An in-progress scan finishes its current images; don't wait forever.
         let _ = tokio::time::timeout(Duration::from_secs(5), t).await;
     }
     Ok(())
+}
+
+/// One binlog follower per database service with `changes` configured.
+fn change_feeds(
+    cfg: &Config,
+    app: &Arc<App>,
+    stop: &watch::Receiver<bool>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut tasks = Vec::new();
+    for (name, svc) in &cfg.services.database {
+        let Some(changes) = &svc.changes else {
+            continue;
+        };
+        let Ok(password) = std::env::var(&changes.password_env) else {
+            tracing::warn!(
+                service = name,
+                var = changes.password_env,
+                "database changes: password not set"
+            );
+            continue;
+        };
+        let mut sites: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for s in &cfg.sites {
+            if let Some(db) = &s.database
+                && &db.service == name
+            {
+                sites
+                    .entry(db.name.clone())
+                    .or_default()
+                    .push(s.name.clone());
+            }
+        }
+        let src = dbchanges::Source {
+            host: svc.host.clone(),
+            port: svc.port,
+            user: changes.user.clone(),
+            password,
+            server_id: changes.server_id,
+            sites,
+        };
+        tasks.push(tokio::spawn(dbchanges::run(
+            src,
+            Arc::clone(&app.live),
+            Arc::clone(&app.micro),
+            stop.clone(),
+        )));
+    }
+    tasks
 }
 
 /// The worker does not own PHP processes, so it learns readiness by pinging

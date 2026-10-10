@@ -471,6 +471,28 @@ pub struct DatabaseService {
     pub driver: DatabaseDriver,
     pub host: String,
     pub port: u16,
+    /// Follow this server's binary log and publish `db:<table>` NOVA Live
+    /// channels for every committed change (MariaDB/MySQL with
+    /// `log_bin` and `binlog_format = ROW`).
+    #[serde(default)]
+    pub changes: Option<DatabaseChanges>,
+}
+
+/// `[services.database.<name>.changes]`: replication login for change feeds.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseChanges {
+    /// A user with `REPLICATION SLAVE, BINLOG MONITOR`.
+    pub user: String,
+    /// Environment variable holding its password.
+    pub password_env: String,
+    /// NOVA's replica id; must differ from the server's `server_id`.
+    #[serde(default = "default_change_server_id")]
+    pub server_id: u32,
+}
+
+fn default_change_server_id() -> u32 {
+    4242
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

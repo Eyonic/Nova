@@ -89,6 +89,42 @@ renders for their own session. No PHP worker is held per connected browser.
 `event: reset` (after a subscriber falls behind) refreshes all subscribed
 regions.
 
+## Database change channels (experimental branch)
+
+Changes made **anywhere** (PHP, cron tasks, queue workers, an admin tool,
+another application, plain SQL) can refresh regions, without PHP sending
+`Nova-Publish`:
+
+```html
+<ul id="orders" data-nova-live data-nova-subscribe="db:orders"> … </ul>
+```
+
+```toml
+[services.database.main.changes]
+user = "nova_cdc"                  # GRANT REPLICATION SLAVE, BINLOG MONITOR ON *.*
+password_env = "NOVA_DB_CDC_PASSWORD"
+```
+
+MariaDB needs a row-based binary log:
+`--log-bin=mariadb-bin --server-id=1 --binlog-format=ROW
+--binlog-row-image=MINIMAL --binlog-expire-logs-seconds=86400
+--max-binlog-total-size=1G`.
+
+* NOVA follows the binary log as a replication client. Each committed
+  change to table `T` in a site's database publishes `db:<t>` (lowercase)
+  to **that site only**; other databases are ignored.
+* Changes are taken at the commit marker: rolled-back transactions publish
+  nothing. Changes are batched every 100 ms (a bulk update is one refresh).
+* The site's micro-cache is cleared on every change, so cached pages never
+  outlive their data.
+* Only table names are used; the stream still carries channel names only.
+* Measured on Unraid (WordPress, `UPDATE` from the mysql client): commit to
+  browser event average 68 ms, maximum 102 ms.
+* Prototype limitation: the reader runs inside the HTTP worker, and a
+  replication login can read every database's changes. A production
+  version should run it as its own sandboxed process that only emits table
+  names.
+
 ## Safety rules (all implemented and tested)
 
 * Only `#id` targets that carry `data-nova-live`; anything else is a normal link.

@@ -6,7 +6,7 @@
 
   const VERSION = '__NOVA_VERSION__';
   const TARGET = /^#[A-Za-z][\w-]*$/;
-  const CHANNEL = /^[a-z0-9][a-z0-9._:-]{0,63}$/;
+  const CHANNEL = /^[a-z0-9][a-z0-9._:_-]{0,63}$/;
   const MIN_POLL_MS = 2000;
 
   const controllers = new Map(); // target id -> AbortController of the newest request

@@ -22,6 +22,7 @@ clearly better (or a deliberate trade-off). Stable baseline: tag
 | 6 | Micro-cache single flight (`proxy_cache_lock`) | every miss at expiry ran PHP (stampede) | local, unit, integration | 200 ms page, TTL 1 s: PHP runs 167 -> 9, slowest request 9.3 s -> 0.21 s, +8-14% req/s | kept |
 | 7 | jemalloc instead of mimalloc | jemalloc returns memory to the OS more eagerly | local, Unraid memory | throughput equal; RSS after settle: jemalloc 37 MB, mimalloc 28 MB, glibc 30 MB | rejected |
 | 8 | Store compressed micro-cache renditions | WordPress: cached hits capped at ~2k req/s, each hit re-compressed 69 KB | Unraid WP, local, integration | WordPress cached 2.0k -> 37.7k req/s (p99 77 -> 1.3 ms); 104 KB page x145 | kept |
+| 9 | Database change channels (binlog → `db:<table>`) | vision phase C; mysql_async binlog is tested against MariaDB 11/12 | Unraid end-to-end, unit, integration | commit → browser 68 ms avg / 102 ms max; rollback 0 events; other databases 0 events; cached WordPress page purged on SQL edit | kept (prototype) |
 
 ## Real applications (Unraid, both stacks, 4 CPUs each)
 
