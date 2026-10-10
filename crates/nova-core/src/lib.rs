@@ -410,6 +410,9 @@ async fn run_worker(
             );
         }
         acme_task = t.acme_task;
+        if let Some(r) = t.http01 {
+            let _ = app.acme_http01.set(r);
+        }
         tracing::info!(listen = %tls_cfg.listen, http3 = quic.is_some(), "accepting HTTPS connections");
     }
 

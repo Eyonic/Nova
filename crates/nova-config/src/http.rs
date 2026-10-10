@@ -179,6 +179,13 @@ pub struct TlsConfig {
     pub acme: bool,
     pub acme_email: Option<String>,
     pub acme_directory: String,
+    /// How the CA validates control of a host: `tls-alpn-01` (port 443
+    /// only, the default) or `http-01` (port 80, `server.listen`; works
+    /// behind CDNs and load balancers that terminate TLS).
+    pub acme_challenge: AcmeChallenge,
+    /// Extra root certificate (PEM) for a private ACME CA (step-ca,
+    /// Pebble). Replaces the public roots for talking to the directory.
+    pub acme_ca_file: Option<PathBuf>,
     /// Generate a self-signed certificate for hosts ACME cannot serve
     /// (`localhost`, `*.localhost`, `*.test`, IP addresses, or everything when ACME is off).
     pub self_signed: bool,
@@ -199,11 +206,23 @@ impl Default for TlsConfig {
             acme: false,
             acme_email: None,
             acme_directory: "https://acme-v02.api.letsencrypt.org/directory".into(),
+            acme_challenge: AcmeChallenge::default(),
+            acme_ca_file: None,
             self_signed: true,
             hsts_max_age_secs: 31_536_000,
             certs: Vec::new(),
         }
     }
+}
+
+/// `server.tls.acme_challenge`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum AcmeChallenge {
+    #[default]
+    #[serde(rename = "tls-alpn-01")]
+    TlsAlpn01,
+    #[serde(rename = "http-01")]
+    Http01,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

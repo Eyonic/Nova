@@ -141,6 +141,17 @@ pub fn site_sandbox(cfg: &Config, site: &SiteConfig) -> Sandbox {
     }
 }
 
+/// TCP port of the ACME directory URL (`https://host[:port]/...`).
+fn acme_port(directory: &str) -> u16 {
+    directory
+        .strip_prefix("https://")
+        .and_then(|r| r.split('/').next())
+        .and_then(|authority| authority.rsplit_once(':'))
+        .filter(|(host, _)| !host.is_empty())
+        .and_then(|(_, port)| port.parse().ok())
+        .unwrap_or(443)
+}
+
 /// Landlock policy for the HTTP worker: read every site and the config,
 /// write optimizer and TLS state, reach PHP sockets, listen on the HTTP(S)
 /// ports and connect only to database ports (readiness checks) and, with
@@ -155,6 +166,7 @@ pub fn worker_sandbox(cfg: &Config, config_path: &std::path::Path) -> Sandbox {
         read.push(c.cert.clone());
         read.push(c.key.clone());
     }
+    read.extend(tls.acme_ca_file.clone());
     read.extend(
         cfg.sites
             .iter()
@@ -176,7 +188,7 @@ pub fn worker_sandbox(cfg: &Config, config_path: &std::path::Path) -> Sandbox {
     if tls.enabled {
         bind.push(tls.listen.port());
         if tls.acme {
-            connect.push(443);
+            connect.push(acme_port(&tls.acme_directory));
         }
     }
     connect.sort_unstable();
@@ -186,5 +198,24 @@ pub fn worker_sandbox(cfg: &Config, config_path: &std::path::Path) -> Sandbox {
         write,
         connect_tcp: connect,
         bind_tcp: bind,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acme_directory_ports() {
+        assert_eq!(
+            acme_port("https://acme-v02.api.letsencrypt.org/directory"),
+            443
+        );
+        assert_eq!(acme_port("https://localhost:14000/dir"), 14000);
+        assert_eq!(
+            acme_port("https://ca.internal:9000/acme/acme/directory"),
+            9000
+        );
+        assert_eq!(acme_port("https://[::1]:9443/dir"), 9443);
     }
 }

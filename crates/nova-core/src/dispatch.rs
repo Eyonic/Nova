@@ -60,6 +60,8 @@ pub struct App {
     micro: crate::microcache::MicroCache,
     /// Keep-alive pool for `[site.proxy]` upstreams.
     upstream: crate::upstream::HttpClient,
+    /// ACME HTTP-01 key authorizations (`acme_challenge = "http-01"`).
+    pub acme_http01: std::sync::OnceLock<Arc<rustls_acme::ResolvesServerCertAcme>>,
 }
 
 impl App {
@@ -98,6 +100,7 @@ impl App {
             seq: AtomicU64::new(0),
             micro: crate::microcache::MicroCache::default(),
             upstream: crate::upstream::http_client(),
+            acme_http01: std::sync::OnceLock::new(),
         }
     }
 
@@ -382,6 +385,22 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        // ACME HTTP-01 validation: before redirects, auth and rate limits.
+        if let Some(token) = req
+            .uri()
+            .path()
+            .strip_prefix("/.well-known/acme-challenge/")
+            && let Some(acme) = self.acme_http01.get()
+        {
+            let resp = match acme.get_http_01_key_auth(token) {
+                Some(key_auth) => Response::builder()
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(full(key_auth))
+                    .unwrap(),
+                None => self.not_found(),
+            };
+            return (resp, Kind::Internal, None);
         }
         if req.uri().path().starts_with("/_nova/") {
             return (self.internal(&req, client).await, Kind::Internal, None);

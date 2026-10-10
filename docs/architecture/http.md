@@ -19,8 +19,12 @@ enabled = true
 listen = "0.0.0.0:8443"
 public_port = 443               # port clients use (redirects, Alt-Svc)
 http3 = true
-acme = true                     # Let's Encrypt, TLS-ALPN-01 on public_port
+acme = true                     # Let's Encrypt
 acme_email = "ops@example.com"
+acme_challenge = "tls-alpn-01"  # or "http-01": validated on port 80 (server.listen),
+                                # works behind CDNs/load balancers that terminate TLS
+# acme_directory = "https://ca.internal:9000/acme/acme/directory"   # private CA (step-ca)
+# acme_ca_file = "/etc/nova/ca/root.pem"                            # its root certificate
 self_signed = true              # fallback for local names and while ACME is pending
 hsts_max_age_secs = 31536000
 
@@ -34,6 +38,11 @@ TLS 1.2 and 1.3 via rustls with the aws-lc-rs provider. Key exchange
 prefers the post-quantum hybrid `X25519MLKEM768` (as Chrome, Firefox and
 Cloudflare do) and falls back to X25519/ECDHE for older clients. It costs
 about 11% of new-handshake throughput, nothing on established connections.
+
+With `http-01`, NOVA answers `/.well-known/acme-challenge/<token>` on the
+plain listener before redirects, auth and rate limits, so port 80 must
+reach `server.listen`. A private ACME directory on another port is
+reachable from the sandboxed worker (Landlock allows the directory's port).
 
 Certificate per SNI host: configured files first, then ACME for public names
 (not `localhost`, `*.localhost`, `*.test`, `*.local`, IPs ...), then a

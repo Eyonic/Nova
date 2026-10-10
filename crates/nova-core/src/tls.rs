@@ -28,6 +28,9 @@ pub struct Tls {
     pub settings: TlsSettings,
     pub quic: Option<nova_http::quinn::ServerConfig>,
     pub acme_task: Option<JoinHandle<()>>,
+    /// With `acme_challenge = "http-01"`: answers
+    /// `/.well-known/acme-challenge/<token>` on the plain HTTP listener.
+    pub http01: Option<Arc<ResolvesServerCertAcme>>,
 }
 
 pub fn tls_dir(cfg: &Config) -> PathBuf {
@@ -161,11 +164,17 @@ pub fn setup(cfg: &Config) -> Result<Tls> {
         (None, None, None)
     } else {
         let email = t.acme_email.clone().unwrap_or_default();
-        let mut state = AcmeConfig::new(acme_hosts.iter())
+        let mut acme = AcmeConfig::new(acme_hosts.iter())
             .contact_push(format!("mailto:{email}"))
             .cache(DirCache::new(dir.join("acme")))
-            .directory(&t.acme_directory)
-            .state();
+            .directory(&t.acme_directory);
+        if t.acme_challenge == nova_config::AcmeChallenge::Http01 {
+            acme = acme.challenge_type(rustls_acme::UseChallenge::Http01);
+        }
+        if let Some(ca) = &t.acme_ca_file {
+            acme = acme.client_tls_config(acme_client_config(ca)?);
+        }
+        let mut state = acme.state();
         let resolver = state.resolver();
         let challenge = state.challenge_rustls_config();
         tracing::info!(hosts = ?acme_hosts, directory = t.acme_directory, "ACME enabled");
@@ -177,8 +186,15 @@ pub fn setup(cfg: &Config) -> Result<Tls> {
                 }
             }
         });
-        (Some(resolver), Some(challenge), Some(task))
+        // HTTP-01 is answered on the plain listener; TLS-ALPN-01 validation
+        // handshakes need the challenge config on the TLS listener.
+        let challenge =
+            (t.acme_challenge == nova_config::AcmeChallenge::TlsAlpn01).then_some(challenge);
+        (Some(resolver), challenge, Some(task))
     };
+    let http01 = acme
+        .clone()
+        .filter(|_| t.acme_challenge == nova_config::AcmeChallenge::Http01);
 
     let fallback = if t.self_signed {
         let mut names: BTreeSet<String> = hosts.iter().filter(|h| !covered(h)).cloned().collect();
@@ -231,7 +247,29 @@ pub fn setup(cfg: &Config) -> Result<Tls> {
         },
         quic,
         acme_task,
+        http01,
     })
+}
+
+/// TLS client settings for a private ACME directory: trust only its root.
+fn acme_client_config(ca: &Path) -> Result<Arc<rustls::ClientConfig>> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in
+        CertificateDer::pem_file_iter(ca).with_context(|| format!("reading {}", ca.display()))?
+    {
+        roots
+            .add(cert.with_context(|| format!("parsing {}", ca.display()))?)
+            .with_context(|| format!("adding {} as a root", ca.display()))?;
+    }
+    if roots.is_empty() {
+        bail!("{} contains no certificate", ca.display());
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+        .with_safe_default_protocol_versions()
+        .context("TLS protocol versions")?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Arc::new(config))
 }
 
 #[cfg(test)]

@@ -10,8 +10,8 @@ pub mod cron;
 pub mod http;
 
 pub use http::{
-    CacheRule, CertFiles, Cidr, ForwardedHeader, RateLimitConfig, Redirect, SiteAuth, SiteCache,
-    SiteProxy, TlsConfig, glob_match,
+    AcmeChallenge, CacheRule, CertFiles, Cidr, ForwardedHeader, RateLimitConfig, Redirect,
+    SiteAuth, SiteCache, SiteProxy, TlsConfig, glob_match,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -857,6 +857,11 @@ impl Config {
             }
             if tls.acme && tls.acme_email.as_deref().is_none_or(|e| !e.contains('@')) {
                 errs.push("server.tls.acme needs server.tls.acme_email".into());
+            }
+            if let Some(ca) = &tls.acme_ca_file
+                && !ca.is_absolute()
+            {
+                errs.push("server.tls.acme_ca_file must be an absolute path".into());
             }
             if !tls.acme && !tls.self_signed && tls.certs.is_empty() {
                 errs.push(
