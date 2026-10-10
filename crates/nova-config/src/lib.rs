@@ -523,6 +523,10 @@ pub struct SiteConfig {
     pub env_from: BTreeMap<String, String>,
     #[serde(default = "default_true")]
     pub optimize: bool,
+    /// Rewrite `<img>` in HTML responses: lazy loading, decoding, priority,
+    /// dimensions and srcset from the Optimizer (never overriding markup).
+    #[serde(default)]
+    pub html_rewrite: bool,
     #[serde(default)]
     pub isolation: SiteIsolation,
     /// Framework integration; `auto` detects it from the project files.

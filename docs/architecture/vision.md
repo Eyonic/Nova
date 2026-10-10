@@ -176,7 +176,7 @@ or another app are invisible.
 
 | Phase | Deliverable | Depends on |
 |---|---|---|
-| A | HTML rewriting: img dimensions, lazy, srcset, fetchpriority; `Nova-Optimize: off`; status explanations | — |
+| A | HTML rewriting: img dimensions, lazy, srcset, fetchpriority (**prototype on `experimental`**: `html_rewrite`, `data-nova-keep`); `Nova-Optimize: off`; status explanations | — |
 | B | Embedded MariaDB supervisor, per-site provisioning, `nova backup` | — |
 | C | Binlog → `db:` channels, coalescing, micro-cache for refetch storms (**prototype on `experimental`**: 68 ms average, micro-cache purge, single flight) | B |
 | D | DOM morphing, View Transitions, prefetch in `live.js` | — |

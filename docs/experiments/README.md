@@ -23,6 +23,8 @@ clearly better (or a deliberate trade-off). Stable baseline: tag
 | 7 | jemalloc instead of mimalloc | jemalloc returns memory to the OS more eagerly | local, Unraid memory | throughput equal; RSS after settle: jemalloc 37 MB, mimalloc 28 MB, glibc 30 MB | rejected |
 | 8 | Store compressed micro-cache renditions | WordPress: cached hits capped at ~2k req/s, each hit re-compressed 69 KB | Unraid WP, local, integration | WordPress cached 2.0k -> 37.7k req/s (p99 77 -> 1.3 ms); 104 KB page x145 | kept |
 | 9 | Database change channels (binlog → `db:<table>`) | vision phase C; mysql_async binlog is tested against MariaDB 11/12 | Unraid end-to-end, unit, integration | commit → browser 68 ms avg / 102 ms max; rollback 0 events; other databases 0 events; cached WordPress page purged on SQL edit | kept (prototype) |
+| 10 | HTTP/3 without a body pump for GET/HEAD | per-request task + channel even without a body; UDP buffers ruled out (no drops) | local x2, integration | 132.6k -> 141.8k req/s (+7%); POST bodies intact | kept |
+| 11 | HTML rewriting for `<img>` (vision phase A) | naive pages load every full-size image and shift layout | Chromium Fast 4G x2, integration | load 1.2 -> 0.37 s, CLS 0.27 -> 0, bytes at load 974 -> 59 KB, phone total 974 -> 110 KB | kept (opt-in) |
 
 ## Real applications (Unraid, both stacks, 4 CPUs each)
 

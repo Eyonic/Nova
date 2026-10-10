@@ -233,6 +233,19 @@ impl nova_http::Handler for App {
         {
             resp.headers_mut().insert(header::ALT_SVC, v);
         }
+        if let Some(site) = site
+            && site.html_rewrite
+            && method == Method::GET
+            && resp.status() == StatusCode::OK
+            && !resp.headers().contains_key(header::CONTENT_ENCODING)
+            && resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("text/html"))
+        {
+            resp = self.rewrite_html(site, resp, &uri_path);
+        }
         if let Some(opts) = &self.compression {
             resp = compress::apply(resp, &method, accept_encoding.as_deref(), opts);
         }
@@ -966,6 +979,34 @@ impl App {
         resp
     }
 
+    /// `html_rewrite`: stream the page through the `<img>` rewriter with the
+    /// site's image metadata from the Optimizer.
+    fn rewrite_html(&self, site: &Site, resp: Response<Body>, path: &str) -> Response<Body> {
+        let manifest = self.optimizer.as_ref().and_then(|o| o.manifest(&site.name));
+        let lookup = move |p: &str| {
+            let asset = manifest.as_ref()?.assets.get(p.trim_start_matches('/'))?;
+            let mut widths: Vec<u32> = asset
+                .variants
+                .iter()
+                .map(|v| v.width)
+                .filter(|w| *w < asset.source.width)
+                .collect();
+            widths.sort_unstable();
+            widths.dedup();
+            Some(crate::htmlrewrite::ImageInfo {
+                width: asset.source.width,
+                height: asset.source.height,
+                widths,
+            })
+        };
+        let (mut parts, body) = resp.into_parts();
+        // The body changes: its length and strong validator no longer apply.
+        parts.headers.remove(header::CONTENT_LENGTH);
+        parts.headers.remove(header::ETAG);
+        let body = crate::htmlrewrite::rewrite(body, path.to_string(), lookup);
+        Response::from_parts(parts, body)
+    }
+
     /// A micro-cache hit, compressed for this client from the entry's
     /// stored rendition when there is one (made once per encoding).
     async fn micro_hit(
@@ -1523,6 +1564,7 @@ mod tests {
             }),
             proxy: None,
             optimize: false,
+            html_rewrite: false,
         }
     }
 

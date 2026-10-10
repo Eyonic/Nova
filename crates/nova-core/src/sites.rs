@@ -16,6 +16,7 @@ pub struct Site {
     /// `[site.proxy]`: application server behind this site.
     pub proxy: Option<nova_config::SiteProxy>,
     pub optimize: bool,
+    pub html_rewrite: bool,
     pub rules: SiteRules,
 }
 
@@ -89,6 +90,7 @@ impl Sites {
                 php,
                 proxy: s.proxy.clone(),
                 optimize: s.optimize,
+                html_rewrite: s.html_rewrite,
                 rules,
             });
         }
