@@ -31,6 +31,12 @@ clearly better (or a deliberate trade-off). Stable baseline: tag
 | 15 | PHP defaults: JIT tracing, max_requests 10 000 (timestamp checks kept) | research: JIT small for web apps, fewer respawns | Unraid WordPress x3 | full profile 104 -> 118% of stable; without validate_timestamps=0: 117%; JIT alone 111%; memory unchanged | kept (defaults) |
 | 16 | LTO (fat) + codegen-units = 1 | research: 3-10% for Rust servers | local, Unraid | local h2 +5%, small +5%, 134 KB +12%; Unraid h2 +8%, JS-br +9%, others flat; binary 45 -> 33 MB | kept |
 | 17 | Compression Dictionary Transport (RFC 9842, dcz) for fingerprinted JS/CSS | Google/Cloudflare: 60-97% smaller updates; matches "load only what is needed" | Chromium x2 + correctness, integration | deploy update 52.7 KB -> 0.6 KB (-98.9%), Chromium runs the new version without errors | kept |
+| 18 | 8 MiB QUIC socket buffers (quinn/Cloudflare guidance) | Unraid HTTP/3 large file 21x slower than HTTP/2, 6,940 UDP drops | Unraid x2, real-client cross-check | server drops 48 -> 0 but no throughput change; the gap is the quinn-based load generator: curl (ngtcp2) over the LAN downloads 4 MB at 15.6 MB/s on HTTP/3 vs 14.5 MB/s on HTTP/2 | rejected (no gain; HTTP/3 is fine for real clients) |
+
+Considered and skipped this round: `Link: rel=preload` hints without 103
+Early Hints (hyper cannot send 1xx; the browser's preload scanner already
+finds `<head>` resources at once, so the research expects little gain for a
+fast origin).
 
 ## Real applications (Unraid, both stacks, 4 CPUs each)
 
