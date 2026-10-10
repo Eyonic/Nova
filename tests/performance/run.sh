@@ -9,6 +9,7 @@
 #   NOVA_BIN=target/release/nova tests/performance/run.sh   # test a binary in the image
 #   SCENARIOS="static-1k static-1k-br" tests/performance/run.sh
 #   LABEL=after tests/performance/run.sh        # name the run (results/<stamp>-<label>)
+#   NOVA_TOML=my.toml tests/performance/run.sh   # another NOVA configuration
 #
 # With tests/performance/baseline.json present, every NOVA scenario must
 # reach at least (1 - TOLERANCE) of its baseline requests/s (default 15%),
@@ -87,7 +88,7 @@ docker run -d --name nova-perf-srv --network host \
   --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
   --cap-add SETUID --cap-add SETGID --cap-add KILL --security-opt no-new-privileges \
   --tmpfs /run/nova --tmpfs /var/lib/nova --tmpfs /tmp -e NOVA_MODE=production \
-  -v "$HERE/nova.toml:/etc/nova/nova.toml:ro" -v "$WORK/site:/srv/sites/bench:ro" \
+  -v "$(realpath "${NOVA_TOML:-$HERE/nova.toml}"):/etc/nova/nova.toml:ro" -v "$WORK/site:/srv/sites/bench:ro" \
   ${NOVA_BIN:+-v "$(realpath "$NOVA_BIN"):/usr/local/bin/nova:ro"} \
   "$NOVA_IMAGE" >/dev/null || exit 1
 wait_up http://127.0.0.1:9005/index.html || { docker logs nova-perf-srv | tail; exit 1; }

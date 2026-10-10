@@ -610,6 +610,9 @@ pub struct SitePhpConfig {
     pub disable_functions: Option<Vec<String>>,
     /// Extra `php_admin_value` settings (cannot be changed by the application).
     pub ini: BTreeMap<String, String>,
+    /// Share anonymous GET responses for this many seconds (0 = off). See
+    /// docs/architecture/http.md "PHP micro-cache" for what is cached.
+    pub micro_cache_secs: u64,
 }
 
 impl Default for SitePhpConfig {
@@ -623,6 +626,7 @@ impl Default for SitePhpConfig {
             timeout_secs: 30,
             disable_functions: None,
             ini: BTreeMap::new(),
+            micro_cache_secs: 0,
         }
     }
 }

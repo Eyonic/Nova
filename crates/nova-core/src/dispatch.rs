@@ -15,7 +15,7 @@ use crate::ratelimit::RateLimiter;
 use crate::sites::{Site, SitePhp, Sites, strip_port};
 use bytes::Bytes;
 use futures_util::StreamExt;
-use http::{HeaderValue, Method, Request, Response, StatusCode, Version, header};
+use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Version, header};
 use http_body_util::{BodyExt, BodyStream, StreamBody};
 use hyper::body::{Body as _, Frame};
 use nova_config::{Cidr, Mode};
@@ -56,6 +56,8 @@ pub struct App {
     pub http: HttpSettings,
     boot: u32,
     seq: AtomicU64,
+    /// `[site.php] micro_cache_secs` storage, shared by all sites.
+    micro: crate::microcache::MicroCache,
 }
 
 impl App {
@@ -92,6 +94,7 @@ impl App {
             http: HttpSettings::default(),
             boot,
             seq: AtomicU64::new(0),
+            micro: crate::microcache::MicroCache::default(),
         }
     }
 
@@ -670,6 +673,24 @@ impl App {
     ) -> Response<Body> {
         let started = Instant::now();
         let (parts, body) = req.into_parts();
+        let cache_key = php.micro_cache.and_then(|_| {
+            crate::microcache::key(
+                &site.name,
+                &parts.method,
+                &parts.uri,
+                &parts.headers,
+                client.https,
+            )
+        });
+        if let Some(k) = &cache_key
+            && let Some(e) = self.micro.get(k)
+        {
+            let mut resp = Response::new(full(e.body.clone()));
+            *resp.status_mut() = e.status;
+            *resp.headers_mut() = e.headers.clone();
+            crate::microcache::mark(resp.headers_mut(), Some(e.age()));
+            return resp;
+        }
         let declared = parts
             .headers
             .get(header::CONTENT_LENGTH)
@@ -815,12 +836,8 @@ impl App {
         };
         self.metrics.php_done(micros, r.status.is_server_error());
 
-        let body = futures_util::stream::unfold(r.body, |mut rx| async move {
-            rx.recv().await.map(|item| (item.map(Frame::data), rx))
-        });
-        let mut resp = Response::new(StreamBody::new(body).boxed_unsync());
-        *resp.status_mut() = r.status;
-        let headers = resp.headers_mut();
+        let mut headers = HeaderMap::new();
+        let mut published = false;
         for (name, value) in r.headers.iter() {
             // Hop-by-hop headers are owned by the HTTP layer.
             if matches!(
@@ -831,7 +848,10 @@ impl App {
             }
             // NOVA Live publish requests are for NOVA, never for the client.
             if name.as_str() == live::PUBLISH_HEADER {
+                published = true;
                 if r.status.as_u16() < 400 {
+                    // The site's data changed: cached pages are stale.
+                    self.micro.purge_site(&site.name);
                     for channel in live::parse_channels(value.to_str().unwrap_or("")) {
                         self.live.publish(&site.name, &channel);
                     }
@@ -840,12 +860,63 @@ impl App {
             }
             headers.append(name.clone(), value.clone());
         }
+        let store = cache_key
+            .zip(php.micro_cache)
+            .filter(|_| !published && crate::microcache::cacheable(r.status, &headers));
         // PHP may answer NOVA Live requests with a fragment: caches must
         // keep fragments and full pages apart.
         headers.append(
             header::VARY,
             HeaderValue::from_static("Nova-Live, Nova-Target"),
         );
+
+        let mut rx = r.body;
+        // Cacheable: buffer up to MAX_ENTRY; anything larger (or failing)
+        // is streamed on from where buffering stopped, and not stored.
+        let mut prefix: Vec<io::Result<Bytes>> = Vec::new();
+        if let Some((key, ttl)) = store {
+            let mut size = 0;
+            loop {
+                match rx.recv().await {
+                    Some(Ok(b)) => {
+                        size += b.len();
+                        prefix.push(Ok(b));
+                        if size > crate::microcache::MAX_ENTRY {
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        prefix.push(Err(e));
+                        break;
+                    }
+                    None => {
+                        let mut body = bytes::BytesMut::with_capacity(size);
+                        for b in prefix.iter().flatten() {
+                            body.extend_from_slice(b);
+                        }
+                        let body = body.freeze();
+                        self.micro
+                            .put(key, r.status, headers.clone(), body.clone(), ttl);
+                        let mut resp = Response::new(full(body));
+                        *resp.status_mut() = r.status;
+                        *resp.headers_mut() = headers;
+                        crate::microcache::mark(resp.headers_mut(), None);
+                        return resp;
+                    }
+                }
+            }
+        }
+        // Without buffering this is the whole body; after a partial buffer
+        // it continues where buffering stopped.
+        let rest = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        let body = futures_util::stream::iter(prefix)
+            .chain(rest)
+            .map(|item| item.map(Frame::data));
+        let mut resp = Response::new(StreamBody::new(body).boxed_unsync());
+        *resp.status_mut() = r.status;
+        *resp.headers_mut() = headers;
         resp
     }
 
@@ -1263,6 +1334,7 @@ mod tests {
                 socket: "/nonexistent".into(),
                 front_controller: fc.map(String::from),
                 timeout: Duration::from_secs(1),
+                micro_cache: None,
             }),
             optimize: false,
         }

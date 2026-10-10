@@ -19,6 +19,7 @@ pub mod framework;
 pub mod isolation;
 pub mod live;
 pub mod metrics;
+pub mod microcache;
 pub mod php;
 pub mod ratelimit;
 pub mod rules;

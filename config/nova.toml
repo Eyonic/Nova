@@ -52,6 +52,7 @@ path = "/srv/sites/example"
 front_controller = "router.php"
 max_children = 8
 timeout_secs = 30
+# micro_cache_secs = 2        # share anonymous GET responses for 2 s (see http.md)
 
 [site.database]
 service = "main"

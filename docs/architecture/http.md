@@ -242,6 +242,31 @@ jit_buffer = "64MiB"
 Startup-only settings (`opcache.*`, `realpath_cache*`) can be overridden per
 site in `[site.php.ini]`; they are passed to that site's master.
 
+### PHP micro-cache (opt-in)
+
+```toml
+[site.php]
+micro_cache_secs = 2             # 0 = off (default)
+```
+
+Shares a PHP response between visitors for a few seconds, so a traffic
+spike costs one PHP execution per page per interval instead of one per
+visitor (a 20 ms page: 787 → 163 000 req/s in `tests/performance`).
+Only responses that are the same for everyone are stored:
+
+* request: `GET` without `Cookie` or `Authorization` (logged-in users and
+  sessions always reach PHP); the key is host, scheme, path, query and the
+  NOVA Live `Nova-Live` / `Nova-Target` headers;
+* response: `200`, no `Set-Cookie`, no `Cache-Control: private`,
+  `no-store` or `no-cache`, no `Vary` other than `Accept-Encoding`, not
+  `text/event-stream`, at most 1 MiB (32 MiB in total).
+
+PHP opts a page out with `header('Cache-Control: no-store')`. A
+`Nova-Publish` from the site clears its cached pages, so NOVA Live
+refreshes always see new data. Responses carry `nova-cache: hit` (with
+`Age`) or `miss`. Cache-eligible misses are buffered before sending; pages
+that stream output with `flush()` should send `Cache-Control: no-store`.
+
 ## Reload without downtime
 
 ```sh

@@ -29,6 +29,8 @@ pub struct SitePhp {
     /// URL path of the front controller, e.g. `/index.php`.
     pub front_controller: Option<String>,
     pub timeout: Duration,
+    /// `micro_cache_secs`, when enabled.
+    pub micro_cache: Option<Duration>,
 }
 
 pub struct Sites {
@@ -65,6 +67,8 @@ impl Sites {
                     .as_ref()
                     .map(|f| format!("/{}", f.trim_start_matches('/'))),
                 timeout: Duration::from_secs(p.timeout_secs),
+                micro_cache: (p.micro_cache_secs > 0)
+                    .then(|| Duration::from_secs(p.micro_cache_secs)),
             });
             for h in &s.hosts {
                 by_host.insert(h.to_ascii_lowercase(), i);
