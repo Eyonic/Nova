@@ -2,11 +2,13 @@
 //! an HTTP status, headers and a streamed body.
 
 use crate::fastcgi::{self, EndRequest, RecordReader, RecordType};
+use crate::pool::{Pool, Slot};
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -45,27 +47,55 @@ pub struct PhpRequest<B> {
     pub site: String,
 }
 
-/// Aborts the task when dropped.
-struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+/// Aborts the task when dropped (unless it was taken out first).
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
 
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(h) = &self.0 {
+            h.abort();
+        }
     }
 }
 
+/// Run one request on a new connection that FPM closes afterwards.
 pub async fn execute<B>(req: PhpRequest<B>) -> Result<PhpResponse, PhpError>
 where
     B: Stream<Item = io::Result<Bytes>> + Send + Unpin + 'static,
 {
+    let stream = connect(&req.socket).await?;
+    run(stream, None, req).await
+}
+
+/// Run one request on a kept-alive connection from `pool` (`req.socket` is
+/// ignored); the connection goes back to the pool after a clean response.
+pub async fn execute_pooled<B>(
+    req: PhpRequest<B>,
+    pool: &Arc<Pool>,
+) -> Result<PhpResponse, PhpError>
+where
+    B: Stream<Item = io::Result<Bytes>> + Send + Unpin + 'static,
+{
+    let (stream, slot) = pool.get().await?.into_parts();
+    run(stream, Some(slot), req).await
+}
+
+async fn run<B>(
+    stream: UnixStream,
+    slot: Option<Slot>,
+    req: PhpRequest<B>,
+) -> Result<PhpResponse, PhpError>
+where
+    B: Stream<Item = io::Result<Bytes>> + Send + Unpin + 'static,
+{
     let PhpRequest {
-        socket,
+        socket: _,
         params,
         body,
         header_timeout,
         site,
     } = req;
-    let stream = connect(&socket).await?;
+    let keep = slot.is_some();
     let (rd, mut wr) = stream.into_split();
 
     // Writer: BEGIN_REQUEST, PARAMS, then STDIN streamed from the client.
@@ -75,9 +105,9 @@ where
     // Aborted on every exit path, including this future being dropped
     // (client gone): FPM closes a connection only after reading EOF, so a
     // write half left open would hold a PHP worker forever.
-    let writer = AbortOnDrop(tokio::spawn(async move {
+    let mut writer = AbortOnDrop(Some(tokio::spawn(async move {
         let mut buf = BytesMut::with_capacity(8192);
-        fastcgi::put_begin_request(&mut buf);
+        fastcgi::put_begin_request(&mut buf, keep);
         let encoded = fastcgi::encode_params(params.iter().map(|(k, v)| (&k[..], &v[..])));
         fastcgi::put_stream(&mut buf, RecordType::Params, &encoded);
         fastcgi::put_record(&mut buf, RecordType::Params, &[]);
@@ -89,7 +119,7 @@ where
                 Err(e) => {
                     // Closing without the final STDIN record makes FPM abort the script.
                     let _ = body_err_tx.send(e).await;
-                    return Ok(());
+                    return Ok(None);
                 }
             };
             buf.clear();
@@ -99,11 +129,15 @@ where
         buf.clear();
         fastcgi::put_record(&mut buf, RecordType::Stdin, &[]);
         wr.write_all(&buf).await?;
+        if keep {
+            // Handed back for reuse once the response is complete.
+            return Ok(Some(wr));
+        }
         // Dropping the write half would half-close the socket; keep it open
         // until the reader has consumed the response and aborts this task.
         std::future::pending::<()>().await;
-        Ok::<_, io::Error>(())
-    }));
+        Ok::<_, io::Error>(None)
+    })));
 
     let mut reader = RecordReader::new(rd);
     let header_phase = async {
@@ -148,7 +182,8 @@ where
 
     let (tx, rx) = mpsc::channel(16);
     tokio::spawn(async move {
-        let _writer = writer;
+        // Reusable only after a clean END_REQUEST with the request fully sent.
+        let mut clean = finished;
         if !rest.is_empty() && tx.send(Ok(rest)).await.is_err() {
             return;
         }
@@ -168,14 +203,14 @@ where
                         }
                         RecordType::Stderr => log_stderr(&site, &rec.content),
                         RecordType::EndRequest => {
-                            if let Ok(end) = EndRequest::parse(&rec.content)
-                                && end.protocol_status != 0
-                            {
-                                tracing::warn!(
+                            match EndRequest::parse(&rec.content) {
+                                Ok(end) if end.protocol_status != 0 => tracing::warn!(
                                     site,
                                     protocol_status = end.protocol_status,
                                     "FastCGI request not completed"
-                                );
+                                ),
+                                Ok(_) => clean = true,
+                                Err(_) => {}
                             }
                             break;
                         }
@@ -189,6 +224,14 @@ where
                 }
             }
         }
+        if let Some(slot) = slot
+            && clean
+            && let Some(handle) = writer.0.take_if(|h| h.is_finished())
+            && let Ok(Ok(Some(wr))) = handle.await
+            && let Ok(stream) = reader.into_inner().reunite(wr)
+        {
+            slot.recycle(stream);
+        }
     });
 
     Ok(PhpResponse {
@@ -201,7 +244,7 @@ where
 /// Connect to the pool. A missing or refusing socket is retried for a few
 /// seconds: that is a pool being (re)started, e.g. during a config reload,
 /// and the client should not see it.
-async fn connect(socket: &Path) -> Result<UnixStream, PhpError> {
+pub(crate) async fn connect(socket: &Path) -> Result<UnixStream, PhpError> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
         match tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(socket)).await {
@@ -398,6 +441,118 @@ mod tests {
             fpm.await.unwrap(),
             "PHP worker never saw the connection close"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fake PHP-FPM that honours FCGI_KEEP_CONN: serves requests on each
+    /// connection until the client closes it. Returns the accept counter
+    /// and the number of connections open at the same time (high water).
+    fn keepalive_fpm(
+        listener: tokio::net::UnixListener,
+        delay: Duration,
+    ) -> (
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use tokio::io::AsyncReadExt;
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let open = Arc::new(AtomicUsize::new(0));
+        let high = Arc::new(AtomicUsize::new(0));
+        let (a, h) = (Arc::clone(&accepts), Arc::clone(&high));
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                a.fetch_add(1, SeqCst);
+                let now = open.fetch_add(1, SeqCst) + 1;
+                h.fetch_max(now, SeqCst);
+                let open = Arc::clone(&open);
+                tokio::spawn(async move {
+                    let mut got = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    let end_of_stdin = [1u8, RecordType::Stdin as u8];
+                    loop {
+                        // One request: read until the empty STDIN record.
+                        while !got
+                            .windows(8)
+                            .any(|w| w[..2] == end_of_stdin && w[4..6] == [0, 0])
+                        {
+                            match s.read(&mut buf).await {
+                                Ok(0) | Err(_) => {
+                                    open.fetch_sub(1, SeqCst);
+                                    return;
+                                }
+                                Ok(n) => got.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        got.clear();
+                        tokio::time::sleep(delay).await;
+                        let mut out = BytesMut::new();
+                        fastcgi::put_stream(
+                            &mut out,
+                            RecordType::Stdout,
+                            b"Content-type: text/plain\r\n\r\nok",
+                        );
+                        fastcgi::put_record(&mut out, RecordType::Stdout, &[]);
+                        fastcgi::put_record(&mut out, RecordType::EndRequest, &[0; 8]);
+                        if s.write_all(&out).await.is_err() {
+                            open.fetch_sub(1, SeqCst);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (accepts, high)
+    }
+
+    async fn drain(mut r: PhpResponse) -> Bytes {
+        let mut b = BytesMut::new();
+        while let Some(c) = r.body.recv().await {
+            b.extend_from_slice(&c.unwrap());
+        }
+        b.freeze()
+    }
+
+    #[tokio::test]
+    async fn pooled_connections_are_reused_and_capped() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = std::env::temp_dir().join(format!("nova-pool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("keep.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let (accepts, high) = keepalive_fpm(listener, Duration::from_millis(20));
+        // max_children 3 -> at most 2 connections.
+        let pool = Pool::new(&sock, 3);
+
+        for _ in 0..5 {
+            let r = execute_pooled(request(&sock), &pool).await.unwrap();
+            assert_eq!(drain(r).await, "ok");
+            tokio::time::sleep(Duration::from_millis(5)).await; // reader task recycles
+        }
+        assert_eq!(
+            accepts.load(SeqCst),
+            1,
+            "sequential requests share one connection"
+        );
+        assert_eq!(pool.idle_count(), 1);
+
+        // 10 concurrent requests never open more than 2 connections.
+        let jobs: Vec<_> = (0..10)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                let sock = sock.clone();
+                tokio::spawn(async move {
+                    drain(execute_pooled(request(&sock), &pool).await.unwrap()).await
+                })
+            })
+            .collect();
+        for j in jobs {
+            assert_eq!(j.await.unwrap(), "ok");
+        }
+        assert!(high.load(SeqCst) <= 2, "pool exceeded max_children - 1");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

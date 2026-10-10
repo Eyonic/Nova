@@ -830,13 +830,16 @@ impl App {
             request_id: id,
         });
 
-        let result = nova_runtime_php::execute(PhpRequest {
-            socket: php.socket.clone(),
-            params,
-            body: stream,
-            header_timeout: php.timeout + Duration::from_secs(5),
-            site: site.name.clone(),
-        })
+        let result = nova_runtime_php::execute_pooled(
+            PhpRequest {
+                socket: php.socket.clone(),
+                params,
+                body: stream,
+                header_timeout: php.timeout + Duration::from_secs(5),
+                site: site.name.clone(),
+            },
+            &php.pool,
+        )
         .await;
         let micros = started.elapsed().as_micros() as u64;
 
@@ -1397,6 +1400,7 @@ mod tests {
                 front_controller: fc.map(String::from),
                 timeout: Duration::from_secs(1),
                 micro_cache: None,
+                pool: nova_runtime_php::Pool::new("/nonexistent", 2),
             }),
             proxy: None,
             optimize: false,

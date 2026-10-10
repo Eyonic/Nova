@@ -76,10 +76,14 @@ pub fn put_stream(buf: &mut BytesMut, ty: RecordType, data: &[u8]) {
     }
 }
 
-pub fn put_begin_request(buf: &mut BytesMut) {
+/// `FCGI_KEEP_CONN`: the application keeps the connection open after the request.
+pub const KEEP_CONN: u8 = 1;
+
+/// `keep_conn = false`: FPM closes the connection after the request.
+pub fn put_begin_request(buf: &mut BytesMut, keep_conn: bool) {
     let mut body = [0u8; 8];
     body[..2].copy_from_slice(&ROLE_RESPONDER.to_be_bytes());
-    // flags = 0: FPM closes the connection after the request.
+    body[2] = if keep_conn { KEEP_CONN } else { 0 };
     put_record(buf, RecordType::BeginRequest, &body);
 }
 
@@ -148,6 +152,10 @@ pub struct RecordReader<R> {
 impl<R: AsyncRead + Unpin> RecordReader<R> {
     pub fn new(inner: R) -> Self {
         Self { inner }
+    }
+
+    pub fn into_inner(self) -> R {
+        self.inner
     }
 
     /// Returns `Ok(None)` on a clean EOF at a record boundary.

@@ -8,7 +8,9 @@ pub mod cgi;
 pub mod client;
 pub mod fastcgi;
 pub mod fpm;
+pub mod pool;
 
 pub use cgi::{CgiRequest, build_params};
-pub use client::{PhpError, PhpRequest, PhpResponse, execute};
+pub use client::{PhpError, PhpRequest, PhpResponse, execute, execute_pooled};
 pub use fpm::{Fpm, FpmConfig, Launch, PoolSpec};
+pub use pool::Pool;
