@@ -14,6 +14,7 @@ path = "src/main.rs"
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 libc = "0.2.190"
+mimalloc = { version = "0.1", default-features = false }
 nova-config = { version = "0.1.0", path = "../nova-config" }
 nova-core = { version = "0.1.0", path = "../nova-core" }
 nova-runtime-php = { version = "0.1.0", path = "../nova-runtime-php" }

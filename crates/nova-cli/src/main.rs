@@ -116,6 +116,12 @@ fn init_logging(mode: Mode) -> tracing_appender::non_blocking::WorkerGuard {
     guard
 }
 
+/// mimalloc instead of glibc malloc: per-thread heaps suit tokio's work
+/// stealing, where memory is often freed on another thread than the one
+/// that allocated it (malloc/free were ~5% of worker CPU).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
