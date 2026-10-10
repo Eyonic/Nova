@@ -135,6 +135,20 @@ watch = true
 Objects that no manifest references are garbage-collected (at most every
 10 minutes, objects younger than an hour are kept).
 
+## Compression dictionaries (RFC 9842, automatic)
+
+Fingerprinted JS/CSS (Vite/Mix builds served as immutable) carry
+`Use-As-Dictionary: match="/build/assets/app-*.js"`. After a deploy, a
+returning Chromium visitor asks for `app-NEW.js` with
+`Available-Dictionary` (the hash of its cached `app-OLD.js`); NOVA answers
+with only the difference, a zstd frame against the old file
+(`Content-Encoding: dcz`, `Vary: Accept-Encoding, Available-Dictionary`),
+when that is smaller than the normal encoding. Versions are remembered in
+memory (64 MiB including computed deltas); unknown hashes, other browsers
+and a just-restarted NOVA get the usual brotli/zstd/gzip. Measured with a
+275 KB library: the updated bundle downloads as 0.6 KB instead of 52.7 KB
+(`tests/browser/dictionaries/`).
+
 ## Caching
 
 | File | `Cache-Control` |

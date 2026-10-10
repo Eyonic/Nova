@@ -15,6 +15,7 @@
 pub mod access;
 pub mod client;
 pub mod dbchanges;
+pub mod dictionaries;
 pub mod dispatch;
 pub mod framework;
 pub mod htmlrewrite;

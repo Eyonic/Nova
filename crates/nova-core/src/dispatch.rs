@@ -58,6 +58,8 @@ pub struct App {
     seq: AtomicU64,
     /// `[site.php] micro_cache_secs` storage, shared by all sites.
     pub micro: Arc<crate::microcache::MicroCache>,
+    /// Remembered asset versions for compression dictionaries (RFC 9842).
+    dictionaries: crate::dictionaries::Dictionaries,
     /// Keep-alive pool for `[site.proxy]` upstreams.
     upstream: crate::upstream::HttpClient,
     /// ACME HTTP-01 key authorizations (`acme_challenge = "http-01"`).
@@ -100,6 +102,7 @@ impl App {
             boot,
             seq: AtomicU64::new(0),
             micro: Arc::default(),
+            dictionaries: Default::default(),
             upstream: crate::upstream::http_client(),
             acme_http01: std::sync::OnceLock::new(),
         }
@@ -633,6 +636,13 @@ impl App {
                 if resp.status() == StatusCode::OK {
                     self.metrics
                         .text_saved(meta.len().saturating_sub(vmeta.len()));
+                    if req.method() == Method::GET
+                        && let Some(delta) = self
+                            .dictionary_response(site, req, rel, meta, vmeta.len(), &mut resp)
+                            .await
+                    {
+                        return (delta, Kind::Static);
+                    }
                 }
                 return (resp, Kind::Static);
             }
@@ -1046,6 +1056,90 @@ impl App {
         };
         let body = crate::htmlrewrite::rewrite(body, path.to_string(), opts, lookup);
         Response::from_parts(parts, body)
+    }
+
+    /// Compression dictionaries for an immutable, fingerprinted JS/CSS
+    /// response: mark it as a dictionary for later versions, and when the
+    /// browser offers an older version NOVA knows, answer with the `dcz`
+    /// delta instead (when it beats `normal_len`, the regular encoding).
+    async fn dictionary_response(
+        &self,
+        site: &Site,
+        req: &Request<ReqBody>,
+        rel: &str,
+        meta: &Metadata,
+        normal_len: u64,
+        resp: &mut Response<Body>,
+    ) -> Option<Response<Body>> {
+        let path = req.uri().path();
+        let immutable = resp
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("immutable"));
+        let pattern = crate::dictionaries::pattern_for(path)?;
+        let offered = req.headers().contains_key("available-dictionary");
+        // Offer a dictionary only on responses browsers keep (immutable);
+        // use one whenever the browser announces a version NOVA knows.
+        if !immutable && !offered {
+            return None;
+        }
+        let opt = self.optimizer.as_ref()?;
+        // The decoded bytes the browser keeps: the minified version, or the
+        // original when the Optimizer left it as is (already minified).
+        let identity = opt
+            .select_text(&site.name, rel, meta, &[])
+            .map(|sel| sel.path)
+            .unwrap_or_else(|| site.root.join(rel));
+        let content = Bytes::from(tokio::fs::read(&identity).await.ok()?);
+        if content.len() > crate::dictionaries::MAX_DICTIONARY {
+            return None;
+        }
+        let hash = crate::dictionaries::sha256(&content);
+        if immutable {
+            self.dictionaries.remember(hash, &pattern, content.clone());
+            if let Ok(v) = HeaderValue::from_str(&format!("match=\"{pattern}\"")) {
+                resp.headers_mut().insert("use-as-dictionary", v);
+            }
+        }
+        let h = req.headers();
+        let accepts_dcz = h
+            .get_all(header::ACCEPT_ENCODING)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|t| t.split(';').next().is_some_and(|t| t.trim() == "dcz"));
+        let have = h
+            .get("available-dictionary")
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::dictionaries::parse_available)?;
+        if !accepts_dcz {
+            return None;
+        }
+        let delta = self.dictionaries.delta(&have, path, hash, &content)?;
+        if delta.len() as u64 >= normal_len {
+            return None;
+        }
+        let mut out = Response::new(full(delta));
+        for name in [
+            header::CONTENT_TYPE,
+            header::CACHE_CONTROL,
+            header::LAST_MODIFIED,
+        ] {
+            if let Some(v) = resp.headers().get(&name) {
+                out.headers_mut().insert(name, v.clone());
+            }
+        }
+        let oh = out.headers_mut();
+        oh.insert(header::CONTENT_ENCODING, HeaderValue::from_static("dcz"));
+        oh.insert(
+            header::VARY,
+            HeaderValue::from_static("Accept-Encoding, Available-Dictionary"),
+        );
+        if let Some(v) = resp.headers().get("use-as-dictionary") {
+            oh.insert("use-as-dictionary", v.clone());
+        }
+        Some(out)
     }
 
     /// An expired entry served within its grace period.

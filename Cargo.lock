@@ -2350,6 +2350,7 @@ name = "nova-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bcrypt",
  "bytes",
  "futures-util",
@@ -2370,9 +2371,11 @@ dependencies = [
  "rustls",
  "rustls-acme",
  "serde_json",
+ "sha2",
  "socket2",
  "tokio",
  "tracing",
+ "zstd 0.13.3",
 ]
 
 [[package]]

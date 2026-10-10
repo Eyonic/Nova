@@ -29,6 +29,8 @@ clearly better (or a deliberate trade-off). Stable baseline: tag
 | 13 | Micro-cache grace + stale-if-error (Varnish grace, Cloudflare SWR) | expiry made visitors wait on PHP; PHP errors reached visitors | local x2, integration | healthy PHP: unchanged; flaky PHP (500 half the time): errors 1,975 -> 0, 5.6x more responses | kept |
 | 14 | Speculation Rules + No-Vary-Search (opt-in) | Chrome/web.dev case studies: tens of % faster navigations | Chromium x2, integration | hover-then-click 326 -> 107 ms; quick clicks unchanged; logout/delete never prefetched | kept |
 | 15 | PHP defaults: JIT tracing, max_requests 10 000 (timestamp checks kept) | research: JIT small for web apps, fewer respawns | Unraid WordPress x3 | full profile 104 -> 118% of stable; without validate_timestamps=0: 117%; JIT alone 111%; memory unchanged | kept (defaults) |
+| 16 | LTO (fat) + codegen-units = 1 | research: 3-10% for Rust servers | local, Unraid | local h2 +5%, small +5%, 134 KB +12%; Unraid h2 +8%, JS-br +9%, others flat; binary 45 -> 33 MB | kept |
+| 17 | Compression Dictionary Transport (RFC 9842, dcz) for fingerprinted JS/CSS | Google/Cloudflare: 60-97% smaller updates; matches "load only what is needed" | Chromium x2 + correctness, integration | deploy update 52.7 KB -> 0.6 KB (-98.9%), Chromium runs the new version without errors | kept |
 
 ## Real applications (Unraid, both stacks, 4 CPUs each)
 
