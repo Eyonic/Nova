@@ -718,14 +718,28 @@ impl App {
                 client.https,
             )
         });
-        if let Some(k) = &cache_key
-            && let Some(e) = self.micro.get(k)
-        {
+        let hit = |e: crate::microcache::Entry| {
             let mut resp = Response::new(full(e.body.clone()));
             *resp.status_mut() = e.status;
             *resp.headers_mut() = e.headers.clone();
             crate::microcache::mark(resp.headers_mut(), Some(e.age()));
-            return resp;
+            resp
+        };
+        // Held until this response is stored (or found uncacheable), so
+        // concurrent misses for the same page wait instead of all running PHP.
+        let mut _lead = None;
+        if let Some(k) = &cache_key {
+            if let Some(e) = self.micro.get(k) {
+                return hit(e);
+            }
+            match self.micro.lead_or_wait(k, php.timeout).await {
+                Some(lead) => _lead = Some(lead),
+                None => {
+                    if let Some(e) = self.micro.get(k) {
+                        return hit(e);
+                    }
+                }
+            }
         }
         let declared = parts
             .headers

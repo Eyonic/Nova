@@ -16,8 +16,9 @@
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 /// Largest response body that is cached.
 pub const MAX_ENTRY: usize = 1 << 20;
@@ -42,6 +43,23 @@ impl Entry {
 #[derive(Default)]
 pub struct MicroCache {
     inner: Mutex<Inner>,
+    /// Keys whose response is being produced right now (single flight).
+    filling: Mutex<HashMap<String, Arc<Notify>>>,
+}
+
+/// Held by the one request that renders a missing entry; dropping it wakes
+/// the requests waiting for the same key.
+pub struct Lead<'a> {
+    cache: &'a MicroCache,
+    key: String,
+}
+
+impl Drop for Lead<'_> {
+    fn drop(&mut self) {
+        if let Some(n) = self.cache.filling.lock().unwrap().remove(&self.key) {
+            n.notify_waiters();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -171,6 +189,35 @@ impl MicroCache {
         );
     }
 
+    /// On a miss: become the request that renders `key` (`Some`), or wait
+    /// up to `max_wait` for the one already doing so (`None`; look the key
+    /// up again, and render it yourself if it is still missing, e.g.
+    /// because that response was not cacheable).
+    pub async fn lead_or_wait(&self, key: &str, max_wait: Duration) -> Option<Lead<'_>> {
+        let notify = {
+            let mut filling = self.filling.lock().unwrap();
+            match filling.get(key) {
+                Some(n) => Arc::clone(n),
+                None => {
+                    filling.insert(key.to_owned(), Arc::new(Notify::new()));
+                    return Some(Lead {
+                        cache: self,
+                        key: key.to_owned(),
+                    });
+                }
+            }
+        };
+        let woken = notify.notified();
+        tokio::pin!(woken);
+        // Registered before re-checking: a leader finishing in between
+        // has removed its entry, so the wait below cannot be missed.
+        woken.as_mut().enable();
+        if self.filling.lock().unwrap().contains_key(key) {
+            let _ = tokio::time::timeout(max_wait, woken).await;
+        }
+        None
+    }
+
     /// Drop every entry of `site` (its data changed).
     pub fn purge_site(&self, site: &str) {
         let prefix = format!("{site}\n");
@@ -297,5 +344,65 @@ mod tests {
             Duration::from_secs(60),
         );
         assert!(c.get("b\n2").is_none(), "too large");
+    }
+
+    /// Many requests for one missing page: one renders, the rest wait and
+    /// are served from the cache it fills.
+    #[tokio::test]
+    async fn single_flight() {
+        let c = Arc::new(MicroCache::default());
+        let renders = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let jobs: Vec<_> = (0..20)
+            .map(|_| {
+                let (c, renders) = (Arc::clone(&c), Arc::clone(&renders));
+                tokio::spawn(async move {
+                    if c.get("s\npage").is_some() {
+                        return "hit";
+                    }
+                    match c.lead_or_wait("s\npage", Duration::from_secs(5)).await {
+                        Some(_lead) => {
+                            renders.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            c.put(
+                                "s\npage".into(),
+                                StatusCode::OK,
+                                HeaderMap::new(),
+                                Bytes::from_static(b"x"),
+                                Duration::from_secs(60),
+                            );
+                            "rendered"
+                        }
+                        None if c.get("s\npage").is_some() => "waited",
+                        None => "fallback",
+                    }
+                })
+            })
+            .collect();
+        let mut out = Vec::new();
+        for j in jobs {
+            out.push(j.await.unwrap());
+        }
+        assert_eq!(
+            renders.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{out:?}"
+        );
+        assert!(!out.contains(&"fallback"), "{out:?}");
+
+        // Uncacheable result: waiters fall back to rendering themselves.
+        let lead = c.lead_or_wait("s\nprivate", Duration::from_secs(5)).await;
+        assert!(lead.is_some());
+        let waiter = {
+            let c = Arc::clone(&c);
+            tokio::spawn(async move {
+                c.lead_or_wait("s\nprivate", Duration::from_secs(5))
+                    .await
+                    .is_none()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(lead); // finished without storing anything
+        assert!(waiter.await.unwrap());
+        assert!(c.get("s\nprivate").is_none());
     }
 }
