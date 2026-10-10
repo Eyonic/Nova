@@ -32,6 +32,7 @@ clearly better (or a deliberate trade-off). Stable baseline: tag
 | 16 | LTO (fat) + codegen-units = 1 | research: 3-10% for Rust servers | local, Unraid | local h2 +5%, small +5%, 134 KB +12%; Unraid h2 +8%, JS-br +9%, others flat; binary 45 -> 33 MB | kept |
 | 17 | Compression Dictionary Transport (RFC 9842, dcz) for fingerprinted JS/CSS | Google/Cloudflare: 60-97% smaller updates; matches "load only what is needed" | Chromium x2 + correctness, integration | deploy update 52.7 KB -> 0.6 KB (-98.9%), Chromium runs the new version without errors | kept |
 | 18 | 8 MiB QUIC socket buffers (quinn/Cloudflare guidance) | Unraid HTTP/3 large file 21x slower than HTTP/2, 6,940 UDP drops | Unraid x2, real-client cross-check | server drops 48 -> 0 but no throughput change; the gap is the quinn-based load generator: curl (ngtcp2) over the LAN downloads 4 MB at 15.6 MB/s on HTTP/3 vs 14.5 MB/s on HTTP/2 | rejected (no gain; HTTP/3 is fine for real clients) |
+| 19 | Tag-based purges (`Nova-Cache-Tags` / `Nova-Purge`, LiteSpeed-style) | any write cleared the whole site's micro-cache | local x2, unit, integration, real WordPress (Unraid) | one article saved 10x/s among 10 cached: PHP runs 914-991 -> 151-183, readers +18-20%; WordPress mu-plugin: a comment purges only that post, home and other pages stay hits | kept |
 
 Considered and skipped this round: `Link: rel=preload` hints without 103
 Early Hints (hyper cannot send 1xx; the browser's preload scanner already

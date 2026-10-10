@@ -929,6 +929,9 @@ impl App {
 
         let mut headers = HeaderMap::new();
         let mut published = false;
+        let mut cache_tags = Vec::new();
+        let mut purge = None::<Vec<String>>;
+        let mut channels = Vec::new();
         for (name, value) in r.headers.iter() {
             // Hop-by-hop headers are owned by the HTTP layer.
             if matches!(
@@ -940,16 +943,33 @@ impl App {
             // NOVA Live publish requests are for NOVA, never for the client.
             if name.as_str() == live::PUBLISH_HEADER {
                 published = true;
-                if r.status.as_u16() < 400 {
-                    // The site's data changed: cached pages are stale.
-                    self.micro.purge_site(&site.name);
-                    for channel in live::parse_channels(value.to_str().unwrap_or("")) {
-                        self.live.publish(&site.name, &channel);
-                    }
-                }
+                channels.extend(live::parse_channels(value.to_str().unwrap_or("")));
+                continue;
+            }
+            // Micro-cache tags and precise purges, also for NOVA only.
+            if name.as_str() == "nova-cache-tags" {
+                cache_tags.extend(crate::microcache::parse_tags(value.to_str().unwrap_or("")));
+                continue;
+            }
+            if name.as_str() == "nova-purge" {
+                published = true;
+                purge
+                    .get_or_insert_with(Vec::new)
+                    .extend(crate::microcache::parse_tags(value.to_str().unwrap_or("")));
                 continue;
             }
             headers.append(name.clone(), value.clone());
+        }
+        if published && r.status.as_u16() < 400 {
+            // Data changed: purge exactly the named tags, or (no Nova-Purge)
+            // every cached page of the site.
+            match &purge {
+                Some(tags) => self.micro.purge_tags(&site.name, tags, false),
+                None => self.micro.purge_site(&site.name),
+            }
+            for channel in &channels {
+                self.live.publish(&site.name, channel);
+            }
         }
         let store = cache_key
             .zip(php.micro_cache)
@@ -991,8 +1011,11 @@ impl App {
                             r.status,
                             headers.clone(),
                             body.clone(),
-                            ttl,
-                            php.micro_cache_grace,
+                            crate::microcache::Policy {
+                                ttl,
+                                grace: php.micro_cache_grace,
+                                tags: std::mem::take(&mut cache_tags),
+                            },
                         );
                         let mut resp = Response::new(full(body));
                         *resp.status_mut() = r.status;

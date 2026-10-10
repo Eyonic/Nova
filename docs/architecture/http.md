@@ -304,6 +304,31 @@ version immediately (`nova-cache: stale`), and if PHP fails (5xx, timeout,
 pool down) the last good page is served instead of an error. A purge
 (`Nova-Publish`, database change) removes pages completely, grace included.
 
+**Precise purges with tags.** By default any `Nova-Publish` clears the
+whole site's cached pages. Tag pages instead and purge only what changed:
+
+```php
+header('Nova-Cache-Tags: post-42, home');   // on the article page (stripped)
+header('Nova-Purge: post-42');              // in the request that saves it
+```
+
+`Nova-Purge: *` clears the site. A database change feed
+(`[services.database.*.changes]`) purges pages tagged `db:<table>` plus
+every untagged page. Measured (10 cached articles, 60 readers, one article
+saved 10x/s): PHP runs 914 -> 151-183, reader throughput +19%. A WordPress
+must-use plugin is enough, e.g. `wp-content/mu-plugins/nova-tags.php`:
+
+```php
+<?php
+add_action('template_redirect', function () {
+    $tags = ['home'];
+    if (is_singular()) $tags[] = 'post-' . get_queried_object_id();
+    header('Nova-Cache-Tags: ' . implode(', ', $tags));
+});
+add_action('save_post', fn ($id) => header("Nova-Purge: post-$id, home"));
+add_action('comment_post', fn ($c, $ok, $data) => header('Nova-Purge: post-' . $data['comment_post_ID']), 10, 3);
+```
+
 PHP opts a page out with `header('Cache-Control: no-store')`. A
 `Nova-Publish` from the site clears its cached pages, so NOVA Live
 refreshes always see new data. Responses carry `nova-cache: hit` (with

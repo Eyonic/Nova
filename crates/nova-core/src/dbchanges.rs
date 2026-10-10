@@ -69,11 +69,10 @@ pub async fn run(
                     _ = stop.changed() => return,
                 }
                 let batch: Vec<_> = pending.lock().unwrap().drain().collect();
-                let mut purged = HashSet::new();
                 for (site, channel) in batch {
-                    if purged.insert(site.clone()) {
-                        micro.purge_site(&site);
-                    }
+                    // Pages tagged with this table, plus untagged pages
+                    // (their dependencies are unknown).
+                    micro.purge_tags(&site, std::slice::from_ref(&channel), true);
                     live.publish(&site, &channel);
                 }
             }

@@ -39,6 +39,41 @@ pub struct Entry {
     /// first hit that asks for one: later hits send stored bytes instead
     /// of compressing the page again.
     encoded: Arc<Mutex<HashMap<&'static str, (HeaderMap, Bytes)>>>,
+    /// `Nova-Cache-Tags` of the response, for precise purges.
+    tags: Vec<String>,
+}
+
+/// How long an entry lives, and what purges it.
+#[derive(Debug, Clone, Default)]
+pub struct Policy {
+    pub ttl: Duration,
+    /// See `micro_cache_grace_secs`.
+    pub grace: Duration,
+    /// `Nova-Cache-Tags`; a purge of any of them removes the entry.
+    pub tags: Vec<String>,
+}
+
+impl Policy {
+    pub fn new(ttl: Duration, grace: Duration) -> Self {
+        Self {
+            ttl,
+            grace,
+            tags: Vec::new(),
+        }
+    }
+}
+
+/// Tags in a `Nova-Cache-Tags` / `Nova-Purge` value (channel syntax; `*`
+/// is kept as "everything").
+pub fn parse_tags(value: &str) -> Vec<String> {
+    let mut tags: Vec<String> = value
+        .split(',')
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| t == "*" || crate::live::valid_channel(t))
+        .collect();
+    tags.sort();
+    tags.dedup();
+    tags
 }
 
 impl Entry {
@@ -206,8 +241,7 @@ impl MicroCache {
         status: StatusCode,
         headers: HeaderMap,
         body: Bytes,
-        ttl: Duration,
-        grace: Duration,
+        policy: Policy,
     ) {
         if body.len() > MAX_ENTRY {
             return;
@@ -238,9 +272,10 @@ impl MicroCache {
                 headers,
                 body,
                 stored: now,
-                expires: now + ttl,
-                stale_until: now + ttl + grace,
+                expires: now + policy.ttl,
+                stale_until: now + policy.ttl + policy.grace,
                 encoded: Arc::default(),
+                tags: policy.tags,
             },
         );
     }
@@ -272,6 +307,22 @@ impl MicroCache {
             let _ = tokio::time::timeout(max_wait, woken).await;
         }
         None
+    }
+
+    /// Drop `site`'s entries carrying any of `tags` (`*`: all of them).
+    /// With `untagged`, entries without tags go too: their dependencies are
+    /// unknown (used for database changes).
+    pub fn purge_tags(&self, site: &str, tags: &[String], untagged: bool) {
+        if tags.iter().any(|t| t == "*") {
+            return self.purge_site(site);
+        }
+        let prefix = format!("{site}\n");
+        let mut inner = self.inner.lock().unwrap();
+        inner.map.retain(|k, e| {
+            !k.starts_with(&prefix)
+                || !(e.tags.iter().any(|t| tags.contains(t)) || (untagged && e.tags.is_empty()))
+        });
+        inner.bytes = inner.map.values().map(|e| e.body.len()).sum();
     }
 
     /// Drop every entry of `site` (its data changed).
@@ -370,24 +421,21 @@ mod tests {
             StatusCode::OK,
             HeaderMap::new(),
             body.clone(),
-            Duration::from_secs(60),
-            Duration::ZERO,
+            Policy::new(Duration::from_secs(60), Duration::ZERO),
         );
         c.put(
             "b\n1".into(),
             StatusCode::OK,
             HeaderMap::new(),
             body.clone(),
-            Duration::from_secs(60),
-            Duration::ZERO,
+            Policy::new(Duration::from_secs(60), Duration::ZERO),
         );
         c.put(
             "a\n2".into(),
             StatusCode::OK,
             HeaderMap::new(),
             body.clone(),
-            Duration::ZERO,
-            Duration::ZERO,
+            Policy::new(Duration::ZERO, Duration::ZERO),
         );
         assert!(c.get("a\n1").is_some());
         assert!(c.get("a\n2").is_none(), "expired");
@@ -400,8 +448,7 @@ mod tests {
             StatusCode::OK,
             HeaderMap::new(),
             big,
-            Duration::from_secs(60),
-            Duration::ZERO,
+            Policy::new(Duration::from_secs(60), Duration::ZERO),
         );
         assert!(c.get("b\n2").is_none(), "too large");
     }
@@ -428,8 +475,7 @@ mod tests {
                                 StatusCode::OK,
                                 HeaderMap::new(),
                                 Bytes::from_static(b"x"),
-                                Duration::from_secs(60),
-                                Duration::ZERO,
+                                Policy::new(Duration::from_secs(60), Duration::ZERO),
                             );
                             "rendered"
                         }
@@ -476,8 +522,7 @@ mod tests {
             StatusCode::OK,
             HeaderMap::new(),
             b,
-            Duration::ZERO,
-            Duration::from_secs(60),
+            Policy::new(Duration::ZERO, Duration::from_secs(60)),
         );
         assert!(
             matches!(c.lookup("s\np"), Lookup::Stale(_)),
@@ -492,14 +537,66 @@ mod tests {
             StatusCode::OK,
             HeaderMap::new(),
             Bytes::new(),
-            Duration::ZERO,
-            Duration::ZERO,
+            Policy::new(Duration::ZERO, Duration::ZERO),
         );
         assert!(matches!(c.lookup("s\nq"), Lookup::Miss), "past grace");
         c.purge_site("s");
         assert!(
             matches!(c.lookup("s\np"), Lookup::Miss),
             "purge drops stale entries too"
+        );
+    }
+
+    #[test]
+    fn tag_purges_are_precise() {
+        let c = MicroCache::default();
+        let tagged = |tags: &[&str]| Policy {
+            ttl: Duration::from_secs(60),
+            grace: Duration::ZERO,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+        };
+        let b = Bytes::from_static(b"x");
+        c.put(
+            "s\npost-1".into(),
+            StatusCode::OK,
+            HeaderMap::new(),
+            b.clone(),
+            tagged(&["post-1", "db:wp_posts"]),
+        );
+        c.put(
+            "s\npost-2".into(),
+            StatusCode::OK,
+            HeaderMap::new(),
+            b.clone(),
+            tagged(&["post-2", "db:wp_posts"]),
+        );
+        c.put(
+            "s\nabout".into(),
+            StatusCode::OK,
+            HeaderMap::new(),
+            b.clone(),
+            tagged(&[]),
+        );
+        c.purge_tags("s", &["post-1".into()], false);
+        assert!(c.get("s\npost-1").is_none());
+        assert!(
+            c.get("s\npost-2").is_some() && c.get("s\nabout").is_some(),
+            "other pages stay cached"
+        );
+        c.purge_tags("s", &["db:wp_comments".into()], true);
+        assert!(
+            c.get("s\nabout").is_none(),
+            "untagged pages go on database changes"
+        );
+        assert!(
+            c.get("s\npost-2").is_some(),
+            "tagged with other tables: stays"
+        );
+        c.purge_tags("s", &["*".into()], false);
+        assert!(c.get("s\npost-2").is_none());
+        assert_eq!(
+            parse_tags(" Post-1, bad tag ,*, post-1"),
+            vec!["*", "post-1"]
         );
     }
 }
