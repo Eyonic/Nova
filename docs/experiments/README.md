@@ -21,6 +21,24 @@ clearly better (or a deliberate trade-off). Stable baseline: tag
 | 5 | Lookup cache for Optimizer variants and precompressed siblings (incl. missing) | browser requests (AVIF, br) still did 1-3 uncached stats | Unraid, local, integration | Unraid AVIF/HTML-br/JS-br +27-29% more (now x5-6 stable), p99 ~25 -> 7-10 ms; local br +9% | kept |
 | 6 | Micro-cache single flight (`proxy_cache_lock`) | every miss at expiry ran PHP (stampede) | local, unit, integration | 200 ms page, TTL 1 s: PHP runs 167 -> 9, slowest request 9.3 s -> 0.21 s, +8-14% req/s | kept |
 | 7 | jemalloc instead of mimalloc | jemalloc returns memory to the OS more eagerly | local, Unraid memory | throughput equal; RSS after settle: jemalloc 37 MB, mimalloc 28 MB, glibc 30 MB | rejected |
+| 8 | Store compressed micro-cache renditions | WordPress: cached hits capped at ~2k req/s, each hit re-compressed 69 KB | Unraid WP, local, integration | WordPress cached 2.0k -> 37.7k req/s (p99 77 -> 1.3 ms); 104 KB page x145 | kept |
+
+## Real applications (Unraid, both stacks, 4 CPUs each)
+
+WordPress 7.1.3 (block theme, MariaDB) and Laravel 13.35 (welcome page,
+file sessions), installed side by side on both stacks.
+
+| Page | Stable | Experimental | Note |
+|---|---:|---:|---|
+| WordPress home, no micro-cache | 44 req/s | 40-46 req/s | PHP-bound (~70 ms render, 4 CPUs) |
+| WordPress home, micro-cache 2 s | 1,266-1,955 req/s | **37,737 req/s** | single flight + stored br rendition |
+| WordPress with a cookie (bypasses cache) | 68 req/s | 70 req/s | PHP-bound |
+| Laravel welcome (sets cookies, never cached) | 137 req/s | 169 req/s | keep-alive + mimalloc; noisy |
+
+Deployment finding: on Unraid, mount sites from `/mnt/cache/appdata/...`,
+not `/mnt/user/appdata/...`. Through the shfs FUSE layer, stat on 2000
+WordPress files took 1.03 s vs 0.044 s directly, and every WordPress page
+took 2.6 s instead of 70 ms (any web server is affected).
 
 Not attempted (research): sendfile needs a hyper change (hyper#3026,
 PR #4214 closed pending a HIP); kTLS depends on it; tokio interval knobs

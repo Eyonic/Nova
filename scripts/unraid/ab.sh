@@ -17,6 +17,7 @@ run() { # stack scenario -> req/s
     wp)    url=http://127.0.0.1:$http/; args="-c 32 --disable-compression -H Host:wp.nova.test -H Accept-Encoding:br" ;;
     wpposts) url=http://127.0.0.1:$http/?posts_per_page=20; args="-c 32 --disable-compression -H Host:wp.nova.test -H Accept-Encoding:br" ;;
     wpcookie) url=http://127.0.0.1:$http/; args="-c 32 --disable-compression -H Host:wp.nova.test -H Accept-Encoding:br -H Cookie:wp-settings-1=x" ;;
+    laravel) url=http://127.0.0.1:$http/; args="-c 32 --disable-compression -H Host:laravel.nova.test -H Accept-Encoding:br" ;;
     avif)  url=http://127.0.0.1:$http/images/hero.jpg; args="-c 64 --disable-compression -H Accept:image/avif,image/webp,*/*" ;;
     htmlbr) url=http://127.0.0.1:$http/index.html; args="-c 128 --disable-compression -H Accept-Encoding:br" ;;
   esac
