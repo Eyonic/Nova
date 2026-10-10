@@ -2,16 +2,89 @@
 //! conditional requests, single byte ranges and HEAD.
 
 use crate::{Body, empty, full};
+use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
+use std::collections::HashMap;
 use std::fs::Metadata;
 use std::io::SeekFrom;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
+
+/// Files up to this size are kept in the in-memory file cache.
+const CACHE_MAX_FILE: u64 = 1 << 20;
+/// Total size of the in-memory file cache.
+const CACHE_BUDGET: u64 = 64 << 20;
+
+/// Recently served small files. An entry is valid only while the file's
+/// size and modification time (the same inputs as the ETag) are unchanged,
+/// so edits are picked up on the next request without any invalidation.
+struct FileCache {
+    map: HashMap<PathBuf, CacheEntry>,
+    bytes: u64,
+}
+
+struct CacheEntry {
+    len: u64,
+    mtime: Option<SystemTime>,
+    data: Bytes,
+}
+
+static FILE_CACHE: LazyLock<Mutex<FileCache>> = LazyLock::new(|| {
+    Mutex::new(FileCache {
+        map: HashMap::new(),
+        bytes: 0,
+    })
+});
+
+/// The whole file, from the cache or read in one blocking-pool hop.
+async fn cached_bytes(path: &Path, meta: &Metadata) -> Option<Bytes> {
+    let (len, mtime) = (meta.len(), meta.modified().ok());
+    if let Some(e) = FILE_CACHE.lock().unwrap().map.get(path)
+        && e.len == len
+        && e.mtime == mtime
+    {
+        return Some(e.data.clone());
+    }
+    let owned = path.to_path_buf();
+    let data = tokio::task::spawn_blocking(move || std::fs::read(owned))
+        .await
+        .ok()?
+        .ok()?;
+    // A file that changed since the stat would not match the headers.
+    if data.len() as u64 != len {
+        return None;
+    }
+    let data = Bytes::from(data);
+    let mut c = FILE_CACHE.lock().unwrap();
+    if let Some(old) = c.map.remove(path) {
+        c.bytes -= old.len;
+    }
+    // Over budget: drop arbitrary entries (hot files come straight back).
+    while c.bytes + len > CACHE_BUDGET {
+        let Some(k) = c.map.keys().next().cloned() else {
+            break;
+        };
+        if let Some(old) = c.map.remove(&k) {
+            c.bytes -= old.len;
+        }
+    }
+    c.bytes += len;
+    c.map.insert(
+        path.to_path_buf(),
+        CacheEntry {
+            len,
+            mtime,
+            data: data.clone(),
+        },
+    );
+    Some(data)
+}
 
 pub struct FileResponse<'a> {
     pub path: &'a Path,
@@ -173,6 +246,25 @@ pub async fn respond(f: FileResponse<'_>, method: &Method, req: &HeaderMap) -> R
         return builder.body(empty()).unwrap();
     }
 
+    // Files up to CACHE_MAX_FILE (HTML, CSS, JS, icons, most images): served
+    // from memory, read with one blocking-pool hop on a miss, instead of
+    // separate open/seek/read hops and a 64 KiB stream buffer per request.
+    if len <= CACHE_MAX_FILE {
+        return match cached_bytes(f.path, f.meta).await {
+            Some(bytes) => {
+                let body = bytes.slice(start as usize..(start + count) as usize);
+                builder.body(full(body)).unwrap()
+            }
+            None => {
+                tracing::warn!(path = %f.path.display(), "cannot read file");
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(full("internal error"))
+                    .unwrap()
+            }
+        };
+    }
+
     let mut file = match tokio::fs::File::open(f.path).await {
         Ok(file) => file,
         Err(e) => {
@@ -243,5 +335,44 @@ mod tests {
         h.insert(header::IF_NONE_MATCH, "W/\"a-b\", \"c-d\"".parse().unwrap());
         assert!(not_modified(&h, "\"c-d\"", None));
         assert!(!not_modified(&h, "\"x\"", None));
+    }
+
+    async fn body_of(path: &Path, range: Option<&str>) -> (StatusCode, Bytes) {
+        let meta = std::fs::metadata(path).unwrap();
+        let mut req = HeaderMap::new();
+        if let Some(r) = range {
+            req.insert(header::RANGE, r.parse().unwrap());
+        }
+        let f = FileResponse {
+            path,
+            meta: &meta,
+            content_type: None,
+            cache_control: "no-cache",
+        };
+        let resp = respond(f, &Method::GET, &req).await;
+        let status = resp.status();
+        (status, resp.into_body().collect().await.unwrap().to_bytes())
+    }
+
+    /// Cached small files: ranges slice the cached bytes, and an edit is
+    /// served on the very next request (size/mtime change the cache key).
+    #[tokio::test]
+    async fn file_cache_follows_edits() {
+        let dir = std::env::temp_dir().join(format!("nova-fc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.txt");
+        std::fs::write(&p, "hello world").unwrap();
+        assert_eq!(
+            body_of(&p, None).await,
+            (StatusCode::OK, Bytes::from("hello world"))
+        );
+        assert_eq!(body_of(&p, None).await.1, "hello world");
+        assert_eq!(
+            body_of(&p, Some("bytes=6-")).await,
+            (StatusCode::PARTIAL_CONTENT, Bytes::from("world"))
+        );
+        std::fs::write(&p, "changed!").unwrap();
+        assert_eq!(body_of(&p, None).await.1, "changed!");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

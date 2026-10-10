@@ -2,7 +2,7 @@
 //! trusted reverse proxies (`X-Forwarded-*`, `Forwarded`) into account.
 
 use http::{HeaderMap, header};
-use nova_config::Cidr;
+use nova_config::{Cidr, ForwardedHeader};
 use nova_http::ConnInfo;
 use std::net::IpAddr;
 
@@ -15,7 +15,23 @@ pub struct Client {
     pub proxied: bool,
 }
 
-pub fn resolve(headers: &HeaderMap, conn: &ConnInfo, trusted: &[Cidr]) -> Client {
+/// One entry of a forwarding chain: the address a proxy saw and, when
+/// known, whether that hop used HTTPS. `ip` is `None` for entries that
+/// cannot be verified (`unknown`, obfuscated identifiers, garbage).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Hop {
+    ip: Option<IpAddr>,
+    https: Option<bool>,
+}
+
+/// Only `source` is read: a proxy appends to its own header and passes any
+/// other one through untouched, where the client could have forged it.
+pub fn resolve(
+    headers: &HeaderMap,
+    conn: &ConnInfo,
+    trusted: &[Cidr],
+    source: ForwardedHeader,
+) -> Client {
     let direct = Client {
         ip: canonical(conn.peer.ip()),
         https: conn.tls,
@@ -24,79 +40,98 @@ pub fn resolve(headers: &HeaderMap, conn: &ConnInfo, trusted: &[Cidr]) -> Client
     if !Cidr::any_contains(trusted, conn.peer.ip()) {
         return direct;
     }
-
-    let (chain, proto) = match forwarded(headers) {
-        Some(f) => f,
-        None => (
-            headers
-                .get_all("x-forwarded-for")
-                .iter()
-                .filter_map(|v| v.to_str().ok())
-                .flat_map(|v| v.split(','))
-                .filter_map(|ip| parse_ip(ip.trim()))
-                .collect(),
-            headers
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| {
-                    v.split(',')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .to_ascii_lowercase()
-                }),
-        ),
+    let hops = match source {
+        ForwardedHeader::XForwardedFor => x_forwarded(headers),
+        ForwardedHeader::Forwarded => forwarded(headers),
     };
     // Walk from the nearest hop outwards; the first untrusted address is the
-    // client. Anything further left could have been forged by it.
+    // client. Anything further left could have been forged by it, and an
+    // unverifiable hop ends the walk at the last proxy that vouched for it.
     let mut ip = direct.ip;
-    for hop in chain.iter().rev() {
-        ip = canonical(*hop);
+    let mut https = conn.tls;
+    for hop in hops.iter().rev() {
+        let Some(addr) = hop.ip else { break };
+        ip = canonical(addr);
+        if let Some(h) = hop.https {
+            https = h;
+        }
         if !Cidr::any_contains(trusted, ip) {
             break;
         }
     }
     Client {
         ip,
-        https: match proto.as_deref() {
-            Some("https") => true,
-            Some("http") => false,
-            _ => conn.tls,
-        },
+        https,
         proxied: true,
     }
 }
 
+/// `X-Forwarded-For` plus `X-Forwarded-Proto`. When both list one entry per
+/// hop they are paired; otherwise the nearest proxy's scheme applies.
+fn x_forwarded(headers: &HeaderMap) -> Vec<Hop> {
+    let list = |name: &str| -> Vec<String> {
+        headers
+            .get_all(name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(|v| v.trim().to_owned())
+            .collect()
+    };
+    let ips = list("x-forwarded-for");
+    let protos = list("x-forwarded-proto");
+    let paired = protos.len() == ips.len();
+    let nearest = protos.last().and_then(|p| scheme(p));
+    let last = ips.len().saturating_sub(1);
+    ips.iter()
+        .enumerate()
+        .map(|(i, ip)| Hop {
+            ip: parse_ip(ip),
+            https: if paired {
+                scheme(&protos[i])
+            } else if i == last {
+                nearest
+            } else {
+                None
+            },
+        })
+        .collect()
+}
+
 /// RFC 7239 `Forwarded: for=192.0.2.1;proto=https, for="[2001:db8::1]:4711"`.
-fn forwarded(headers: &HeaderMap) -> Option<(Vec<IpAddr>, Option<String>)> {
-    let values: Vec<&str> = headers
+fn forwarded(headers: &HeaderMap) -> Vec<Hop> {
+    headers
         .get_all(header::FORWARDED)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .collect();
-    if values.is_empty() {
-        return None;
-    }
-    let mut chain = Vec::new();
-    let mut first_proto = None;
-    for element in values.iter().flat_map(|v| v.split(',')) {
-        for pair in element.split(';') {
-            let Some((k, v)) = pair.trim().split_once('=') else {
-                continue;
+        .flat_map(|v| v.split(','))
+        .map(|element| {
+            let mut hop = Hop {
+                ip: None,
+                https: None,
             };
-            let v = v.trim().trim_matches('"');
-            match k.trim().to_ascii_lowercase().as_str() {
-                "for" => {
-                    if let Some(ip) = parse_ip(v) {
-                        chain.push(ip);
-                    }
+            for pair in element.split(';') {
+                let Some((k, v)) = pair.trim().split_once('=') else {
+                    continue;
+                };
+                let v = v.trim().trim_matches('"');
+                match k.trim().to_ascii_lowercase().as_str() {
+                    "for" => hop.ip = parse_ip(v),
+                    "proto" => hop.https = scheme(v),
+                    _ => {}
                 }
-                "proto" if first_proto.is_none() => first_proto = Some(v.to_ascii_lowercase()),
-                _ => {}
             }
-        }
+            hop
+        })
+        .collect()
+}
+
+fn scheme(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "https" => Some(true),
+        "http" => Some(false),
+        _ => None,
     }
-    Some((chain, first_proto))
 }
 
 /// `1.2.3.4`, `1.2.3.4:80`, `[::1]`, `[::1]:80` or a bare IPv6 address.
@@ -140,48 +175,116 @@ mod tests {
         h
     }
 
+    const XFF: ForwardedHeader = ForwardedHeader::XForwardedFor;
+    const RFC: ForwardedHeader = ForwardedHeader::Forwarded;
+
+    fn trusted() -> Vec<Cidr> {
+        vec!["10.0.0.0/8".parse().unwrap()]
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
     #[test]
     fn untrusted_peers_cannot_spoof() {
-        let trusted = vec!["10.0.0.0/8".parse().unwrap()];
         let h = headers(&[
             ("x-forwarded-for", "1.1.1.1"),
             ("x-forwarded-proto", "https"),
+            ("forwarded", "for=1.1.1.1;proto=https"),
         ]);
-        let c = resolve(&h, &conn("203.0.113.5:999", false), &trusted);
-        assert_eq!(c.ip, "203.0.113.5".parse::<IpAddr>().unwrap());
-        assert!(!c.https && !c.proxied);
+        for source in [XFF, RFC] {
+            let c = resolve(&h, &conn("203.0.113.5:999", false), &trusted(), source);
+            assert_eq!(c.ip, ip("203.0.113.5"));
+            assert!(!c.https && !c.proxied);
+        }
     }
 
     #[test]
     fn trusted_proxy_chain() {
-        let trusted = vec!["10.0.0.0/8".parse().unwrap()];
         // spoofed, real client, inner proxy
         let h = headers(&[
             ("x-forwarded-for", "6.6.6.6, 198.51.100.7"),
             ("x-forwarded-for", "10.0.0.9"),
             ("x-forwarded-proto", "https"),
         ]);
-        let c = resolve(&h, &conn("10.0.0.2:999", false), &trusted);
-        assert_eq!(c.ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+        let c = resolve(&h, &conn("10.0.0.2:999", false), &trusted(), XFF);
+        assert_eq!(c.ip, ip("198.51.100.7"));
         assert!(c.https && c.proxied);
     }
 
     #[test]
     fn rfc7239() {
-        let trusted = vec!["10.0.0.0/8".parse().unwrap()];
         let h = headers(&[(
             "forwarded",
-            "for=\"[2001:db8::1]:4711\";proto=https, for=10.1.1.1",
+            "for=\"[2001:db8::1]:4711\";proto=https, for=10.1.1.1;proto=http",
         )]);
-        let c = resolve(&h, &conn("10.0.0.2:999", false), &trusted);
-        assert_eq!(c.ip, "2001:db8::1".parse::<IpAddr>().unwrap());
+        let c = resolve(&h, &conn("10.0.0.2:999", false), &trusted(), RFC);
+        assert_eq!(c.ip, ip("2001:db8::1"));
+        assert!(c.https, "the client's own hop decides the scheme");
+    }
+
+    /// A proxy that maintains X-Forwarded-For passes a client-sent
+    /// `Forwarded` header through unchanged; it must not be believed.
+    #[test]
+    fn only_the_configured_header_counts() {
+        let h = headers(&[
+            ("forwarded", "for=10.0.0.5;proto=https"),
+            ("x-forwarded-for", "198.51.100.7"),
+        ]);
+        let c = resolve(&h, &conn("10.0.0.2:999", false), &trusted(), XFF);
+        assert_eq!(c.ip, ip("198.51.100.7"));
+        assert!(!c.https);
+
+        let h = headers(&[
+            ("x-forwarded-for", "10.0.0.5"),
+            ("forwarded", "for=198.51.100.7"),
+        ]);
+        let c = resolve(&h, &conn("10.0.0.2:999", false), &trusted(), RFC);
+        assert_eq!(c.ip, ip("198.51.100.7"));
+    }
+
+    #[test]
+    fn unverifiable_hops_stop_the_walk() {
+        let h = headers(&[("x-forwarded-for", "10.0.0.7, unknown, 10.0.0.9")]);
+        let c = resolve(&h, &conn("10.0.0.2:999", false), &trusted(), XFF);
+        assert_eq!(c.ip, ip("10.0.0.9"));
+
+        let h = headers(&[("forwarded", "for=10.0.0.7, for=_hidden")]);
+        let c = resolve(&h, &conn("10.0.0.2:999", true), &trusted(), RFC);
+        assert_eq!(c.ip, ip("10.0.0.2"));
+        assert!(c.https);
+    }
+
+    /// The client may send its own X-Forwarded-Proto; with one value per hop
+    /// the pairing picks the client's hop, otherwise the nearest proxy's.
+    #[test]
+    fn forwarded_proto_comes_from_the_proxy() {
+        let h = headers(&[
+            ("x-forwarded-for", "198.51.100.7"),
+            ("x-forwarded-proto", "http, https"),
+        ]);
+        let c = resolve(&h, &conn("10.0.0.2:999", false), &trusted(), XFF);
+        assert!(c.https);
+
+        let h = headers(&[
+            ("x-forwarded-for", "198.51.100.7, 10.0.0.9"),
+            ("x-forwarded-proto", "https, http"),
+        ]);
+        let c = resolve(&h, &conn("10.0.0.2:999", false), &trusted(), XFF);
+        assert_eq!(c.ip, ip("198.51.100.7"));
         assert!(c.https);
     }
 
     #[test]
     fn mapped_ipv4() {
-        let c = resolve(&HeaderMap::new(), &conn("[::ffff:192.0.2.1]:1", true), &[]);
-        assert_eq!(c.ip, "192.0.2.1".parse::<IpAddr>().unwrap());
+        let c = resolve(
+            &HeaderMap::new(),
+            &conn("[::ffff:192.0.2.1]:1", true),
+            &[],
+            XFF,
+        );
+        assert_eq!(c.ip, ip("192.0.2.1"));
         assert!(c.https);
     }
 }

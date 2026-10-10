@@ -65,7 +65,11 @@ pub struct Optimizer {
     text: RwLock<HashMap<String, Arc<text::TextManifest>>>,
     text_profile: String,
     last_gc: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Image encodes (seconds each, CPU heavy).
     permits: Arc<Semaphore>,
+    /// Script/style jobs (milliseconds). Separate from `permits` so a
+    /// backlog of image encodes never delays a changed script.
+    text_permits: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,6 +121,7 @@ impl Optimizer {
             }
         }
         let permits = Arc::new(Semaphore::new(cfg.workers));
+        let text_permits = Arc::new(Semaphore::new(cfg.workers));
         Self {
             cfg,
             dir,
@@ -127,6 +132,7 @@ impl Optimizer {
             text_profile,
             last_gc: std::sync::Mutex::new(None),
             permits,
+            text_permits,
         }
     }
 
@@ -520,7 +526,7 @@ impl Optimizer {
                 files.insert(d.rel, a.clone());
                 continue;
             }
-            let permit = Arc::clone(&self.permits);
+            let permit = Arc::clone(&self.text_permits);
             let (profile, minify, objects) =
                 (self.text_profile.clone(), self.cfg.minify, objects.clone());
             jobs.spawn(async move {

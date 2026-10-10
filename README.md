@@ -17,8 +17,23 @@ dropping a request, and shuts down gracefully.
 | **Certificates** | Let's Encrypt (ACME TLS-ALPN-01), your own PEM files, persistent self-signed for local hosts |
 | **Speed** | brotli/zstd/gzip, precompressed assets, immutable caching of fingerprinted builds (Vite, Mix), OPcache/JIT tuning, AVIF/WebP + responsive images, JS/CSS minification |
 | **Site rules** | redirects, canonical host, HTTPS redirect + HSTS, security headers, custom headers, error pages, basic auth, cache rules |
-| **Protection** | per-site uid + Landlock sandbox, per-IP rate limits and connection caps, upload idle timeout, admin endpoints restricted, trusted-proxy aware |
+| **Protection** | per-site uid + Landlock sandbox (fails closed), per-IP rate limits and connection caps (TCP and QUIC), upload idle timeout, admin endpoints restricted, explicit trusted proxies |
 | **Operations** | zero-downtime reload (SIGHUP), cron tasks + supervised workers per site, Prometheus metrics, structured access logs, health checks |
+
+## What NOVA serves (and what it does not)
+
+| Application | Supported | How |
+|---|---|---|
+| Static sites, SPAs, build output (Vite, Mix, Hugo, Astro static) | **yes** | served directly, optimized |
+| PHP (Laravel, Symfony, WordPress, plain PHP) | **yes** | supervised PHP-FPM per site over FastCGI |
+| Node.js, Python (WSGI/ASGI), Go, Ruby, Java or any other HTTP app server | **no** | there is no generic reverse proxy (`proxy_pass`) yet |
+| WebSocket or gRPC backends | **no** | NOVA Live uses server-sent events served by NOVA itself |
+
+For a non-PHP backend today, run it next to NOVA and put a reverse proxy
+(Traefik, Caddy, nginx) in front that routes by host or path; NOVA then
+sits behind that proxy (see `trusted_proxies` in
+[http.md](docs/architecture/http.md)). A built-in `[site.proxy]` upstream is
+on the roadmap ([vision.md](docs/architecture/vision.md)).
 
 ## Quick start
 
@@ -101,8 +116,9 @@ No local Rust needed; the toolchain runs in a container:
 scripts/cargo.sh test                 # unit tests
 scripts/cargo.sh clippy --all-targets
 scripts/cargo.sh fmt --all
-tests/integration/run.sh              # end-to-end suite, 167 checks (throwaway stack on :18088/:18443)
+tests/integration/run.sh              # end-to-end suite, 174 checks (throwaway stack on :18088/:18443)
 tests/browser/run.sh                  # NOVA Live in headless Chromium (needs a running stack)
+REF=1 tests/performance/run.sh        # load tests vs stock nginx + PHP-FPM (needs oha)
 docker compose run --rm nova check --php   # validate config, print generated FPM config
 docker compose run --rm nova optimize      # one optimization pass
 ```
@@ -127,6 +143,7 @@ sites/               demo sites (example, second)
 docker/              toolchain image, MariaDB init
 tests/integration/   end-to-end acceptance suite
 tests/browser/       NOVA Live browser tests (Playwright/Chromium)
+tests/performance/   load tests and regression baseline
 docs/architecture/   specification
 ```
 

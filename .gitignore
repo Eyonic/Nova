@@ -15,3 +15,4 @@ docker/mariadb/init/*local*
 /data
 node_modules/
 compose.override.yaml
+tests/performance/results/

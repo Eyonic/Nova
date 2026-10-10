@@ -107,6 +107,7 @@ impl App {
 /// Server-wide HTTP behaviour (proxies, limits, TLS facts for headers).
 pub struct HttpSettings {
     pub trusted_proxies: Vec<Cidr>,
+    pub forwarded_header: nova_config::ForwardedHeader,
     /// Clients allowed to read metrics and optimizer status.
     pub admin_allow: Vec<Cidr>,
     pub rate_limit: Option<RateLimiter>,
@@ -122,6 +123,7 @@ impl Default for HttpSettings {
     fn default() -> Self {
         Self {
             trusted_proxies: Vec::new(),
+            forwarded_header: nova_config::ForwardedHeader::default(),
             admin_allow: Cidr::private_ranges(),
             rate_limit: None,
             rate_exempt: Vec::new(),
@@ -176,7 +178,12 @@ impl nova_http::Handler for App {
         let method = req.method().clone();
         let version = req.version();
         let uri_path = req.uri().path().to_owned();
-        let client = client::resolve(req.headers(), &conn, &self.http.trusted_proxies);
+        let client = client::resolve(
+            req.headers(),
+            &conn,
+            &self.http.trusted_proxies,
+            self.http.forwarded_header,
+        );
         let (accept_encoding, host, user_agent, referer) = {
             let header = |name: header::HeaderName| {
                 req.headers()
@@ -1079,13 +1086,35 @@ async fn file_meta(p: &Path) -> Option<Metadata> {
     tokio::fs::metadata(p).await.ok().filter(|m| m.is_file())
 }
 
+/// What `stat` + (for files) `canonicalize` found, in one blocking-pool hop.
+enum Probe {
+    /// A regular file inside the site root: its canonical path.
+    File(PathBuf, Metadata),
+    /// A regular file whose real path leaves the site root (symlink escape).
+    Escapes,
+    Dir,
+    Missing,
+}
+
+async fn probe(site: &Site, p: &Path) -> Probe {
+    let (root, p) = (site.root.clone(), p.to_path_buf());
+    tokio::task::spawn_blocking(move || match std::fs::metadata(&p) {
+        Ok(m) if m.is_file() => match std::fs::canonicalize(&p) {
+            Ok(c) if c.starts_with(&root) => Probe::File(c, m),
+            _ => Probe::Escapes,
+        },
+        Ok(m) if m.is_dir() => Probe::Dir,
+        _ => Probe::Missing,
+    })
+    .await
+    .unwrap_or(Probe::Missing)
+}
+
 async fn resolve_target(site: &Site, safe: &SafePath, query: Option<&str>) -> Target {
     let full = site.root.join(safe.to_path());
-    match tokio::fs::metadata(&full).await {
-        Ok(m) if m.is_file() => {
-            let Some(c) = contained(site, &full).await else {
-                return Target::NotFound;
-            };
+    match probe(site, &full).await {
+        Probe::Escapes => return Target::NotFound,
+        Probe::File(c, m) => {
             if is_php(&c) {
                 return Target::Php {
                     script: c,
@@ -1095,7 +1124,7 @@ async fn resolve_target(site: &Site, safe: &SafePath, query: Option<&str>) -> Ta
             }
             return Target::Static(c, m);
         }
-        Ok(m) if m.is_dir() => {
+        Probe::Dir => {
             if !safe.segments.is_empty() && !safe.trailing_slash {
                 let q = query.map(|q| format!("?{q}")).unwrap_or_default();
                 return Target::Redirect(format!("{}/{q}", safe.url()));
@@ -1112,9 +1141,7 @@ async fn resolve_target(site: &Site, safe: &SafePath, query: Option<&str>) -> Ta
             };
             for index in indexes {
                 let f = full.join(index);
-                if let Some(meta) = file_meta(&f).await
-                    && let Some(c) = contained(site, &f).await
-                {
+                if let Probe::File(c, meta) = probe(site, &f).await {
                     if is_php(&c) {
                         return Target::Php {
                             script: c,
@@ -1126,7 +1153,7 @@ async fn resolve_target(site: &Site, safe: &SafePath, query: Option<&str>) -> Ta
                 }
             }
         }
-        _ => {
+        Probe::Missing => {
             // `/index.php/some/path`: the first existing .php segment is the script.
             if site.php.is_some() && safe.segments.len() > 1 {
                 for i in 0..safe.segments.len() - 1 {

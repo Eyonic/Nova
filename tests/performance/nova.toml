@@ -1,0 +1,37 @@
+# Benchmark configuration: production defaults, except the rate limit is
+# raised (not disabled) so its cost is measured without 429s, and loopback
+# is not an admin network (so it is rate limited like a real client).
+version = 1
+mode = "production"
+
+[server]
+listen = "0.0.0.0:9005"
+max_connections = 20000
+admin_allow = ["10.255.255.254/32"]
+
+[server.rate_limit]
+requests_per_sec = 10000000.0
+burst = 10000000
+max_connections_per_ip = 0
+
+[server.tls]
+enabled = true
+listen = "0.0.0.0:9445"
+public_port = 9445
+self_signed = true
+
+[paths]
+state_dir = "/var/lib/nova"
+run_dir = "/run/nova"
+
+[optimize]
+enabled = false
+
+[[site]]
+name = "bench"
+hosts = ["localhost", "127.0.0.1"]
+default = true
+path = "/srv/sites/bench"
+
+[site.php]
+max_children = 16

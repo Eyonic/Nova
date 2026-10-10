@@ -8,9 +8,14 @@ listen = "0.0.0.0:8080"
 shutdown_grace_secs = 20
 max_request_body = "32MiB"
 metrics = true
-# Inside Compose every client reaches NOVA through Docker's network; trust
-# X-Forwarded-* only from private ranges (put your real proxy here).
-trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+# Reverse proxies allowed to set the client address. List the proxies
+# themselves, never whole networks: with Docker's port publishing every
+# client can arrive from the bridge gateway (172.x), and trusting that range
+# would let anyone forge X-Forwarded-For (and reach admin endpoints).
+# Behind nginx/Traefik/a CDN on 10.0.0.5, for example:
+#   trusted_proxies = ["10.0.0.5"]
+#   forwarded_header = "x-forwarded-for"   # or "forwarded" (RFC 7239)
+trusted_proxies = []
 
 # HTTPS + HTTP/2 + HTTP/3. Local hosts get a persistent self-signed
 # certificate; set acme = true and acme_email for Let's Encrypt on public hosts.

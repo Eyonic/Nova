@@ -72,7 +72,12 @@ fn load(path: &Path) -> Result<Config> {
     Config::load_env(path).with_context(|| format!("loading {}", path.display()))
 }
 
-fn init_logging(mode: Mode) {
+/// Log lines are formatted on the calling thread but written by a
+/// dedicated thread, so a slow stdout (a pipe to the container runtime)
+/// never blocks request handling. Nothing is dropped: when the queue is
+/// full, callers wait as they did with direct writes. Keep the returned
+/// guard alive; dropping it flushes the queue.
+fn init_logging(mode: Mode) -> tracing_appender::non_blocking::WorkerGuard {
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_env("NOVA_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
     let json = match std::env::var("NOVA_LOG_FORMAT").as_deref() {
@@ -80,20 +85,28 @@ fn init_logging(mode: Mode) {
         Ok("text") => false,
         _ => !mode.is_dev(),
     };
+    let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(false)
+        .buffered_lines_limit(64 * 1024)
+        .thread_name("nova-log")
+        .finish(std::io::stdout());
     if json {
         fmt()
             .json()
             .flatten_event(true)
             .with_current_span(false)
             .with_env_filter(filter)
+            .with_writer(writer)
             .init();
     } else {
         use std::io::IsTerminal;
         fmt()
             .with_ansi(std::io::stdout().is_terminal())
             .with_env_filter(filter)
+            .with_writer(writer)
             .init();
     }
+    guard
 }
 
 fn main() -> ExitCode {
@@ -102,11 +115,11 @@ fn main() -> ExitCode {
         Command::Health { addr, live } => health(&cli.config, addr, live),
         Command::Check { php } => check(&cli.config, php),
         Command::Serve => load(&cli.config).and_then(|cfg| {
-            init_logging(cfg.mode);
+            let _log = init_logging(cfg.mode);
             run_to_completion(nova_core::serve(cfg, cli.config.clone()))
         }),
         Command::Worker => load(&cli.config).and_then(|cfg| {
-            init_logging(cfg.mode);
+            let _log = init_logging(cfg.mode);
             run_to_completion(nova_core::worker_main(cfg, cli.config.clone()))
         }),
         Command::Sandbox {
@@ -118,7 +131,7 @@ fn main() -> ExitCode {
             command,
         } => sandbox_exec(read, write, connect, bind, require, command),
         Command::Optimize => load(&cli.config).and_then(|cfg| {
-            init_logging(Mode::Development);
+            let _log = init_logging(Mode::Development);
             runtime()?.block_on(optimize(cfg))
         }),
     };

@@ -189,11 +189,19 @@ Objects live in `<state>/optimize/objects/<2 hex>/<32 hex>.<ext>`.
 |---|---|---|
 | Unit | `cargo test` (via `scripts/cargo.sh test`) | config validation, FastCGI encoding, CGI params, path security, ranges, dispatch resolution order and symlink escapes, planning, negotiation, encoder output validation, incremental scans |
 | Browser | `tests/browser/run.sh` | 14 NOVA Live tests in headless Chromium |
-| Integration | `tests/integration/run.sh` | 167 checks against a real Compose stack: static, compression, caching, site rules, proxies, HTTPS/HTTP2/HTTP3, Script Optimizer, PHP, uploads, limits, images, DB, isolation probe, tasks/workers, live reload, graceful shutdown, restart persistence, metrics/logs |
-| Next | `tests/compatibility`, `tests/performance` | WordPress/Laravel/Symfony suites, load tests (phase 11) |
+| Integration | `tests/integration/run.sh` | 174 checks against a real Compose stack: static, request smuggling and malformed requests, compression, caching, site rules, proxies, HTTPS/HTTP2/HTTP3, Script Optimizer, PHP, uploads, limits, images, DB, isolation probe, tasks/workers, live reload, graceful shutdown, restart persistence, metrics/logs |
+| Performance | `tests/performance/run.sh` | static 1 KiB / 100 KiB / image, HTTP/2, PHP; `REF=1` adds stock nginx + PHP-FPM on the same files; fails when a scenario drops more than 15% below `baseline.json` |
+| Next | `tests/compatibility` | WordPress/Laravel/Symfony suites |
 
 ## 8. Known limitations
 
+* A request with both `Content-Length` and `Transfer-Encoding` is framed by
+  `Transfer-Encoding` (hyper drops the length), but the connection is not
+  closed afterwards as RFC 9112 §6.3 requires; nginx rejects such requests.
+* **Backends: static files and PHP-FPM (FastCGI) only.** There is no
+  reverse proxy to arbitrary HTTP application servers (Node.js, Python,
+  Go, ...), no WebSocket or gRPC proxying and no load balancing. Such apps
+  need a separate proxy in front (see README "What NOVA serves").
 * Landlock restricts TCP by **port**, not host: a site allowed to reach
   port 3306 could reach any host on 3306. Database credentials are per site,
   so this exposes no data, but host-level egress rules need network
@@ -202,6 +210,12 @@ Objects live in `<state>/optimize/objects/<2 hex>/<32 hex>.<ext>`.
   worker is trusted (Rust, sandboxed, no secrets, no capabilities).
 * Animated images and GIF are served unmodified; SVG is compressed but not minified.
 * `103 Early Hints` are not sent (hyper's server API has no informational responses).
+* With `isolation.require_landlock = true` (default) the worker, PHP,
+  tasks and workers refuse to start unless the kernel enforces Landlock
+  filesystem (ABI 1) and TCP (ABI 4, Linux 6.7+) rules; newer refinements
+  (truncate, ioctl, signal/abstract-socket scoping) are applied when
+  available. In shared mode (non-root) the HTTP worker runs inside the
+  supervisor and is not sandboxed itself.
 * Live reload needs strict isolation; in shared mode SIGHUP only logs a hint.
 * A QUIC connection open during a reload may be routed to the new worker
   and has to reconnect (TCP connections are unaffected).

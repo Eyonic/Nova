@@ -1,0 +1,32 @@
+{
+  "nova-h2-static-1k": {
+    "rps": 110242,
+    "p50_ms": 2.12,
+    "p99_ms": 6.31,
+    "ok_ratio": 1.0
+  },
+  "nova-image-470k": {
+    "rps": 23584,
+    "p50_ms": 2.3,
+    "p99_ms": 8.01,
+    "ok_ratio": 1.0
+  },
+  "nova-php-hello": {
+    "rps": 39196,
+    "p50_ms": 1.52,
+    "p99_ms": 3.37,
+    "ok_ratio": 1.0
+  },
+  "nova-static-100k": {
+    "rps": 102528,
+    "p50_ms": 0.51,
+    "p99_ms": 2.75,
+    "ok_ratio": 1.0
+  },
+  "nova-static-1k": {
+    "rps": 139214,
+    "p50_ms": 1.55,
+    "p99_ms": 5.96,
+    "ok_ratio": 1.0
+  }
+}

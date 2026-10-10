@@ -279,8 +279,9 @@ pub async fn worker_main(cfg: Config, config_path: PathBuf) -> Result<()> {
     if nova_security::is_root() {
         anyhow::bail!("`nova worker` must not run as root");
     }
+    // Same rule as for PHP: with require_landlock the worker fails closed.
     let level = isolation::worker_sandbox(&cfg, &config_path)
-        .apply(false)
+        .apply(cfg.isolation.require_landlock)
         .map_err(|e| anyhow::anyhow!("sandboxing the worker: {e}"))?;
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
@@ -358,6 +359,7 @@ async fn run_worker(
     let tls_cfg = &srv.tls;
     app.http = dispatch::HttpSettings {
         trusted_proxies: srv.trusted_proxies.clone(),
+        forwarded_header: srv.forwarded_header,
         admin_allow: srv.admin_allow.clone(),
         rate_limit: rl
             .enabled
@@ -419,6 +421,7 @@ async fn run_worker(
             app.live.close();
         }
     };
+    let proxies = srv.trusted_proxies.clone();
     // Trusted proxies multiplex many clients over few connections.
     let mut conn_exempt = rate_exempt;
     conn_exempt.extend(srv.trusted_proxies.iter().copied());
@@ -430,6 +433,7 @@ async fn run_worker(
             0
         },
         per_ip_exempt: Arc::new(move |ip| nova_config::Cidr::any_contains(&conn_exempt, ip)),
+        proxy_from: Arc::new(move |ip| nova_config::Cidr::any_contains(&proxies, ip)),
         header_read_timeout: Duration::from_secs(srv.header_read_timeout_secs),
         shutdown_grace: Duration::from_secs(srv.shutdown_grace_secs),
     };

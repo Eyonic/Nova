@@ -1,6 +1,6 @@
 //! HTTP/3 over QUIC (quinn + h3), feeding the same [`Handler`] as TCP.
 
-use crate::server::{ConnInfo, Handler};
+use crate::server::{ConnInfo, Handler, PerIp, ServerOptions};
 use bytes::{Buf, Bytes};
 use http::{Request, Response};
 use http_body_util::BodyExt;
@@ -11,16 +11,26 @@ use std::time::Duration;
 use tokio::sync::{Semaphore, watch};
 use tokio_util::task::TaskTracker;
 
+/// Largest request header section accepted (hyper's HTTP/2 default is 16 KiB).
+const MAX_FIELD_SECTION: u64 = 64 * 1024;
+
+/// The connection limits shared with the TCP listeners.
+pub(crate) struct Limits {
+    pub total: Arc<Semaphore>,
+    pub per_ip: Arc<PerIp>,
+    pub opts: ServerOptions,
+}
+
 /// Accept QUIC connections until `stop` flips, then send GOAWAY and wait
-/// (up to `grace`) for open requests.
-pub async fn serve<H: Handler>(
+/// (up to the shutdown grace) for open requests.
+pub(crate) async fn serve<H: Handler>(
     endpoint: quinn::Endpoint,
     handler: Arc<H>,
-    limit: Arc<Semaphore>,
+    limits: Limits,
     mut stop: watch::Receiver<bool>,
-    grace: Duration,
 ) {
     let tracker = TaskTracker::new();
+    let opts = &limits.opts;
     loop {
         let incoming = tokio::select! {
             _ = stop.changed() => break,
@@ -29,19 +39,46 @@ pub async fn serve<H: Handler>(
                 None => break,
             },
         };
-        let Ok(permit) = Arc::clone(&limit).try_acquire_owned() else {
+        let ip = incoming.remote_address().ip();
+        let max = opts.max_connections_per_ip;
+        let exempt = max == 0 || (opts.per_ip_exempt)(ip);
+        // A UDP source address is trivially spoofed. Once an address holds
+        // half its quota, make it prove it is real (a stateless Retry round
+        // trip) before it may take more, so forged packets cannot lock a
+        // victim address out.
+        if !exempt && !incoming.remote_address_validated() && limits.per_ip.count(ip) >= max / 2 {
+            if let Err(e) = incoming.retry() {
+                e.into_incoming().refuse();
+            }
+            continue;
+        }
+        let guard = if exempt {
+            None
+        } else {
+            match limits.per_ip.acquire(ip, max) {
+                Some(g) => Some(g),
+                None => {
+                    tracing::debug!(peer = %incoming.remote_address(), "per-IP connection limit reached (QUIC)");
+                    incoming.refuse();
+                    continue;
+                }
+            }
+        };
+        let Ok(permit) = Arc::clone(&limits.total).try_acquire_owned() else {
             incoming.refuse();
             continue;
         };
         let handler = Arc::clone(&handler);
         let stop = stop.clone();
+        let handshake_timeout = opts.header_read_timeout;
         tracker.spawn(async move {
-            connection(incoming, handler, stop).await;
+            connection(incoming, handler, stop, handshake_timeout).await;
+            drop(guard);
             drop(permit);
         });
     }
     tracker.close();
-    let _ = tokio::time::timeout(grace, tracker.wait()).await;
+    let _ = tokio::time::timeout(opts.shutdown_grace, tracker.wait()).await;
     endpoint.close(0u32.into(), b"shutting down");
     let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
 }
@@ -50,23 +87,31 @@ async fn connection<H: Handler>(
     incoming: quinn::Incoming,
     handler: Arc<H>,
     mut stop: watch::Receiver<bool>,
+    handshake_timeout: Duration,
 ) {
-    let conn = match incoming.await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::debug!(error = %e, "QUIC handshake failed");
+    // Same budget as a TLS handshake on TCP (`header_read_timeout`).
+    let setup = async {
+        let conn = incoming.await.map_err(|e| e.to_string())?;
+        let peer = conn.remote_address();
+        let mut builder = ::h3::server::builder();
+        builder.max_field_section_size(MAX_FIELD_SECTION);
+        let h3c = builder
+            .build::<_, Bytes>(h3_quinn::Connection::new(conn))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>((peer, h3c))
+    };
+    let (peer, mut h3c) = match tokio::time::timeout(handshake_timeout, setup).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "QUIC/HTTP/3 setup failed");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!("QUIC handshake timed out");
             return;
         }
     };
-    let peer = conn.remote_address();
-    let mut h3c =
-        match ::h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(conn)).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(%peer, error = %e, "HTTP/3 setup failed");
-                return;
-            }
-        };
     let requests = TaskTracker::new();
     let mut draining = *stop.borrow();
     if draining {

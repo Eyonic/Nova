@@ -67,22 +67,29 @@ pub struct ServerOptions {
     pub max_connections_per_ip: usize,
     /// Peers never subject to `max_connections_per_ip` (proxies, monitoring).
     pub per_ip_exempt: IpPredicate,
+    /// Peers allowed to send a PROXY protocol header. On a `proxy_protocol`
+    /// listener every other peer is disconnected before anything is read.
+    pub proxy_from: IpPredicate,
     /// Time allowed for the PROXY header, the TLS handshake and request headers.
     pub header_read_timeout: Duration,
     pub shutdown_grace: Duration,
 }
 
-/// Open connections per peer address.
+/// Open connections per peer address, shared by TCP and QUIC.
 #[derive(Default)]
-struct PerIp(Mutex<HashMap<IpAddr, usize>>);
+pub(crate) struct PerIp(Mutex<HashMap<IpAddr, usize>>);
 
-struct PerIpGuard {
+pub(crate) struct PerIpGuard {
     map: Arc<PerIp>,
     ip: IpAddr,
 }
 
 impl PerIp {
-    fn acquire(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<PerIpGuard> {
+    pub(crate) fn count(&self, ip: IpAddr) -> usize {
+        self.0.lock().unwrap().get(&ip).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn acquire(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<PerIpGuard> {
         let mut m = self.0.lock().unwrap();
         let n = m.entry(ip).or_insert(0);
         if max > 0 && *n >= max {
@@ -149,9 +156,12 @@ pub async fn serve<H: Handler>(
         tokio::spawn(h3::serve(
             ep,
             Arc::clone(&handler),
-            Arc::clone(&shared.limit),
+            h3::Limits {
+                total: Arc::clone(&shared.limit),
+                per_ip: Arc::clone(&shared.per_ip),
+                opts: opts.clone(),
+            },
             stop_rx.clone(),
-            opts.shutdown_grace,
         ))
     });
 
@@ -247,6 +257,10 @@ async fn handle_connection<H: Handler>(
     let timeout = shared.opts.header_read_timeout;
     let mut peer = socket_peer;
     if proxy_protocol {
+        if !(shared.opts.proxy_from)(socket_peer.ip()) {
+            tracing::debug!(%socket_peer, "PROXY protocol listener: peer is not a trusted proxy");
+            return;
+        }
         match tokio::time::timeout(timeout, proxy::read_header(&mut stream)).await {
             Ok(Ok(Some(addr))) => peer = addr,
             Ok(Ok(None)) => {}

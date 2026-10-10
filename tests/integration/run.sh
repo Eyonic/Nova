@@ -114,13 +114,39 @@ eq "wrong password rejected" "$(code -u nova:wrong "$BASE/private/")" 401
 eq "right password accepted" "$(code -u nova:demo "$BASE/private/")" 200
 eq "auth limited to its paths" "$(code "$BASE/index.html")" 200
 
+section "Protocol abuse (smuggling, malformed requests)"
+# Raw HTTP/1.1 over bash's /dev/tcp: curl normalizes these away.
+raw() { # request bytes -> status code of the first response (or "closed")
+  local out
+  out=$(exec 3<>"/dev/tcp/127.0.0.1/$PORT" && printf '%b' "$1" >&3 && timeout 5 head -c 64 <&3; exec 3<&-) 2>/dev/null
+  [[ "$out" =~ ^HTTP/1\.[01]\ ([0-9]{3}) ]] && echo "${BASH_REMATCH[1]}" || echo closed
+}
+not_ok() { [ "$2" != 200 ] && ok "$1" || bad "$1" "expected rejection, got 200"; }
+# hyper drops Content-Length when Transfer-Encoding is present (RFC 9112
+# §6.3): the body must be framed by the chunked encoding, never by the length.
+has "Content-Length + Transfer-Encoding: framed by Transfer-Encoding (CL.TE)" \
+  "$(exec 3<>"/dev/tcp/127.0.0.1/$PORT" && printf 'POST /info.php HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n' >&3 && timeout 5 cat <&3)" '"raw_body_bytes": 5'
+eq "conflicting Content-Length rejected" \
+  "$(raw 'POST /info.php HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabcd')" 400
+eq "obsolete header line folding rejected" \
+  "$(raw 'GET / HTTP/1.1\r\nHost: localhost\r\nX-A: 1\r\n folded\r\n\r\n')" 400
+eq "invalid chunk size rejected" \
+  "$(raw 'POST /info.php HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nab\r\n0\r\n\r\n')" 400
+not_ok "Transfer-Encoding other than chunked rejected" \
+  "$(raw 'POST /info.php HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\n')"
+hasnt "image path with .php suffix is not executed (CVE-2019-11043 class)" \
+  "$(curl -s "$BASE/images/logo.png/x.php")" 'fpm-fcgi'
+eq "NUL byte in path rejected" "$(code --path-as-is "$BASE/index.html%00.php")" 400
+
 section "Proxies and admin endpoints"
-has "trusted proxy: client IP from X-Forwarded-For" \
-  "$(curl -s -H 'X-Forwarded-For: 6.6.6.6, 198.51.100.23' "$BASE/info.php")" '"remote_addr": "198.51.100.23"'
-has "trusted proxy: HTTPS from X-Forwarded-Proto" "$(curl -s -H 'X-Forwarded-Proto: https' "$BASE/info.php")" '"https": "on"'
+# No trusted proxies are configured: forwarding headers from clients are ignored.
+hasnt "untrusted client cannot forge X-Forwarded-For" \
+  "$(curl -s -H 'X-Forwarded-For: 6.6.6.6, 198.51.100.23' "$BASE/info.php")" '198.51.100.23'
+hasnt "untrusted client cannot forge Forwarded" \
+  "$(curl -s -H 'Forwarded: for=198.51.100.23' "$BASE/info.php")" '198.51.100.23'
+hasnt "untrusted client cannot forge X-Forwarded-Proto" "$(curl -s -H 'X-Forwarded-Proto: https' "$BASE/info.php")" '"https": "on"'
 eq "metrics allowed from the private network" "$(code "$BASE/_nova/metrics")" 200
-eq "metrics hidden from public clients" "$(code -H 'X-Forwarded-For: 203.0.113.9' "$BASE/_nova/metrics")" 404
-eq "health stays public" "$(code -H 'X-Forwarded-For: 203.0.113.9' "$BASE/_nova/health/live")" 200
+eq "health stays public" "$(code "$BASE/_nova/health/live")" 200
 
 section "HTTPS, HTTP/2, HTTP/3"
 eq "HTTPS with HTTP/2" "$(curl -sk -o /dev/null -w '%{http_code} %{http_version}' "$TBASE/")" "200 2"

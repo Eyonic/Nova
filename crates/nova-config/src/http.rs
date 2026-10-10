@@ -59,6 +59,28 @@ impl Cidr {
     }
 }
 
+impl Cidr {
+    /// Prefix length (`8` for `10.0.0.0/8`).
+    pub fn prefix(&self) -> u8 {
+        self.prefix
+    }
+}
+
+/// Which header a trusted proxy uses to pass the client address on.
+/// Only this one is read: proxies typically append to their own header
+/// and pass any other one through unchanged, so reading both would let a
+/// client forge its address.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ForwardedHeader {
+    /// `X-Forwarded-For` + `X-Forwarded-Proto` (nginx, HAProxy, Traefik, most CDNs).
+    #[default]
+    #[serde(rename = "x-forwarded-for")]
+    XForwardedFor,
+    /// RFC 7239 `Forwarded: for=...;proto=...`.
+    #[serde(rename = "forwarded")]
+    Forwarded,
+}
+
 impl FromStr for Cidr {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {

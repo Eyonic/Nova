@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const SHARDS: usize = 32;
@@ -20,7 +21,12 @@ pub struct RateLimiter {
     rate: f64,
     burst: f64,
     shards: Vec<Mutex<HashMap<IpAddr, Bucket>>>,
-    last_sweep: Mutex<Instant>,
+    /// Reference point for `last_sweep_ms`.
+    epoch: Instant,
+    /// Milliseconds after `epoch` of the last sweep. An atomic, not a
+    /// mutex: every request reads it, and a global lock here serialized
+    /// all requests across shards.
+    last_sweep_ms: AtomicU64,
 }
 
 impl RateLimiter {
@@ -29,7 +35,8 @@ impl RateLimiter {
             rate: requests_per_sec,
             burst: burst as f64,
             shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
-            last_sweep: Mutex::new(Instant::now()),
+            epoch: Instant::now(),
+            last_sweep_ms: AtomicU64::new(0),
         }
     }
 
@@ -74,12 +81,16 @@ impl RateLimiter {
     }
 
     fn maybe_sweep(&self, now: Instant) {
+        let now_ms = now.saturating_duration_since(self.epoch).as_millis() as u64;
+        let last = self.last_sweep_ms.load(Ordering::Relaxed);
+        // Exactly one caller wins the exchange and sweeps.
+        if now_ms.saturating_sub(last) < 60_000
+            || self
+                .last_sweep_ms
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
         {
-            let mut last = self.last_sweep.lock().unwrap();
-            if now.saturating_duration_since(*last) < Duration::from_secs(60) {
-                return;
-            }
-            *last = now;
+            return;
         }
         let refill = Duration::from_secs_f64(self.burst / self.rate);
         for shard in &self.shards {

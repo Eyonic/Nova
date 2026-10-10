@@ -44,16 +44,34 @@ publicly trusted certificate (ACME or configured files); a self-signed
 
 ```toml
 [server]
-trusted_proxies = ["10.0.0.0/8"]   # X-Forwarded-For/-Proto and Forwarded (RFC 7239)
-proxy_protocol = false             # PROXY v1/v2 header on every connection
+trusted_proxies = ["10.0.0.5"]          # the proxies themselves; default: none
+forwarded_header = "x-forwarded-for"    # or "forwarded" (RFC 7239); only this one is read
+proxy_protocol = false                  # PROXY v1/v2 header; only trusted_proxies may connect
 admin_allow = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7"]
 ```
 
-The client IP is the first untrusted address walking `X-Forwarded-For`
-from the nearest hop; forged entries further left are ignored. PHP receives
-it as `REMOTE_ADDR`, plus `HTTPS=on` when the client used HTTPS at the edge.
+The client IP is the first untrusted address walking the configured header
+from the nearest hop; forged entries further left are ignored, and an
+entry that is not an address (`unknown`, an obfuscated `Forwarded` name)
+stops the walk at the last proxy that vouched for it. The scheme comes from
+the same hop (`X-Forwarded-Proto` is paired per hop when it lists one value
+per address, otherwise the nearest proxy's value counts). PHP receives the
+client as `REMOTE_ADDR`, plus `HTTPS=on` when it used HTTPS at the edge.
 `/_nova/metrics` and `/_nova/optimize/status` answer only clients in
 `admin_allow` (404 otherwise); health endpoints stay public.
+
+Trust is deliberately narrow:
+
+* Only the header named by `forwarded_header` is read. A proxy that
+  maintains `X-Forwarded-For` passes a client-sent `Forwarded` through
+  untouched (and vice versa), so reading both would let clients choose.
+* List proxy addresses, not networks. With Docker port publishing, clients
+  may appear to come from the bridge gateway (`172.17.0.1`); trusting
+  `172.16.0.0/12` would make every client a "proxy" that can claim any
+  address, including one in `admin_allow`. `0.0.0.0/0` is rejected.
+* With `proxy_protocol = true`, connections from peers outside
+  `trusted_proxies` are closed before anything is read, and the setting
+  requires `trusted_proxies`.
 
 ## Compression
 
@@ -168,6 +186,18 @@ exempt = []                      # admin_allow is always exempt
 ```
 
 Over the limit: `429` with `Retry-After`.
+
+The connection caps apply to HTTP/3 too: QUIC connections count against the
+same `max_connections` and the same per-IP budget as TCP (one budget per
+address across both). Because UDP source addresses can be forged, an address
+that already holds half of its budget must answer a QUIC Retry (address
+validation) before it gets more, so spoofed packets cannot lock a real
+client out. The QUIC handshake shares `header_read_timeout_secs`, and HTTP/3
+request headers are limited to 64 KiB.
+
+Small static files (up to 1 MiB) are served from a 64 MiB in-memory cache
+keyed by path, size and modification time, so edits show up on the next
+request without any invalidation step.
 
 ## Background processes
 

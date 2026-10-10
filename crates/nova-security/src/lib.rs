@@ -7,8 +7,8 @@
 //!   privileged supervisor.
 
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, NetPort, Ruleset, RulesetAttr, RulesetCreatedAttr,
-    RulesetStatus, Scope, path_beneath_rules,
+    ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, Ruleset, RulesetAttr,
+    RulesetCreatedAttr, RulesetStatus, Scope, path_beneath_rules,
 };
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -23,6 +23,11 @@ pub enum SandboxError {
     Landlock(#[from] landlock::RulesetError),
     #[error("landlock is not available on this kernel, refusing to run unsandboxed")]
     Unavailable,
+    #[error(
+        "the kernel cannot enforce the required Landlock rules (filesystem: ABI 1, TCP: ABI 4) \
+         ({0}); refusing to run with a weaker sandbox (set isolation.require_landlock = false to allow it)"
+    )]
+    Insufficient(landlock::RulesetError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,11 +62,25 @@ pub struct Sandbox {
 
 impl Sandbox {
     /// Restrict the calling process (and everything it later executes).
-    /// Missing paths are skipped. Fails only if Landlock is entirely
-    /// unavailable and `require` is set.
+    /// Missing paths are skipped.
+    ///
+    /// With `require`, the policy fails closed: the kernel must enforce the
+    /// filesystem rules (Landlock ABI 1) and the TCP bind/connect rules
+    /// (ABI 4), or nothing is applied and an error is returned. Only newer
+    /// refinements (truncate, ioctl, scoping, ...) remain best effort.
+    /// Without `require`, everything is best effort.
     pub fn apply(&self, require: bool) -> Result<Enforcement, SandboxError> {
         let abi = TARGET_ABI;
-        let mut ruleset = Ruleset::default()
+        let mut ruleset = Ruleset::default();
+        if require {
+            ruleset = ruleset
+                .set_compatibility(CompatLevel::HardRequirement)
+                .handle_access(AccessFs::from_all(ABI::V1))
+                .and_then(|r| r.handle_access(AccessNet::from_all(ABI::V4)))
+                .map_err(SandboxError::Insufficient)?
+                .set_compatibility(CompatLevel::BestEffort);
+        }
+        let mut ruleset = ruleset
             .handle_access(AccessFs::from_all(abi))?
             .handle_access(AccessNet::from_all(abi))?
             .scope(Scope::from_all(abi))?
@@ -253,8 +272,10 @@ mod tests {
                 connect_tcp: vec![1],
                 bind_tcp: vec![],
             };
-            let code = match sb.apply(false) {
-                Ok(Enforcement::None) | Err(_) => 77, // no landlock: skip
+            // `require` exercises the fail-closed path: on kernels without
+            // filesystem + TCP Landlock support it errors and the test skips.
+            let code = match sb.apply(true) {
+                Ok(Enforcement::None) | Err(_) => 77, // no (sufficient) landlock: skip
                 Ok(_) => {
                     let can_write_allowed = std::fs::write(allowed.join("ok"), "y").is_ok();
                     let can_read_denied = std::fs::read(denied.join("secret")).is_ok();

@@ -10,8 +10,8 @@ pub mod cron;
 pub mod http;
 
 pub use http::{
-    CacheRule, CertFiles, Cidr, RateLimitConfig, Redirect, SiteAuth, SiteCache, TlsConfig,
-    glob_match,
+    CacheRule, CertFiles, Cidr, ForwardedHeader, RateLimitConfig, Redirect, SiteAuth, SiteCache,
+    TlsConfig, glob_match,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -155,9 +155,14 @@ pub struct ServerConfig {
     pub compression: CompressionConfig,
     /// Clients allowed to read `/_nova/metrics` and `/_nova/optimize/status`.
     pub admin_allow: Vec<Cidr>,
-    /// Reverse proxies whose `X-Forwarded-*` / `Forwarded` headers are trusted.
+    /// Reverse proxies whose forwarding headers (see `forwarded_header`)
+    /// and PROXY protocol headers are trusted. List the proxies themselves,
+    /// never whole client networks.
     pub trusted_proxies: Vec<Cidr>,
-    /// Expect a PROXY protocol (v1/v2) header on every connection.
+    /// The header trusted proxies set: `x-forwarded-for` or `forwarded`.
+    pub forwarded_header: ForwardedHeader,
+    /// Expect a PROXY protocol (v1/v2) header on every connection; only
+    /// peers in `trusted_proxies` may connect.
     pub proxy_protocol: bool,
     /// Abort uploads that send nothing for this long.
     pub request_body_timeout_secs: u64,
@@ -200,6 +205,7 @@ impl Default for ServerConfig {
             compression: CompressionConfig::default(),
             admin_allow: http::default_admin_allow(),
             trusted_proxies: Vec::new(),
+            forwarded_header: ForwardedHeader::default(),
             proxy_protocol: false,
             request_body_timeout_secs: http::DEFAULT_BODY_TIMEOUT_SECS,
             access_log: true,
@@ -330,7 +336,8 @@ pub struct IsolationConfig {
     pub base_uid: u32,
     /// Identity of the network-facing worker (HTTP + optimizer).
     pub worker_uid: u32,
-    /// Refuse to start PHP when the kernel cannot enforce Landlock at all.
+    /// Refuse to start the worker, PHP, tasks or workers unless the kernel
+    /// enforces Landlock's filesystem (ABI 1) and TCP (ABI 4) rules.
     pub require_landlock: bool,
 }
 
@@ -849,6 +856,17 @@ impl Config {
                     "server.tls needs acme, self_signed or at least one [[server.tls.cert]]".into(),
                 );
             }
+        }
+        if let Some(c) = self.server.trusted_proxies.iter().find(|c| c.prefix() == 0) {
+            errs.push(format!(
+                "server.trusted_proxies must not contain {c}: every client could forge its address"
+            ));
+        }
+        if self.server.proxy_protocol && self.server.trusted_proxies.is_empty() {
+            errs.push(
+                "server.proxy_protocol needs server.trusted_proxies (the load balancers allowed to send PROXY headers)"
+                    .into(),
+            );
         }
         let rl = &self.server.rate_limit;
         if rl.enabled && (rl.requests_per_sec <= 0.0 || rl.burst == 0) {
