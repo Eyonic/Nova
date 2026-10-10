@@ -14,3 +14,9 @@ publish = false
 [patch.crates-io]
 hyper = { path = "vendor/hyper" }
 hyper-util = { path = "vendor/hyper-util" }
+
+# Measured: local +5% HTTP/2 and small files, +12% 134 KB files; Unraid
+# +8% HTTP/2, +9% JS; binary 45 -> 33 MB (docs/experiments, #16).
+[profile.release]
+lto = "fat"
+codegen-units = 1
