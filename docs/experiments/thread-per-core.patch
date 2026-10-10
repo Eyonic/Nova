@@ -1,0 +1,196 @@
+diff --git a/crates/nova-config/src/lib.rs b/crates/nova-config/src/lib.rs
+index c8fe333..da6bde1 100644
+--- a/crates/nova-config/src/lib.rs
++++ b/crates/nova-config/src/lib.rs
+@@ -168,6 +168,9 @@ pub struct ServerConfig {
+     pub request_body_timeout_secs: u64,
+     /// One structured access-log line per request.
+     pub access_log: bool,
++    /// Serve TCP on one single-threaded runtime per CPU (SO_REUSEPORT
++    /// sharding) instead of one shared work-stealing runtime.
++    pub thread_per_core: bool,
+     pub rate_limit: RateLimitConfig,
+     pub tls: TlsConfig,
+ }
+@@ -209,6 +212,7 @@ impl Default for ServerConfig {
+             proxy_protocol: false,
+             request_body_timeout_secs: http::DEFAULT_BODY_TIMEOUT_SECS,
+             access_log: true,
++            thread_per_core: true,
+             rate_limit: RateLimitConfig::default(),
+             tls: TlsConfig::default(),
+         }
+diff --git a/crates/nova-core/src/lib.rs b/crates/nova-core/src/lib.rs
+index e9285b8..3ed179c 100644
+--- a/crates/nova-core/src/lib.rs
++++ b/crates/nova-core/src/lib.rs
+@@ -379,8 +379,25 @@ async fn run_worker(
+     };
+     let app = Arc::new(app);
+ 
++    // Per-core mode: one SO_REUSEPORT socket per thread and address
++    // (available_parallelism honours the container's CPU quota).
++    let threads = if srv.thread_per_core {
++        std::thread::available_parallelism().map_or(1, |n| n.get())
++    } else {
++        0
++    };
++    let extra = |addr| -> Result<Vec<std::net::TcpListener>> {
++        (1..threads)
++            .map(|_| {
++                bind_tcp(addr)
++                    .and_then(|l| l.into_std())
++                    .with_context(|| format!("cannot listen on {addr}"))
++            })
++            .collect()
++    };
+     let mut listeners = vec![nova_http::Listener {
+         tcp: bind_tcp(srv.listen).with_context(|| format!("cannot listen on {}", srv.listen))?,
++        extra: extra(srv.listen)?,
+         tls: None,
+         proxy_protocol: srv.proxy_protocol,
+     }];
+@@ -393,6 +410,7 @@ async fn run_worker(
+         listeners.push(nova_http::Listener {
+             tcp: bind_tcp(tls_cfg.listen)
+                 .with_context(|| format!("cannot listen on {}", tls_cfg.listen))?,
++            extra: extra(tls_cfg.listen)?,
+             tls: Some(t.settings),
+             proxy_protocol: srv.proxy_protocol,
+         });
+@@ -442,6 +460,7 @@ async fn run_worker(
+         proxy_from: Arc::new(move |ip| nova_config::Cidr::any_contains(&proxies, ip)),
+         header_read_timeout: Duration::from_secs(srv.header_read_timeout_secs),
+         shutdown_grace: Duration::from_secs(srv.shutdown_grace_secs),
++        per_core_threads: threads,
+     };
+     nova_http::serve(listeners, quic, opts, Arc::clone(&app), shutdown).await?;
+     if let Some(t) = acme_task {
+diff --git a/crates/nova-http/src/server.rs b/crates/nova-http/src/server.rs
+index 4dcb813..be1e1ba 100644
+--- a/crates/nova-http/src/server.rs
++++ b/crates/nova-http/src/server.rs
+@@ -53,6 +53,9 @@ pub struct TlsSettings {
+ 
+ pub struct Listener {
+     pub tcp: TcpListener,
++    /// More SO_REUSEPORT sockets on the same address, one per extra
++    /// per-core thread (see [`ServerOptions::per_core_threads`]).
++    pub extra: Vec<std::net::TcpListener>,
+     pub tls: Option<TlsSettings>,
+     /// Read a PROXY protocol v1/v2 header before anything else.
+     pub proxy_protocol: bool,
+@@ -73,6 +76,12 @@ pub struct ServerOptions {
+     /// Time allowed for the PROXY header, the TLS handshake and request headers.
+     pub header_read_timeout: Duration,
+     pub shutdown_grace: Duration,
++    /// Serve TCP connections on this many dedicated threads, each with its
++    /// own single-threaded runtime and its own SO_REUSEPORT socket per
++    /// listener (the kernel spreads connections). A connection then never
++    /// changes threads: no work-stealing wake-ups or cross-thread locking.
++    /// 0 = serve on the calling (multi-threaded) runtime.
++    pub per_core_threads: usize,
+ }
+ 
+ /// Open connections per peer address, shared by TCP and QUIC.
+@@ -165,10 +174,18 @@ pub async fn serve<H: Handler>(
+         ))
+     });
+ 
+-    // Accept loops borrow `graceful` (each connection gets a watcher) and
+-    // end once `stop` flips.
+-    let loops = futures_util::future::join_all(
++    // Per-core mode hands every listener to the dedicated threads; otherwise
++    // the accept loops run here. They borrow `graceful` (each connection
++    // gets a watcher) and end once `stop` flips.
++    let mut threads = Vec::new();
++    let local = if opts.per_core_threads > 0 {
++        threads = spawn_per_core(listeners, &shared, &stop_rx)?;
++        Vec::new()
++    } else {
+         listeners
++    };
++    let loops = futures_util::future::join_all(
++        local
+             .into_iter()
+             .map(|l| accept_loop(l, &shared, &graceful, stop_rx.clone())),
+     );
+@@ -185,6 +202,10 @@ pub async fn serve<H: Handler>(
+     );
+     let drain = async {
+         graceful.shutdown().await;
++        // Per-core threads drain their own connections (same grace period).
++        for t in threads {
++            let _ = tokio::task::spawn_blocking(move || t.join()).await;
++        }
+         if let Some(t) = h3_task {
+             let _ = t.await;
+         }
+@@ -196,6 +217,67 @@ pub async fn serve<H: Handler>(
+     Ok(())
+ }
+ 
++/// Start `per_core_threads` threads. Thread `i` serves socket `i` of every
++/// listener (socket 0 is `tcp`, the rest come from `extra`).
++fn spawn_per_core<H: Handler>(
++    listeners: Vec<Listener>,
++    shared: &Arc<Shared<H>>,
++    stop: &watch::Receiver<bool>,
++) -> std::io::Result<Vec<std::thread::JoinHandle<()>>> {
++    let n = shared.opts.per_core_threads;
++    let mut per_thread: Vec<Vec<(std::net::TcpListener, Option<TlsSettings>, bool)>> =
++        (0..n).map(|_| Vec::new()).collect();
++    for l in listeners {
++        let first = l.tcp.into_std()?;
++        for (i, sock) in std::iter::once(first).chain(l.extra).enumerate().take(n) {
++            per_thread[i].push((sock, l.tls.clone(), l.proxy_protocol));
++        }
++    }
++    let mut handles = Vec::new();
++    for (i, socks) in per_thread.into_iter().enumerate() {
++        let (shared, stop) = (Arc::clone(shared), stop.clone());
++        let rt = tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .thread_name(format!("nova-http-{i}"))
++            .build()?;
++        handles.push(
++            std::thread::Builder::new()
++                .name(format!("nova-http-{i}"))
++                .spawn(move || {
++                    rt.block_on(async move {
++                        let graceful = GracefulShutdown::new();
++                        let listeners: Vec<Listener> = socks
++                            .into_iter()
++                            .filter_map(|(sock, tls, proxy_protocol)| {
++                                let tcp = TcpListener::from_std(sock)
++                                    .inspect_err(
++                                        |e| tracing::error!(error = %e, "per-core listener"),
++                                    )
++                                    .ok()?;
++                                Some(Listener {
++                                    tcp,
++                                    extra: Vec::new(),
++                                    tls,
++                                    proxy_protocol,
++                                })
++                            })
++                            .collect();
++                        futures_util::future::join_all(
++                            listeners
++                                .into_iter()
++                                .map(|l| accept_loop(l, &shared, &graceful, stop.clone())),
++                        )
++                        .await;
++                        let _ =
++                            tokio::time::timeout(shared.opts.shutdown_grace, graceful.shutdown())
++                                .await;
++                    });
++                })?,
++        );
++    }
++    Ok(handles)
++}
++
+ async fn accept_loop<H: Handler>(
+     listener: Listener,
+     shared: &Arc<Shared<H>>,

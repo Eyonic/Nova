@@ -77,6 +77,7 @@ impl App {
         databases: Vec<(String, String, u16)>,
         live: Arc<LiveHub>,
     ) -> Self {
+        PROBE_CACHING.store(mode == Mode::Production, Ordering::Relaxed);
         let boot = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() ^ (d.as_secs() as u32))
@@ -1252,6 +1253,7 @@ async fn file_meta(p: &Path) -> Option<Metadata> {
 }
 
 /// What `stat` + (for files) `canonicalize` found, in one blocking-pool hop.
+#[derive(Clone)]
 enum Probe {
     /// A regular file inside the site root: its canonical path.
     File(PathBuf, Metadata),
@@ -1261,10 +1263,30 @@ enum Probe {
     Missing,
 }
 
+/// Recent `probe` results for files and directories (like nginx's
+/// `open_file_cache`): a hit skips the blocking-pool hop and the
+/// stat/readlink syscalls, which are slow on FUSE filesystems such as
+/// Unraid's /mnt/user. Entries live [`PROBE_TTL`]; missing paths are never
+/// cached, so new files appear immediately.
+static PROBE_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, (Probe, Instant)>>,
+> = std::sync::LazyLock::new(Default::default);
+const PROBE_TTL: Duration = Duration::from_secs(1);
+/// Production only: in development every edit must show on the next request.
+static PROBE_CACHING: AtomicBool = AtomicBool::new(false);
+const PROBE_CACHE_MAX: usize = 16_384;
+
 async fn probe(site: &Site, p: &Path) -> Probe {
-    let (root, p) = (site.root.clone(), p.to_path_buf());
-    tokio::task::spawn_blocking(move || match std::fs::metadata(&p) {
-        Ok(m) if m.is_file() => match std::fs::canonicalize(&p) {
+    let caching = PROBE_CACHING.load(Ordering::Relaxed);
+    if caching
+        && let Some((hit, at)) = PROBE_CACHE.lock().unwrap().get(p)
+        && at.elapsed() < PROBE_TTL
+    {
+        return hit.clone();
+    }
+    let (root, path) = (site.root.clone(), p.to_path_buf());
+    let found = tokio::task::spawn_blocking(move || match std::fs::metadata(&path) {
+        Ok(m) if m.is_file() => match std::fs::canonicalize(&path) {
             Ok(c) if c.starts_with(&root) => Probe::File(c, m),
             _ => Probe::Escapes,
         },
@@ -1272,7 +1294,15 @@ async fn probe(site: &Site, p: &Path) -> Probe {
         _ => Probe::Missing,
     })
     .await
-    .unwrap_or(Probe::Missing)
+    .unwrap_or(Probe::Missing);
+    if caching && matches!(found, Probe::File(..) | Probe::Dir) {
+        let mut cache = PROBE_CACHE.lock().unwrap();
+        if cache.len() >= PROBE_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(p.to_path_buf(), (found.clone(), Instant::now()));
+    }
+    found
 }
 
 async fn resolve_target(site: &Site, safe: &SafePath, query: Option<&str>) -> Target {

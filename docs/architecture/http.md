@@ -213,6 +213,12 @@ Small static files (up to 1 MiB) are served from a 64 MiB in-memory cache
 keyed by path, size and modification time, so edits show up on the next
 request without any invalidation step.
 
+In production, path lookups (stat + symlink resolution) are also cached
+for 1 second, like nginx's `open_file_cache`: a changed or deleted file
+may be served in its previous state for up to a second (new files appear
+immediately; development mode never caches). On FUSE filesystems such as
+Unraid's `/mnt/user` this is what makes static serving fast.
+
 ## Background processes
 
 ```toml
