@@ -14,10 +14,13 @@ clearly better (or a deliberate trade-off). Stable baseline: tag
 
 | # | Idea | Why (research) | Tests | Result | Decision |
 |---|---|---|---|---|---|
-| 1 | mimalloc allocator | malloc/free ~5% of worker CPU; work stealing frees across threads | Unraid, local, memory | +1-3% (Unraid), +3-7% (local, h2 most); RSS 58 vs 29 MB | kept |
+| 1 | mimalloc allocator | malloc/free ~5% of worker CPU; work stealing frees across threads | Unraid, local, memory | +1-3% (Unraid), +3-7% (local, h2 most); RSS 58 vs 29 MB right after load, but 28 vs 30 MB (= glibc) after a 5 s settle (see #7) | kept |
 | 2 | FastCGI keep-alive pool | nginx `fastcgi_keep_conn`; connect/accept per request | local, Unraid, integration | PHP +17% local (above nginx+fpm), +7% Unraid, p99 lower | kept |
 | 3 | Thread-per-core runtimes + SO_REUSEPORT | removes work-stealing wake-ups (monoio/tako research) | local, Unraid | h2 +15% but PHP -10% locally; Unraid within noise, p99 worse (uneven spreading) | rejected, patch in `thread-per-core.patch` |
 | 4 | 1 s path-lookup cache | `open_file_cache`; stat + readlink per request, blocking-pool hop | Unraid, local, integration | Unraid static x2.2-4.7 (FUSE), local h2 +45%, small +19% | kept |
+| 5 | Lookup cache for Optimizer variants and precompressed siblings (incl. missing) | browser requests (AVIF, br) still did 1-3 uncached stats | Unraid, local, integration | Unraid AVIF/HTML-br/JS-br +27-29% more (now x5-6 stable), p99 ~25 -> 7-10 ms; local br +9% | kept |
+| 6 | Micro-cache single flight (`proxy_cache_lock`) | every miss at expiry ran PHP (stampede) | local, unit, integration | 200 ms page, TTL 1 s: PHP runs 167 -> 9, slowest request 9.3 s -> 0.21 s, +8-14% req/s | kept |
+| 7 | jemalloc instead of mimalloc | jemalloc returns memory to the OS more eagerly | local, Unraid memory | throughput equal; RSS after settle: jemalloc 37 MB, mimalloc 28 MB, glibc 30 MB | rejected |
 
 Not attempted (research): sendfile needs a hyper change (hyper#3026,
 PR #4214 closed pending a HIP); kTLS depends on it; tokio interval knobs
