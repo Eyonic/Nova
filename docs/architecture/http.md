@@ -213,6 +213,11 @@ Small static files (up to 1 MiB) are served from a 64 MiB in-memory cache
 keyed by path, size and modification time, so edits show up on the next
 request without any invalidation step.
 
+Files larger than the memory cache (over 1 MiB) are sent with
+`sendfile(2)` on plain HTTP/1.1 (zero-copy from the page cache; TLS,
+HTTP/2 and HTTP/3 stream them as before). This uses a vendored hyper with
+hyperium/hyper PR #4214 (experimental branch only).
+
 In production, path lookups (stat + symlink resolution) are also cached
 for 1 second, like nginx's `open_file_cache`: a changed or deleted file
 may be served in its previous state for up to a second (new files appear

@@ -16,6 +16,8 @@ WORKDIR /src
 # Dependency layer: build against stub sources so this layer is only
 # invalidated when manifests or the lockfile change.
 COPY Cargo.toml Cargo.lock ./
+# Patched dependencies ([patch.crates-io] in Cargo.toml).
+COPY vendor vendor
 COPY crates/nova-config/Cargo.toml crates/nova-config/
 COPY crates/nova-http/Cargo.toml crates/nova-http/
 COPY crates/nova-runtime-php/Cargo.toml crates/nova-runtime-php/

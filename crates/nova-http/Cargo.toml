@@ -20,6 +20,7 @@ hyper-util = { version = "0.1.21", features = ["tokio", "server", "server-auto",
 mime_guess = "2.0.5"
 percent-encoding = "2.3.2"
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
+libc = "0.2.190"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12", "logging"] }
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "fs", "io-util", "macros", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }

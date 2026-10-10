@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fs::Metadata;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
@@ -265,7 +265,27 @@ pub async fn respond(f: FileResponse<'_>, method: &Method, req: &HeaderMap) -> R
         };
     }
 
-    let mut file = match tokio::fs::File::open(f.path).await {
+    let std_file = match std::fs::File::open(f.path) {
+        Ok(file) => Arc::new(file),
+        Err(e) => {
+            tracing::warn!(path = %f.path.display(), error = %e, "cannot open file");
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(full("internal error"))
+                .unwrap();
+        }
+    };
+    // Files too large for the memory cache: plain HTTP/1 sends them with
+    // sendfile(2) (4 MB: 3.3x on Unraid, 4.5x on loopback). Files served
+    // from memory keep the buffered write: there sendfile measured -8%
+    // behind Docker's bridge (+91% on loopback), so it is not used.
+    builder = builder.extension(hyper::ext::SendFile::new(
+        Arc::clone(&std_file),
+        start,
+        count,
+    ));
+    // Fallback body (TLS, HTTP/2): read from a duplicate descriptor.
+    let mut file = match std_file.try_clone().map(tokio::fs::File::from_std) {
         Ok(file) => file,
         Err(e) => {
             tracing::warn!(path = %f.path.display(), error = %e, "cannot open file");

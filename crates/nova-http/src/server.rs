@@ -18,7 +18,7 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 
@@ -278,7 +278,8 @@ async fn handle_connection<H: Handler>(
             tls: false,
             http3: false,
         };
-        serve_io(stream, info, shared, watcher).await;
+        let io = crate::sendfile::PlainTcp(TokioIo::new(stream));
+        serve_io(io, info, shared, watcher).await;
         return;
     };
 
@@ -306,7 +307,7 @@ async fn handle_connection<H: Handler>(
                 tls: true,
                 http3: false,
             };
-            serve_io(s, info, shared, watcher).await;
+            serve_io(TokioIo::new(s), info, shared, watcher).await;
         }
         Ok(Ok(None)) => {}
         Ok(Err(e)) => tracing::debug!(%peer, error = %e, "TLS handshake failed"),
@@ -319,7 +320,7 @@ const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 async fn serve_io<H, I>(io: I, info: ConnInfo, shared: Arc<Shared<H>>, watcher: Watcher)
 where
     H: Handler,
-    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
     let h = Arc::clone(&shared.handler);
     let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
@@ -331,7 +332,7 @@ where
     });
     let conn = shared
         .builder
-        .serve_connection_with_upgrades(TokioIo::new(io), svc)
+        .serve_connection_with_upgrades(io, svc)
         .into_owned();
     let conn = watcher.watch(conn);
     if let Err(e) = conn.await {

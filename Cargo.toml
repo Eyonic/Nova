@@ -8,3 +8,9 @@ edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.99"
 publish = false
+
+# Experiment: hyper with zero-copy file bodies (hyperium/hyper PR #4214,
+# closed pending a HIP) and hyper-util forwarding them through Rewind.
+[patch.crates-io]
+hyper = { path = "vendor/hyper" }
+hyper-util = { path = "vendor/hyper-util" }

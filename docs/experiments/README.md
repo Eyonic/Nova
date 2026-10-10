@@ -25,6 +25,7 @@ clearly better (or a deliberate trade-off). Stable baseline: tag
 | 9 | Database change channels (binlog → `db:<table>`) | vision phase C; mysql_async binlog is tested against MariaDB 11/12 | Unraid end-to-end, unit, integration | commit → browser 68 ms avg / 102 ms max; rollback 0 events; other databases 0 events; cached WordPress page purged on SQL edit | kept (prototype) |
 | 10 | HTTP/3 without a body pump for GET/HEAD | per-request task + channel even without a body; UDP buffers ruled out (no drops) | local x2, integration | 132.6k -> 141.8k req/s (+7%); POST bodies intact | kept |
 | 11 | HTML rewriting for `<img>` (vision phase A) | naive pages load every full-size image and shift layout | Chromium Fast 4G x2, integration | load 1.2 -> 0.37 s, CLS 0.27 -> 0, bytes at load 974 -> 59 KB, phone total 974 -> 110 KB | kept (opt-in) |
+| 12 | sendfile(2) for static files (vendored hyper with PR #4214, closed pending a HIP; hyper-util Rewind forwards it) | biggest remaining gap vs nginx; user-space copy of every byte | local, Unraid x2 | 4 MB: local 2.9k -> 13.1k req/s (x4.5), Unraid 927 -> 3,027 (x3.3, p99 76 -> 19 ms); 477 KB from the memory cache: local +91% but Unraid -8% | kept for files > 1 MiB (not in the memory cache); not used for cached files |
 
 ## Real applications (Unraid, both stacks, 4 CPUs each)
 
@@ -43,6 +44,9 @@ not `/mnt/user/appdata/...`. Through the shfs FUSE layer, stat on 2000
 WordPress files took 1.03 s vs 0.044 s directly, and every WordPress page
 took 2.6 s instead of 70 ms (any web server is affected).
 
-Not attempted (research): sendfile needs a hyper change (hyper#3026,
-PR #4214 closed pending a HIP); kTLS depends on it; tokio interval knobs
-expected low single digits; h2 already at 0.4.20 (lock and HPACK fixes).
+Not attempted (research): kTLS (needs the sendfile path plus the ktls
+crate; TLS 1.3 key updates are an open question there); tokio interval
+knobs expected low single digits; h2 already at 0.4.20 (lock and HPACK
+fixes). The sendfile experiment (#12) carries a vendored hyper: drop
+`vendor/` and the `[patch.crates-io]` entries if hyper ships its own
+file-body API.

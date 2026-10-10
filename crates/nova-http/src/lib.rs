@@ -6,6 +6,7 @@ pub mod compress;
 mod h3;
 pub mod path;
 pub mod proxy;
+pub mod sendfile;
 pub mod server;
 pub mod static_files;
 

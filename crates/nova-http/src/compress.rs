@@ -211,6 +211,8 @@ pub fn apply(
     if method == Method::HEAD {
         return resp;
     }
+    // The encoded body replaces the file's bytes: never send the file raw.
+    resp.extensions_mut().remove::<hyper::ext::SendFile>();
     resp.map(|body| encode(body, encoding))
 }
 
