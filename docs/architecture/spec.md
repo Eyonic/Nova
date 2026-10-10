@@ -189,7 +189,7 @@ Objects live in `<state>/optimize/objects/<2 hex>/<32 hex>.<ext>`.
 |---|---|---|
 | Unit | `cargo test` (via `scripts/cargo.sh test`) | config validation, FastCGI encoding, CGI params, path security, ranges, dispatch resolution order and symlink escapes, planning, negotiation, encoder output validation, incremental scans |
 | Browser | `tests/browser/run.sh` | 14 NOVA Live tests in headless Chromium |
-| Integration | `tests/integration/run.sh` | 174 checks against a real Compose stack: static, request smuggling and malformed requests, compression, caching, site rules, proxies, HTTPS/HTTP2/HTTP3, Script Optimizer, PHP, uploads, limits, images, DB, isolation probe, tasks/workers, live reload, graceful shutdown, restart persistence, metrics/logs |
+| Integration | `tests/integration/run.sh` | 179 checks against a real Compose stack: static, request smuggling and malformed requests, compression, caching, site rules, proxies, HTTPS/HTTP2/HTTP3, Script Optimizer, PHP, uploads, limits, images, DB, isolation probe, tasks/workers, live reload, graceful shutdown, restart persistence, metrics/logs |
 | Performance | `tests/performance/run.sh` | static 1 KiB / 100 KiB / image, HTTP/2, PHP; `REF=1` adds stock nginx + PHP-FPM on the same files; fails when a scenario drops more than 15% below `baseline.json` |
 | Next | `tests/compatibility` | WordPress/Laravel/Symfony suites |
 

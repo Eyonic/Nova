@@ -24,8 +24,12 @@ self_signed = true
 state_dir = "/var/lib/nova"
 run_dir = "/run/nova"
 
+# The Script Optimizer is on (as in production): text files are served
+# minified and precompressed. Image encoding is off so no AVIF/WebP work
+# competes with the load test (images are served as originals).
 [optimize]
-enabled = false
+enabled = true
+formats = []
 
 [[site]]
 name = "bench"

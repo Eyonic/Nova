@@ -92,6 +92,12 @@ docker run -d --name nova-perf-srv --network host \
   ${NOVA_BIN:+-v "$(realpath "$NOVA_BIN"):/usr/local/bin/nova:ro"} \
   "$NOVA_IMAGE" >/dev/null || exit 1
 wait_up http://127.0.0.1:9005/index.html || { docker logs nova-perf-srv | tail; exit 1; }
+# Let the Script Optimizer precompress the text files first.
+for _ in $(seq 60); do
+  curl -s -D - -o /dev/null -H 'Accept-Encoding: br' http://127.0.0.1:9005/100k.txt |
+    grep -qi 'content-encoding: br' && break
+  sleep 1
+done
 scenarios nova 9005 9445
 docker rm -f nova-perf-srv >/dev/null
 

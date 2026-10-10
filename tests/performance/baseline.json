@@ -1,32 +1,44 @@
 {
   "nova-h2-static-1k": {
-    "rps": 110242,
-    "p50_ms": 2.12,
-    "p99_ms": 6.31,
+    "rps": 116536,
+    "p50_ms": 2.0,
+    "p99_ms": 5.96,
     "ok_ratio": 1.0
   },
   "nova-image-470k": {
-    "rps": 23584,
+    "rps": 23450,
     "p50_ms": 2.3,
-    "p99_ms": 8.01,
+    "p99_ms": 7.92,
     "ok_ratio": 1.0
   },
   "nova-php-hello": {
-    "rps": 39196,
-    "p50_ms": 1.52,
-    "p99_ms": 3.37,
+    "rps": 40133,
+    "p50_ms": 1.49,
+    "p99_ms": 3.28,
+    "ok_ratio": 1.0
+  },
+  "nova-static-100k-br": {
+    "rps": 121280,
+    "p50_ms": 0.43,
+    "p99_ms": 2.28,
     "ok_ratio": 1.0
   },
   "nova-static-100k": {
-    "rps": 102528,
-    "p50_ms": 0.51,
-    "p99_ms": 2.75,
+    "rps": 108150,
+    "p50_ms": 0.48,
+    "p99_ms": 2.65,
+    "ok_ratio": 1.0
+  },
+  "nova-static-1k-br": {
+    "rps": 123357,
+    "p50_ms": 1.62,
+    "p99_ms": 7.39,
     "ok_ratio": 1.0
   },
   "nova-static-1k": {
-    "rps": 139214,
-    "p50_ms": 1.55,
-    "p99_ms": 5.96,
+    "rps": 151811,
+    "p50_ms": 1.4,
+    "p99_ms": 5.66,
     "ok_ratio": 1.0
   }
 }

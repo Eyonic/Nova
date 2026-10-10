@@ -101,6 +101,32 @@ H2O and lower than nginx, Caddy and Apache in this test.
 | 4 | Clarify arbitrary HTTP backends | README "What NOVA serves" table and spec limitation: static + PHP-FPM only, no generic reverse proxy/WebSocket/gRPC; how to combine with a proxy today; `[site.proxy]` on the roadmap. |
 | 5 | Repeatable performance + security regression tests | `tests/performance/run.sh` (baseline file, fails on >15% regression, optional nginx reference). 7 new protocol-abuse integration checks (CL+TE, duplicate Content-Length, obs-fold, bad chunk size, unknown Transfer-Encoding, PHP-suffix path trick, NUL byte). A request with both `Content-Length` and `Transfer-Encoding` is framed by `Transfer-Encoding` and the connection is closed afterwards (RFC 9112 §6.3; a request smuggled behind it is never answered), verified by an integration check. (An earlier draft of this report wrongly said the connection stayed open.) New unit tests for proxy trust, file cache and Landlock require mode. |
 
+## 3b. Second round: improvements tested one by one
+
+Each idea was measured A/B (same machine, same files, at most three
+attempts per idea) and kept only when it was clearly better or a
+deliberate trade-off.
+
+| Area | Idea | Result | Kept |
+|---|---|---|---|
+| Performance | Dedicated JSON access-log formatter | +8% / +9% small files (two runs), +7% HTTP/2, identical log lines | yes |
+| Performance | Block-buffered log output | no gain over the formatter | no |
+| Performance | HTTP/2 window and frame tuning | no gain (40.5k vs 40.7k) | no |
+| Performance / security | aws-lc-rs TLS with post-quantum key exchange (X25519MLKEM768) | speed-neutral on established connections, -11% new handshakes | yes (security) |
+| Performance | `writev` for large bodies; 2 MiB socket send buffer | within noise on the 477 KB JPEG | no |
+| **Bug found** | PHP workers leaked by abandoned requests | a client leaving while PHP worked pinned an FPM worker forever; after 16 the site only returned 504. Fixed and covered by unit + integration tests | fixed |
+| Security | CL+TE request smuggling | already safe (connection closed); now tested | test |
+| Security | Decompression bomb, `?w=` abuse | already safe (pixel limit before decoding, fixed widths); now tested | test |
+| Security | `cargo audit` | no vulnerabilities in 449 crates | clean |
+| Feature | PHP micro-cache (opt-in) | 20 ms page: 787 → 163 000 req/s | yes |
+| Feature | `[site.proxy]` reverse proxy (HTTP + WebSocket) | verified with a Node app over h1/h2/h3, streaming, ws/wss | yes |
+| Feature | ACME HTTP-01 + private CA root | verified end to end against Pebble | yes |
+
+Final numbers (`tests/performance/baseline.json`, Script Optimizer on):
+small file 152k req/s, 134 KB 108k, 134 KB brotli 121k, HTTP/2 117k,
+JPEG 23k, PHP hello 40k; nginx 1.29 on the same run: 199k, 167k, 170k
+(identity), 185k, 53k, 43k.
+
 ## 4. What we can improve next (prioritized)
 
 **Security / correctness**
@@ -123,11 +149,13 @@ H2O and lower than nginx, Caddy and Apache in this test.
 **Performance**
 
 6. `sendfile`/`splice` for large static files on plain HTTP/1.1 (and kTLS
-   later): the biggest remaining gap (2.3x vs nginx on the JPEG).
-7. Cheaper access logs: pre-formatted line writer instead of the generic
-   JSON formatter, optional sampling, or a binary/structured sink.
-8. HTTP/2: profile the TLS + h2 path (connection-level flow control
-   windows, write buffer sizes, `max_concurrent_streams`).
+   later): the biggest remaining gap (2.3x vs nginx on the JPEG). `writev`
+   and larger socket buffers were tried and do not help: the cost is the
+   copy through user space and the kernel, so this needs zero-copy below hyper.
+7. ~~Cheaper access logs~~ **done** (dedicated formatter, +8-9%); sampling
+   remains an option for very busy sites.
+8. HTTP/2: window/frame tuning tried, no gain; the remaining gap is in
+   hyper's h2 implementation itself.
 9. ~~Startup: the Script Optimizer's text pass waited behind image
    encodes~~ **fixed in this round**: text and image jobs shared one
    2-permit semaphore, so a cold start with AVIF encoding delayed new JS/CSS
@@ -138,14 +166,13 @@ H2O and lower than nginx, Caddy and Apache in this test.
 
 **Features (by impact)**
 
-11. HTTP-01 and DNS-01 ACME (wildcards), ARI.
-12. `[site.proxy]`: HTTP/WebSocket reverse proxy to one upstream per site
-    (Node/Python/Go apps), with health checks.
-13. FastCGI micro-cache (1-10 s, only for responses without cookies or
-    `Cache-Control: private`), plus purge from PHP via a header.
+11. ~~HTTP-01~~ **done**; DNS-01 (wildcards) and ARI remain.
+12. ~~`[site.proxy]`~~ **done** (HTTP + WebSocket, one upstream per site);
+    load balancing and health checks across several upstreams remain.
+13. ~~FastCGI micro-cache~~ **done** (`micro_cache_secs`, purged by `Nova-Publish`).
 14. 103 Early Hints (blocked on hyper's API; alternative: `Link: preload`
     on the final response, which NOVA can already send).
-15. Post-quantum key exchange: switch rustls to the aws-lc-rs provider.
+15. ~~Post-quantum key exchange~~ **done** (aws-lc-rs, X25519MLKEM768).
 16. OpenTelemetry traces (request → PHP → DB timing).
 17. The vision items in [vision.md](../architecture/vision.md): HTML
     rewriting for lazy/responsive images, embedded database, database
