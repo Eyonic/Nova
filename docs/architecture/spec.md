@@ -195,9 +195,6 @@ Objects live in `<state>/optimize/objects/<2 hex>/<32 hex>.<ext>`.
 
 ## 8. Known limitations
 
-* A request with both `Content-Length` and `Transfer-Encoding` is framed by
-  `Transfer-Encoding` (hyper drops the length), but the connection is not
-  closed afterwards as RFC 9112 §6.3 requires; nginx rejects such requests.
 * **Backends: static files and PHP-FPM (FastCGI) only.** There is no
   reverse proxy to arbitrary HTTP application servers (Node.js, Python,
   Go, ...), no WebSocket or gRPC proxying and no load balancing. Such apps

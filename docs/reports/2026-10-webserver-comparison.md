@@ -99,7 +99,7 @@ H2O and lower than nginx, Caddy and Apache in this test.
 | 2 | HTTP/3 per-client resource gap | QUIC connections now share the per-IP connection budget with TCP; addresses holding half their budget must pass a QUIC Retry first (spoofed UDP sources cannot lock out real clients); QUIC handshake bounded by `header_read_timeout`; HTTP/3 request headers capped at 64 KiB. |
 | 3 | Profile rate limiter, logging, static files | Profiled with `perf`. Static files: one blocking-pool hop for stat+canonicalize instead of two, and a 64 MiB in-memory cache for files up to 1 MiB (keyed by size+mtime, so edits show immediately). Logging: written by a dedicated thread (no dropped lines). Rate limiter: the global sweep mutex taken on every request is now an atomic. Result: +81% small files, +114% 134 KB, +33% JPEG, +76% HTTP/2. |
 | 4 | Clarify arbitrary HTTP backends | README "What NOVA serves" table and spec limitation: static + PHP-FPM only, no generic reverse proxy/WebSocket/gRPC; how to combine with a proxy today; `[site.proxy]` on the roadmap. |
-| 5 | Repeatable performance + security regression tests | `tests/performance/run.sh` (baseline file, fails on >15% regression, optional nginx reference). 7 new protocol-abuse integration checks (CL+TE, duplicate Content-Length, obs-fold, bad chunk size, unknown Transfer-Encoding, PHP-suffix path trick, NUL byte). One finding: a request with both `Content-Length` and `Transfer-Encoding` is accepted and framed by `Transfer-Encoding` (hyper drops the length before NOVA sees the request, which RFC 9112 allows), but hyper keeps the connection open where the RFC requires closing it, and nginx rejects such requests outright. NOVA cannot detect this above hyper; see improvement 3. New unit tests for proxy trust, file cache and Landlock require mode. |
+| 5 | Repeatable performance + security regression tests | `tests/performance/run.sh` (baseline file, fails on >15% regression, optional nginx reference). 7 new protocol-abuse integration checks (CL+TE, duplicate Content-Length, obs-fold, bad chunk size, unknown Transfer-Encoding, PHP-suffix path trick, NUL byte). A request with both `Content-Length` and `Transfer-Encoding` is framed by `Transfer-Encoding` and the connection is closed afterwards (RFC 9112 §6.3; a request smuggled behind it is never answered), verified by an integration check. (An earlier draft of this report wrongly said the connection stayed open.) New unit tests for proxy trust, file cache and Landlock require mode. |
 
 ## 4. What we can improve next (prioritized)
 
@@ -110,11 +110,8 @@ H2O and lower than nginx, Caddy and Apache in this test.
    "MadeYouReset" fix).
 2. Fuzz the request path (HTTP/1 parser edge cases, path normalization,
    FastCGI param building, image decoders) with `cargo fuzz`.
-3. Requests with both `Content-Length` and `Transfer-Encoding`: hyper
-   handles them by `Transfer-Encoding` but does not close the connection
-   (RFC 9112 §6.3 "MUST close"). Propose the fix upstream (hyper) or reject
-   them in a thin pre-parser; until then NOVA should not sit behind a proxy
-   that forwards both headers.
+3. ~~Requests with both `Content-Length` and `Transfer-Encoding`~~: verified
+   safe (framed by `Transfer-Encoding`, connection closed).
 4. Image optimizer hardening: cap decoded pixel count (decompression bombs),
    restrict `?w=` to configured widths (already the case: verify in tests),
    decode in the sandboxed worker only.

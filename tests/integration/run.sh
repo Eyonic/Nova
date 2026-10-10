@@ -122,10 +122,11 @@ raw() { # request bytes -> status code of the first response (or "closed")
   [[ "$out" =~ ^HTTP/1\.[01]\ ([0-9]{3}) ]] && echo "${BASH_REMATCH[1]}" || echo closed
 }
 not_ok() { [ "$2" != 200 ] && ok "$1" || bad "$1" "expected rejection, got 200"; }
-# hyper drops Content-Length when Transfer-Encoding is present (RFC 9112
-# §6.3): the body must be framed by the chunked encoding, never by the length.
-has "Content-Length + Transfer-Encoding: framed by Transfer-Encoding (CL.TE)" \
-  "$(exec 3<>"/dev/tcp/127.0.0.1/$PORT" && printf 'POST /info.php HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n' >&3 && timeout 5 cat <&3)" '"raw_body_bytes": 5'
+# CL + TE: framed by Transfer-Encoding (hyper drops the length), and the
+# connection closes afterwards, so a request smuggled behind it never runs.
+SMUGGLE=$(exec 3<>"/dev/tcp/127.0.0.1/$PORT" && printf 'POST /info.php HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\nGET /smuggled-request HTTP/1.1\r\nHost: localhost\r\n\r\n' >&3 && timeout 5 cat <&3)
+has "Content-Length + Transfer-Encoding: framed by Transfer-Encoding (CL.TE)" "$SMUGGLE" '"raw_body_bytes": 5'
+eq "connection closed after CL.TE, smuggled request not answered" "$(grep -c '^HTTP/1.1 ' <<<"$SMUGGLE")" 1
 eq "conflicting Content-Length rejected" \
   "$(raw 'POST /info.php HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabcd')" 400
 eq "obsolete header line folding rejected" \
@@ -230,6 +231,21 @@ curl -s -H 'Accept: image/webp' -o "$WORK/v.webp" "$BASE/images/hero.jpg?w=600"
 W=$(od -An -t u2 -j 26 -N 2 "$WORK/v.webp" | tr -d ' '); W=$((W & 0x3fff))
 eq "?w=600 rounds up to 640px variant" "$W" 640
 eq "transparent PNG to AVIF" "$(curl -s -o /dev/null -H 'Accept: image/avif' -w '%{content_type}' "$BASE/images/logo.png")" image/avif
+# Decompression bomb: 190 KB file declaring 40000x40000 pixels. It must be
+# rejected from its header (never decoded), served as is, and harmless.
+BOMB=sites/example/public/images/zz-bomb.png
+trap 'rm -f "$BOMB" "${WATCH:-}"; cleanup' EXIT
+python3 -I tests/integration/bomb.py "$BOMB"
+for _ in $(seq 1 30); do
+  BSTATUS=$(curl -s "$BASE/_nova/optimize/status")
+  [[ "$BSTATUS" == *'"errors":1'* ]] && break
+  sleep 1
+done
+has "decompression bomb rejected by the pixel limit" "$(dc logs nova 2>&1 | grep zz-bomb)" "above the configured limit"
+eq "decompression bomb served unmodified" \
+  "$(curl -s -o /dev/null -H 'Accept: image/avif' -w '%{content_type} %{size_download}' "$BASE/images/zz-bomb.png?w=320")" "image/png $(stat -c %s "$BOMB")"
+eq "still ready after the bomb" "$(code "$BASE/_nova/health/ready")" 200
+rm -f "$BOMB"
 
 section "Database"
 V1=$(curl -s -X POST "$BASE/db.php" | sed -E 's/.*"visits":([0-9]+).*/\1/')

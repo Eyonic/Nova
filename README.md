@@ -119,6 +119,7 @@ scripts/cargo.sh fmt --all
 tests/integration/run.sh              # end-to-end suite, 174 checks (throwaway stack on :18088/:18443)
 tests/browser/run.sh                  # NOVA Live in headless Chromium (needs a running stack)
 REF=1 tests/performance/run.sh        # load tests vs stock nginx + PHP-FPM (needs oha)
+cargo audit                           # RustSec advisories (cargo install cargo-audit)
 docker compose run --rm nova check --php   # validate config, print generated FPM config
 docker compose run --rm nova optimize      # one optimization pass
 ```
