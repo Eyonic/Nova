@@ -14,6 +14,8 @@ run() { # stack scenario -> req/s
     php)   url=http://127.0.0.1:$http/info.php; args="-c 64 --disable-compression" ;;
     phpbr) url=http://127.0.0.1:$http/info.php; args="-c 64 --disable-compression -H Accept-Encoding:br" ;;
     h2)    url=https://localhost:$https/index.html; args="--http2 -c 16 -p 8 --insecure --disable-compression" ;;
+    avif)  url=http://127.0.0.1:$http/images/hero.jpg; args="-c 64 --disable-compression -H Accept:image/avif,image/webp,*/*" ;;
+    htmlbr) url=http://127.0.0.1:$http/index.html; args="-c 128 --disable-compression -H Accept-Encoding:br" ;;
   esac
   taskset -c 16-23 $OHA --no-tui -z 2s $args "$url" >/dev/null 2>&1
   # -> "<req/s> <p99 ms> <non-200 count>"

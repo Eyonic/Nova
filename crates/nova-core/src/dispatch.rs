@@ -564,7 +564,7 @@ impl App {
                 .and_then(|v| v.to_str().ok());
             let width = query_param(req.uri().query(), "w").and_then(|w| w.parse::<u32>().ok());
             if let Some(sel) = opt.select(&site.name, rel, meta, accept, width)
-                && let Ok(vmeta) = tokio::fs::metadata(&sel.path).await
+                && let Some(vmeta) = variant_meta(&sel.path).await
             {
                 let fr = FileResponse {
                     path: &sel.path,
@@ -601,7 +601,7 @@ impl App {
             };
             let tokens: Vec<&str> = accepted.iter().map(|e| e.token()).collect();
             if let Some(sel) = opt.select_text(&site.name, rel, meta, &tokens)
-                && let Ok(vmeta) = tokio::fs::metadata(&sel.path).await
+                && let Some(vmeta) = variant_meta(&sel.path).await
             {
                 let ctype = static_files::guess_mime(file);
                 let fr = FileResponse {
@@ -686,9 +686,8 @@ impl App {
             name.push(".");
             name.push(enc.extension());
             let sibling = PathBuf::from(name);
-            if let Some(m) = file_meta(&sibling).await
+            if let Probe::File(c, m) = probe_optional(site, &sibling).await
                 && m.modified().is_ok_and(|t| t >= modified)
-                && let Some(c) = contained(site, &sibling).await
             {
                 return Some((enc, c, m));
             }
@@ -1277,6 +1276,42 @@ static PROBE_CACHING: AtomicBool = AtomicBool::new(false);
 const PROBE_CACHE_MAX: usize = 16_384;
 
 async fn probe(site: &Site, p: &Path) -> Probe {
+    probe_with(site, p, false).await
+}
+
+/// `probe`, also caching "missing": for optional files looked up on every
+/// request (precompressed `.br`/`.zst`/`.gz` siblings), where a new file
+/// may take up to [`PROBE_TTL`] to be noticed.
+async fn probe_optional(site: &Site, p: &Path) -> Probe {
+    probe_with(site, p, true).await
+}
+
+/// Metadata of an Optimizer output file (written atomically, never
+/// changed in place), through the same short-lived cache.
+async fn variant_meta(p: &Path) -> Option<Metadata> {
+    let caching = PROBE_CACHING.load(Ordering::Relaxed);
+    if caching
+        && let Some((Probe::File(_, m), at)) = PROBE_CACHE.lock().unwrap().get(p)
+        && at.elapsed() < PROBE_TTL
+    {
+        return Some(m.clone());
+    }
+    let m = tokio::fs::metadata(p).await.ok().filter(|m| m.is_file())?;
+    if caching {
+        remember(p, Probe::File(p.to_path_buf(), m.clone()));
+    }
+    Some(m)
+}
+
+fn remember(p: &Path, probe: Probe) {
+    let mut cache = PROBE_CACHE.lock().unwrap();
+    if cache.len() >= PROBE_CACHE_MAX {
+        cache.clear();
+    }
+    cache.insert(p.to_path_buf(), (probe, Instant::now()));
+}
+
+async fn probe_with(site: &Site, p: &Path, cache_missing: bool) -> Probe {
     let caching = PROBE_CACHING.load(Ordering::Relaxed);
     if caching
         && let Some((hit, at)) = PROBE_CACHE.lock().unwrap().get(p)
@@ -1295,12 +1330,8 @@ async fn probe(site: &Site, p: &Path) -> Probe {
     })
     .await
     .unwrap_or(Probe::Missing);
-    if caching && matches!(found, Probe::File(..) | Probe::Dir) {
-        let mut cache = PROBE_CACHE.lock().unwrap();
-        if cache.len() >= PROBE_CACHE_MAX {
-            cache.clear();
-        }
-        cache.insert(p.to_path_buf(), (found.clone(), Instant::now()));
+    if caching && (cache_missing || matches!(found, Probe::File(..) | Probe::Dir)) {
+        remember(p, found.clone());
     }
     found
 }
