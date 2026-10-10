@@ -13,7 +13,7 @@ use nova_config::{Config, TlsConfig};
 use nova_http::TlsSettings;
 use nova_http::rustls::{
     self, ServerConfig,
-    crypto::ring::{default_provider, sign::any_supported_type},
+    crypto::aws_lc_rs::{default_provider, sign::any_supported_type},
     pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
@@ -200,7 +200,7 @@ pub fn setup(cfg: &Config) -> Result<Tls> {
         .context("TLS protocol versions")?
         .with_no_client_auth()
         .with_cert_resolver(resolver.clone());
-    config.ticketer = rustls::crypto::ring::Ticketer::new().context("TLS session tickets")?;
+    config.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new().context("TLS session tickets")?;
 
     let quic = if t.http3 {
         let mut q = config.clone();
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn self_signed_is_persistent() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let dir = std::env::temp_dir().join(format!("nova-tls-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let hosts: BTreeSet<String> = ["localhost".to_string(), "a.localhost".to_string()].into();

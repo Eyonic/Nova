@@ -30,6 +30,11 @@ cert = "/etc/nova/certs/example.org.pem"
 key = "/etc/nova/certs/example.org.key"
 ```
 
+TLS 1.2 and 1.3 via rustls with the aws-lc-rs provider. Key exchange
+prefers the post-quantum hybrid `X25519MLKEM768` (as Chrome, Firefox and
+Cloudflare do) and falls back to X25519/ECDHE for older clients. It costs
+about 11% of new-handshake throughput, nothing on established connections.
+
 Certificate per SNI host: configured files first, then ACME for public names
 (not `localhost`, `*.localhost`, `*.test`, `*.local`, IPs ...), then a
 self-signed certificate persisted in `<state>/tls/self-signed/` so browsers

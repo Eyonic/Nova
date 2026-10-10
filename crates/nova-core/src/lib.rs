@@ -386,7 +386,7 @@ async fn run_worker(
     let mut quic = None;
     let mut acme_task = None;
     if tls_cfg.enabled {
-        let _ = nova_http::rustls::crypto::ring::default_provider().install_default();
+        let _ = nova_http::rustls::crypto::aws_lc_rs::default_provider().install_default();
         let t = tls::setup(&cfg).context("setting up TLS")?;
         listeners.push(nova_http::Listener {
             tcp: bind_tcp(tls_cfg.listen)

@@ -19,9 +19,9 @@ hyper = { version = "1.12.0", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "server", "server-auto", "server-graceful", "http1", "http2"] }
 mime_guess = "2.0.5"
 percent-encoding = "2.3.2"
-quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12", "logging"] }
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "fs", "io-util", "macros", "signal", "sync", "time"] }
-tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
 tokio-util = { version = "0.7.20", features = ["io", "rt"] }
 tracing = "0.1.44"
