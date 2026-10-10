@@ -159,23 +159,38 @@ async fn request<H: Handler>(
     peer: SocketAddr,
 ) {
     let (mut send, mut recv) = stream.split();
-    // The request body is pumped through a channel so the handler gets a
-    // `Sync` body like on TCP.
-    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(8);
-    tokio::spawn(async move {
-        loop {
-            let item = match recv.recv_data().await {
-                Ok(Some(mut buf)) => Ok(buf.copy_to_bytes(buf.remaining())),
-                Ok(None) => return,
-                Err(e) => Err(std::io::Error::other(e)),
-            };
-            let failed = item.is_err();
-            if tx.send(item).await.is_err() || failed {
-                return;
+    // GET/HEAD without a declared body: hand the handler an empty body and
+    // keep the receive half open until the response is sent, instead of a
+    // pump task and channel per request.
+    let bodiless = matches!(*req.method(), http::Method::GET | http::Method::HEAD)
+        && !req.headers().contains_key(http::header::CONTENT_LENGTH);
+    let mut _recv_open = None;
+    let req = if bodiless {
+        _recv_open = Some(recv);
+        req.map(|()| {
+            http_body_util::Empty::<Bytes>::new()
+                .map_err(|never| match never {})
+                .boxed()
+        })
+    } else {
+        // The request body is pumped through a channel so the handler gets
+        // a `Sync` body like on TCP.
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(8);
+        tokio::spawn(async move {
+            loop {
+                let item = match recv.recv_data().await {
+                    Ok(Some(mut buf)) => Ok(buf.copy_to_bytes(buf.remaining())),
+                    Ok(None) => return,
+                    Err(e) => Err(std::io::Error::other(e)),
+                };
+                let failed = item.is_err();
+                if tx.send(item).await.is_err() || failed {
+                    return;
+                }
             }
-        }
-    });
-    let req = req.map(|()| ChannelBody(rx).boxed());
+        });
+        req.map(|()| ChannelBody(rx).boxed())
+    };
     let info = ConnInfo {
         peer,
         socket_peer: peer,
