@@ -188,6 +188,14 @@ has "site env injected" "$INFO" '"app_name": "NOVA Example"'
 has "request id passed to PHP" "$INFO" '"request_id": "'
 has "pdo_mysql loaded" "$INFO" 'pdo_mysql'
 has "OPcache enabled" "$INFO" '"opcache": true'
+# Clients that give up while PHP is still working (closed tabs, proxy
+# timeouts) must not keep PHP workers busy: abandon more requests than the
+# pool has workers (8), then the pool must still answer promptly.
+for _ in $(seq 12); do curl -s -m 0.3 -o /dev/null "$BASE/slow.php?s=1" & done; wait
+sleep 2
+ABANDON_OK=0
+for _ in $(seq 10); do [ "$(code -m 5 "$BASE/info.php")" = 200 ] && ABANDON_OK=$((ABANDON_OK + 1)); done
+eq "PHP workers released after abandoned requests" "$ABANDON_OK" 10
 hasnt "PHP source never exposed" "$(curl -s "$BASE/info.php")" '<?php'
 has "PATH_INFO" "$(curl -s "$BASE/info.php/extra/path")" '"path_info": "/extra/path"'
 has "front controller route" "$(curl -s "$BASE/hello/nova")" '"name":"nova"'

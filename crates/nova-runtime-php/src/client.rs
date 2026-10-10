@@ -45,6 +45,15 @@ pub struct PhpRequest<B> {
     pub site: String,
 }
 
+/// Aborts the task when dropped.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub async fn execute<B>(req: PhpRequest<B>) -> Result<PhpResponse, PhpError>
 where
     B: Stream<Item = io::Result<Bytes>> + Send + Unpin + 'static,
@@ -63,7 +72,10 @@ where
     // Runs concurrently with the reader so a script that writes output
     // before consuming php://input cannot deadlock against us.
     let (body_err_tx, mut body_err_rx) = mpsc::channel::<io::Error>(1);
-    let writer = tokio::spawn(async move {
+    // Aborted on every exit path, including this future being dropped
+    // (client gone): FPM closes a connection only after reading EOF, so a
+    // write half left open would hold a PHP worker forever.
+    let writer = AbortOnDrop(tokio::spawn(async move {
         let mut buf = BytesMut::with_capacity(8192);
         fastcgi::put_begin_request(&mut buf);
         let encoded = fastcgi::encode_params(params.iter().map(|(k, v)| (&k[..], &v[..])));
@@ -91,7 +103,7 @@ where
         // until the reader has consumed the response and aborts this task.
         std::future::pending::<()>().await;
         Ok::<_, io::Error>(())
-    });
+    }));
 
     let mut reader = RecordReader::new(rd);
     let header_phase = async {
@@ -129,23 +141,25 @@ where
         }
     };
     let (head, rest, finished) = match tokio::time::timeout(header_timeout, header_phase).await {
-        Ok(r) => r.inspect_err(|_| writer.abort())?,
-        Err(_) => {
-            writer.abort();
-            return Err(PhpError::Timeout(header_timeout));
-        }
+        Ok(r) => r?,
+        Err(_) => return Err(PhpError::Timeout(header_timeout)),
     };
     let (status, headers) = parse_cgi_headers(&head)?;
 
     let (tx, rx) = mpsc::channel(16);
     tokio::spawn(async move {
+        let _writer = writer;
         if !rest.is_empty() && tx.send(Ok(rest)).await.is_err() {
-            writer.abort();
             return;
         }
         if !finished {
             loop {
-                match reader.next().await {
+                let next = tokio::select! {
+                    // Client gone: close now instead of waiting for output.
+                    _ = tx.closed() => break,
+                    next = reader.next() => next,
+                };
+                match next {
                     Ok(Some(rec)) => match rec.ty {
                         RecordType::Stdout if !rec.content.is_empty() => {
                             if tx.send(Ok(rec.content)).await.is_err() {
@@ -175,7 +189,6 @@ where
                 }
             }
         }
-        writer.abort();
     });
 
     Ok(PhpResponse {
@@ -303,5 +316,76 @@ mod tests {
         assert_eq!(find_header_end(b"A: b\r\n\r\nbody"), Some((4, 4)));
         assert_eq!(find_header_end(b"A: b\n\nbody"), Some((4, 2)));
         assert_eq!(find_header_end(b"A: b\r\n"), None);
+    }
+
+    /// A fake PHP-FPM that, like `fcgi_close`, answers and then waits for
+    /// the web server to close the connection. Returns whether it saw EOF
+    /// within two seconds after answering.
+    async fn fake_fpm(listener: tokio::net::UnixListener, delay: Duration) -> bool {
+        use tokio::io::AsyncReadExt;
+        let (mut s, _) = listener.accept().await.unwrap();
+        // Read until the empty STDIN record that ends the request.
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        let end_of_stdin = [1u8, RecordType::Stdin as u8];
+        while !got
+            .windows(8)
+            .any(|w| w[..2] == end_of_stdin && w[4..6] == [0, 0])
+        {
+            let n = s.read(&mut buf).await.unwrap();
+            assert!(n > 0, "request incomplete");
+            got.extend_from_slice(&buf[..n]);
+        }
+        tokio::time::sleep(delay).await;
+        let mut out = BytesMut::new();
+        fastcgi::put_stream(&mut out, RecordType::Stdout, b"Content-type: text/plain\r\n\r\nhi");
+        fastcgi::put_record(&mut out, RecordType::Stdout, &[]);
+        fastcgi::put_record(&mut out, RecordType::EndRequest, &[0; 8]);
+        let _ = s.write_all(&out).await;
+        let _ = s.shutdown().await;
+        let eof = async {
+            loop {
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), eof).await.is_ok()
+    }
+
+    fn request(socket: &Path) -> PhpRequest<futures_util::stream::Empty<io::Result<Bytes>>> {
+        PhpRequest {
+            socket: socket.to_path_buf(),
+            params: vec![(b"REQUEST_METHOD".to_vec(), b"GET".to_vec())],
+            body: futures_util::stream::empty(),
+            header_timeout: Duration::from_secs(5),
+            site: "test".into(),
+        }
+    }
+
+    /// The client gives up while PHP is still working (closed tab, proxy
+    /// timeout): the FastCGI connection must still be closed, or FPM keeps
+    /// that worker waiting forever and the pool runs dry.
+    #[tokio::test]
+    async fn abandoned_request_releases_the_php_worker() {
+        let dir = std::env::temp_dir().join(format!("nova-fcgi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("abandon.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let fpm = tokio::spawn(fake_fpm(listener, Duration::from_millis(300)));
+        let call = tokio::spawn(execute(request(&sock)));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        call.abort(); // the HTTP request future is dropped mid-flight
+        assert!(fpm.await.unwrap(), "PHP worker never saw the connection close");
+
+        // And a completed request closes too.
+        let listener = tokio::net::UnixListener::bind(dir.join("done.sock")).unwrap();
+        let fpm = tokio::spawn(fake_fpm(listener, Duration::ZERO));
+        let mut resp = execute(request(&dir.join("done.sock"))).await.unwrap();
+        while resp.body.recv().await.is_some() {}
+        assert!(fpm.await.unwrap(), "PHP worker never saw the connection close");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
