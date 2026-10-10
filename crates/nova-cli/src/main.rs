@@ -91,6 +91,13 @@ fn init_logging(mode: Mode) -> tracing_appender::non_blocking::WorkerGuard {
         .thread_name("nova-log")
         .finish(std::io::stdout());
     if json {
+        // Access lines bypass the generic formatter (see nova_core::access)
+        // but share the writer thread, so lines never interleave.
+        let access = writer.clone();
+        nova_core::access::set_json_sink(move |line| {
+            use std::io::Write;
+            let _ = access.clone().write_all(line);
+        });
         fmt()
             .json()
             .flatten_event(true)

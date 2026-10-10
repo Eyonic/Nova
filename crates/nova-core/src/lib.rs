@@ -12,6 +12,7 @@
 //! Shutdown (SIGTERM/SIGINT): readiness turns 503, the listener closes,
 //! in-flight requests drain, then the optimizer and PHP stop.
 
+pub mod access;
 pub mod client;
 pub mod dispatch;
 pub mod framework;

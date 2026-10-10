@@ -240,25 +240,54 @@ impl nova_http::Handler for App {
                 .get(header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok());
-            tracing::info!(
-                target: "nova::access",
-                request_id = %id,
-                site = site.map_or("-", |s| s.name.as_str()),
-                client = %client.ip,
-                peer = %conn.peer,
-                host = host.as_deref().unwrap_or("-"),
-                method = %method,
-                path = %uri_path,
-                protocol = if conn.http3 { "HTTP/3" } else { protocol_name(version) },
-                tls = client.https,
+            let record = crate::access::Record {
+                request_id: &id,
+                site: site.map_or("-", |s| s.name.as_str()),
+                client: client.ip,
+                peer: conn.peer,
+                host: host.as_deref().unwrap_or("-"),
+                method: method.as_str(),
+                path: &uri_path,
+                protocol: if conn.http3 {
+                    "HTTP/3"
+                } else {
+                    protocol_name(version)
+                },
+                tls: client.https,
                 status,
                 bytes,
-                kind = kind.as_str(),
-                encoding = resp.headers().get(header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()),
-                referer = referer.as_deref(),
-                user_agent = user_agent.as_deref(),
-                duration_ms = start.elapsed().as_secs_f64() * 1e3,
-            );
+                kind: kind.as_str(),
+                encoding: resp
+                    .headers()
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok()),
+                referer: referer.as_deref(),
+                user_agent: user_agent.as_deref(),
+                duration_ms: start.elapsed().as_secs_f64() * 1e3,
+            };
+            if tracing::enabled!(target: "nova::access", tracing::Level::INFO)
+                && !crate::access::write(&record)
+            {
+                tracing::info!(
+                    target: "nova::access",
+                    request_id = record.request_id,
+                    site = record.site,
+                    client = %record.client,
+                    peer = %record.peer,
+                    host = record.host,
+                    method = record.method,
+                    path = record.path,
+                    protocol = record.protocol,
+                    tls = record.tls,
+                    status = record.status,
+                    bytes = record.bytes,
+                    kind = record.kind,
+                    encoding = record.encoding,
+                    referer = record.referer,
+                    user_agent = record.user_agent,
+                    duration_ms = record.duration_ms,
+                );
+            }
         }
         resp
     }
