@@ -1,0 +1,40 @@
+{
+	auto_https off
+	admin off
+	frankenphp {
+		num_threads 16
+		worker {
+			file /srv/sites/laravel/public/frankenphp-worker.php
+			num 8
+		}
+		php_ini opcache.jit tracing
+		php_ini opcache.jit_buffer_size 64M
+		php_ini opcache.memory_consumption 128
+		php_ini opcache.interned_strings_buffer 16
+		php_ini opcache.max_accelerated_files 20000
+		php_ini opcache.validate_timestamps 1
+		php_ini opcache.revalidate_freq 2
+		php_ini realpath_cache_size 4096K
+		php_ini memory_limit 256M
+	}
+}
+wp.nova.test:443 {
+	tls /certs/cert.pem /certs/key.pem
+	root * /srv/sites/wordpress/public
+	encode zstd br gzip
+	php_server
+}
+laravel.nova.test:443 {
+	tls /certs/cert.pem /certs/key.pem
+	root * /srv/sites/laravel/public
+	encode zstd br gzip
+	php_server {
+		try_files {path} frankenphp-worker.php
+	}
+}
+static.test:443 {
+	tls /certs/cert.pem /certs/key.pem
+	root * /srv/sites/example/public
+	encode zstd br gzip
+	file_server
+}

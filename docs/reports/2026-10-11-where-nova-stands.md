@@ -20,6 +20,21 @@ interleaved rounds, medians (harness: `tests/compare/`).
 | Laravel `/up` (worker modes; nginx: FPM) | **5 917** | 1 100 | 4 622 |
 | Laravel welcome page (file sessions) | 692 | 311 | **703** |
 
+Over HTTPS, the way browsers connect (same setup, shared self-signed
+P-256 certificate for nginx and Caddy, `tests/compare/run-tls.sh`):
+
+| req/s | NOVA | nginx + PHP-FPM | FrankenPHP (Caddy) |
+|---|---:|---:|---:|
+| HTTP/2 small HTML | **87 993** | 59 912 | 21 499 |
+| HTTP/2 470 KB JPEG | **5 182** | 2 458 | 1 957 |
+| HTTP/2 WordPress | **129** | 109 | 107 |
+| HTTP/2 Laravel `/up` | **6 235** | 1 102 | 4 354 |
+| HTTP/3 small HTML | **70 200** | (failed) | 7 400 |
+| HTTP/3 WordPress | **133** | (failed) | 28 |
+
+nginx's HTTP/3 (1.27, `listen 443 quic`) reset its streams with
+`H3_INTERNAL_ERROR` in this setup, so it has no valid number.
+
 NOVA leads or ties everywhere: +77% over nginx on small pages (stored
 brotli/zstd vs gzip on the fly), WordPress +14% over both, Laravel +28%
 over FrankenPHP's worker mode and 5.4x nginx + FPM. With its micro-cache

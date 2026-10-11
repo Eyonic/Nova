@@ -13,8 +13,11 @@ Head-to-head on a real server (Unraid, Ryzen 9 5900X), next to NOVA's
 * 3 interleaved rounds, median reported.
 
     run.sh setup && run.sh check && run.sh bench html jpg wp up lhome; run.sh teardown
+    # HTTPS (HTTP/2, HTTP/3): certificate in certs/ (openssl, P-256), then
+    NGINXCONF=nginx-tls.conf CADDYFILE=Caddyfile-tls run.sh setup
+    run-tls.sh h2 html jpg wp up; run-tls.sh h3 html wp
 
-Results: `results-2026-10-11-unraid.txt`; summary in
+Results: `results-2026-10-11-unraid.txt` (HTTP/1.1), `results-2026-10-11-unraid-https.txt` (h2, h3); summary in
 docs/reports/2026-10-11-where-nova-stands.md. NOVA ran with
 `isolation.php_open_basedir = "never"`, what `auto` picks on hosts with
 Landlock or with one PHP site; with `open_basedir` (several PHP sites and

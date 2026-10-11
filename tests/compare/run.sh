@@ -6,7 +6,7 @@
 set -u
 B=/mnt/cache/appdata/nova-bench; SITES=/mnt/cache/appdata/nova-exp/sites; NET=nova-exp_default
 OHA=/mnt/user/appdata/nova-images/oha; CPUS=4-7; LOADCPUS=8-11,20-23
-eval "$(grep NOVA_DB_WP_PASSWORD /mnt/cache/appdata/nova-exp/.env)"   # the test stack's WordPress DB password
+eval "$(grep NOVA_DB_WP_PASSWORD /mnt/cache/appdata/nova-exp/.env)"
 S=/tmp/storage
 LENV=(-e APP_ENV=production -e APP_DEBUG=false -e APP_KEY=base64:QyPJje5vr6aGFmKvX7sWIpejADaMxhut+CCgdKZKqwk= -e APP_URL=http://laravel.nova.test
       -e SESSION_DRIVER=file -e CACHE_STORE=file -e LOG_CHANNEL=stderr -e DB_CONNECTION=sqlite -e LARAVEL_STORAGE_PATH=$S
@@ -20,8 +20,8 @@ setup() {
   docker run -d --name bench-php --network $NET --network-alias php --cpuset-cpus $CPUS \
     -v $SITES:/srv/sites:ro -v $B/${PHPINI:-php.ini}:/usr/local/etc/php/conf.d/zz-bench.ini:ro -v $B/fpm.conf:/usr/local/etc/php-fpm.conf:ro \
     "${WENV[@]}" "${LENV[@]}" --entrypoint sh localhost/nova:dnd3 -c "$MK && chown -R www-data $S && exec php-fpm -F -y /usr/local/etc/php-fpm.conf" >/dev/null
-  docker run -d --name bench-nginx --network $NET --cpuset-cpus $CPUS -v $SITES:/srv/sites:ro -v $B/nginx.conf:/etc/nginx/nginx.conf:ro nginx:alpine >/dev/null
-  docker run -d --name bench-fp --network $NET --cpuset-cpus $CPUS -v $SITES:/srv/sites:ro -v $B/Caddyfile:/etc/frankenphp/Caddyfile:ro \
+  docker run -d --name bench-nginx --network $NET --cpuset-cpus $CPUS -v $SITES:/srv/sites:ro -v $B/${NGINXCONF:-nginx.conf}:/etc/nginx/nginx.conf:ro -v $B/certs:/certs:ro nginx:alpine >/dev/null
+  docker run -d --name bench-fp --network $NET --cpuset-cpus $CPUS -v $SITES:/srv/sites:ro -v $B/${CADDYFILE:-Caddyfile}:/etc/frankenphp/Caddyfile:ro -v $B/certs:/certs:ro \
     "${WENV[@]}" "${LENV[@]}" -e LARAVEL_OCTANE=1 -e APP_BASE_PATH=/srv/sites/laravel -e MAX_REQUESTS=100000000 \
     --entrypoint sh localhost/frankenphp:bench -c "$MK && exec frankenphp run --config /etc/frankenphp/Caddyfile" >/dev/null
   docker update --cpuset-cpus $CPUS nova-exp-nova-1 >/dev/null
