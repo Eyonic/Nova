@@ -534,11 +534,11 @@ refreshes always see new data. Responses carry `nova-cache: hit` (with
 `Age`) or `miss`. Cache-eligible misses are buffered before sending; pages
 that stream output with `flush()` should send `Cache-Control: no-store`.
 
-## Automatic image markup (`html_rewrite`, experimental)
+## Automatic image markup (`html_rewrite`, on by default)
 
 ```toml
 [[site]]
-html_rewrite = true      # default false
+html_rewrite = false     # opt out (default true)
 ```
 
 HTML responses NOVA sends uncompressed (PHP output, plain static HTML) are
@@ -547,8 +547,11 @@ markup does not set it already: `loading="lazy"` after the first two
 images, `decoding="async"`, `fetchpriority="high"` on the first image,
 `width`/`height` from the Optimizer (no layout shift) and a `srcset` over
 the Optimizer's responsive widths (`sizes="auto, 100vw"` for lazy images).
-`data-nova-keep` leaves an image alone. Precompressed static HTML is not
-rewritten yet (that belongs in the Optimizer pipeline).
+`data-nova-keep` leaves an image alone. Sites the Optimizer has no images
+for are not parsed at all; on a 70 KB page with images the rewriter costs
+no measurable CPU (lol_html streams it). Static HTML of such sites is
+rewritten and then compressed per response, instead of being served from
+the Optimizer's precompressed copies (which predate the rewrite).
 
 Measured on a naive 12-image gallery (Chromium, Fast 4G): load 1.2 s ->
 0.37 s, phone LCP 0.72 s -> 0.35 s, desktop CLS 0.24-0.27 -> 0, image

@@ -11,6 +11,23 @@ use std::time::{Duration, Instant, SystemTime};
 /// `Cache-Control` for content that never changes under its URL.
 pub const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
+/// Images, fonts, audio and video without a cache rule: reused for an
+/// hour, then refreshed in the background for up to a day (what a CDN
+/// would do). They are rarely replaced in place, and when they are, a
+/// visitor sees the new file within the hour; pages, scripts and styles
+/// keep revalidating on every use.
+pub const MEDIA: &str = "public, max-age=3600, stale-while-revalidate=86400";
+
+const MEDIA_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "webp", "avif", "svg", "ico", "bmp", "woff", "woff2", "ttf",
+    "otf", "eot", "mp4", "webm", "ogg", "ogv", "mp3", "wav", "m4a", "flac",
+];
+
+fn is_media(rel: &str) -> bool {
+    rel.rsplit_once('.')
+        .is_some_and(|(_, ext)| MEDIA_EXTENSIONS.iter().any(|m| ext.eq_ignore_ascii_case(m)))
+}
+
 pub struct SiteRules {
     pub cache: CachePolicy,
     pub headers: Vec<(HeaderName, HeaderValue)>,
@@ -162,6 +179,8 @@ impl CachePolicy {
             "no-cache".into()
         } else if self.max_age > 0 {
             format!("public, max-age={}", self.max_age)
+        } else if is_media(rel) {
+            MEDIA.to_string()
         } else {
             "public, max-age=0, must-revalidate".into()
         }
@@ -461,6 +480,12 @@ mod tests {
             "public, max-age=0, must-revalidate"
         );
         assert_eq!(p.cache_control("index.html", None, true), "no-cache");
+        assert_eq!(p.cache_control("img/a.JPG", None, false), MEDIA);
+        assert_eq!(p.cache_control("img/a.JPG", None, true), "no-cache");
+        assert_eq!(
+            p.cache_control("app.js", None, false),
+            "public, max-age=0, must-revalidate"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

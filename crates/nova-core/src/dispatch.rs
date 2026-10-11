@@ -259,7 +259,7 @@ impl nova_http::Handler for App {
             resp.headers_mut().insert(header::ALT_SVC, v);
         }
         if let Some(site) = site
-            && (site.html_rewrite || site.speculation_rules)
+            && (site.speculation_rules || (site.html_rewrite && self.has_images(site)))
             && method == Method::GET
             && resp.status() == StatusCode::OK
             && !resp.headers().contains_key(header::CONTENT_ENCODING)
@@ -808,7 +808,15 @@ impl App {
         }
 
         // Script Optimizer output: minified and precompressed in the background.
+        // HTML that the image rewriter changes is rewritten and compressed
+        // per response instead (the stored copies predate the rewrite).
+        let rewritten = (site.speculation_rules || (site.html_rewrite && self.has_images(site)))
+            && file
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"));
         if site.optimize
+            && !rewritten
             && !rel.is_empty()
             && !req.headers().contains_key(header::RANGE)
             && let Some(opt) = &self.optimizer
@@ -1392,6 +1400,15 @@ impl App {
         *resp.status_mut() = r.status;
         *resp.headers_mut() = headers;
         resp
+    }
+
+    /// The Optimizer has images of this site (else the `<img>` rewriter
+    /// has nothing to add and the page is not parsed at all).
+    fn has_images(&self, site: &Site) -> bool {
+        self.optimizer
+            .as_ref()
+            .and_then(|o| o.manifest(&site.name))
+            .is_some_and(|m| !m.assets.is_empty())
     }
 
     /// `html_rewrite`: stream the page through the `<img>` rewriter with the

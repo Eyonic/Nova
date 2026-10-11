@@ -1,4 +1,4 @@
-//! Streaming HTML rewriting for `<img>` (prototype, `html_rewrite = true`).
+//! Streaming HTML rewriting for `<img>` (`html_rewrite`, on by default).
 //!
 //! Adds what a hand-tuned page would have, and only where the developer
 //! did not set it already (their markup always wins):

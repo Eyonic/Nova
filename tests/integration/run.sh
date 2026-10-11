@@ -84,7 +84,7 @@ H=$(curl -s -o /dev/null -D - -H 'Accept-Encoding: br, gzip' "$BASE/" | tr -d '\
 has "static HTML compressed with brotli" "$H" "content-encoding: br"
 has "compressed response varies on Accept-Encoding" "$H" "vary: Accept-Encoding"
 hasnt "on-the-fly compression drops the identity length" "$(curl -s -o /dev/null -D - -H 'Accept-Encoding: br' "$BASE/info.php" | tr -d '\r')" "content-length:"
-eq "stored encoding carries its exact length" "$(curl -s -o /dev/null -w '%header{content-length}' -H 'Accept-Encoding: br' "$BASE/")" "$(curl -s -o /dev/null -w '%{size_download}' -H 'Accept-Encoding: br' "$BASE/")"
+eq "stored encoding carries its exact length" "$(curl -s -o /dev/null -w '%header{content-length}' -H 'Accept-Encoding: br' "$BASE/js/cart.js")" "$(curl -s -o /dev/null -w '%{size_download}' -H 'Accept-Encoding: br' "$BASE/js/cart.js")"
 eq "gzip body decodes to the original" "$(curl -s --compressed -H 'Accept-Encoding: gzip' "$BASE/" | md5sum)" "$(curl -s "$BASE/" | md5sum)"
 hasnt "identity when the client asks for nothing" "$(curl -sI "$BASE/" | tr -d '\r')" "content-encoding"
 hasnt "images are not recompressed" "$(curl -s -o /dev/null -D - -H 'Accept-Encoding: br' "$BASE/images/hero.jpg" | tr -d '\r')" "content-encoding"
@@ -95,6 +95,7 @@ section "Caching"
 eq "fingerprinted bundle (Vite manifest) is immutable" \
   "$(curl -s -o /dev/null -w '%header{cache-control}' "$BASE/build/assets/app-Bx7Kq2Lm.js")" "public, max-age=31536000, immutable"
 eq "other files revalidate" "$(curl -s -o /dev/null -w '%header{cache-control}' "$BASE/index.html")" "public, max-age=0, must-revalidate"
+eq "images cached like a CDN" "$(curl -s -o /dev/null -w '%header{cache-control}' "$BASE/images/hero.jpg")" "public, max-age=3600, stale-while-revalidate=86400"
 H=$(curl -s -D - -o "$WORK/bundle" -H 'Accept-Encoding: gzip' "$BASE/build/assets/app-Bx7Kq2Lm.js" | tr -d '\r')
 has "precompressed sibling served" "$H" "content-encoding: gzip"
 eq "precompressed body is the .gz file" "$(md5sum < "$WORK/bundle")" "$(md5sum < sites/example/public/build/assets/app-Bx7Kq2Lm.js.gz)"
@@ -230,6 +231,9 @@ check "AVIF smaller than original ($SIZE < $ORIG)" [ "$SIZE" -lt "$ORIG" ]
 eq "WebP negotiated" "$(curl -s -o /dev/null -H 'Accept: image/webp' -w '%{content_type}' "$BASE/images/hero.jpg")" image/webp
 eq "legacy client gets original" "$(curl -s -o /dev/null -H 'Accept: */*' -w '%{size_download}' "$BASE/images/hero.jpg")" "$ORIG"
 has "Vary: Accept" "$(curl -sI -H 'Accept: image/avif' "$BASE/images/hero.jpg" | tr -d '\r')" "vary: Accept"
+PAGE=$(curl -s --compressed -H 'Accept-Encoding: br, gzip' "$BASE/")
+has "image markup added by default (first image high priority)" "$PAGE" 'fetchpriority="high"'
+has "developer srcset kept" "$PAGE" 'srcset="/images/hero.jpg?w=640 640w'
 read -r CT640 S640 < <(curl -s -o /dev/null -H 'Accept: image/webp' -w '%{content_type} %{size_download}' "$BASE/images/hero.jpg?w=600")
 eq "responsive variant format" "$CT640" image/webp
 curl -s -H 'Accept: image/webp' -o "$WORK/v.webp" "$BASE/images/hero.jpg?w=600"

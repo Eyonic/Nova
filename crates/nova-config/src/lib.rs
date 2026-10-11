@@ -583,7 +583,9 @@ pub struct SiteConfig {
     pub optimize: bool,
     /// Rewrite `<img>` in HTML responses: lazy loading, decoding, priority,
     /// dimensions and srcset from the Optimizer (never overriding markup).
-    #[serde(default)]
+    /// On by default; pages of sites without optimized images pass through
+    /// untouched.
+    #[serde(default = "default_true")]
     pub html_rewrite: bool,
     /// Add Speculation Rules (prefetch same-site links before the click)
     /// to HTML pages, unless the page has its own.
