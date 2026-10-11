@@ -69,15 +69,24 @@ welcome page went from 1 030 to 4 700 req/s under Chrome's header.
 | AVIF/WebP + responsive images | yes (automatic) | no | no | no | no | via its WordPress plugin + QUIC.cloud |
 | Live partial page updates | yes (NOVA Live) | no | no | Mercure (separate) | no | no |
 | Cron tasks + queue workers supervised | yes | no | no | no | jobs plugin | no |
+| Load balancing + health checks | yes (least_conn/round_robin, passive + active, safe retry) | yes | yes | via Caddy | n/a | yes |
+| OpenTelemetry tracing (incl. PHP child spans) | yes (OTLP/HTTP, W3C trace context) | module | yes | via Caddy | yes | not checked |
+| ACME DNS-01 / wildcard certificates | yes (Cloudflare, any DNS via hook) | no (external tools) | yes (DNS plugins) | via Caddy | n/a | not checked |
+| Request inspection (WAF) | yes (libinjection + rules, detect/block) | ModSecurity module | Coraza plugin | via Caddy | no | ModSecurity |
+
+Added after this report's first version (same day): load balancing,
+OpenTelemetry tracing, ACME DNS-01 with wildcard certificates and
+wildcard site hosts, and the WAF; see experiments #29-#34.
 
 ## 5. Where others still lead
 
 * **FrankenPHP**: 8-25% more Laravel throughput (in-process PHP; see §2).
 * **nginx / H2O**: a few percent on plain static files over loopback; zero
   copy for files served from memory on loopback.
-* **Features**: DNS-01 / wildcard certificates, load balancing and health
-  checks across several upstreams, OpenTelemetry tracing, WAF integration,
-  dynamic configuration APIs.
+* **Features**: the full OWASP Core Rule Set (NOVA's WAF is a smaller,
+  faster rule set; the pure-Rust CRS engine we evaluated was not ready),
+  DNS providers beyond Cloudflare without a hook script, a dynamic
+  configuration API (NOVA reloads its file on SIGHUP).
 * **Maturity**: decades of production use, fuzzing, packaging.
 
 ## Method notes
