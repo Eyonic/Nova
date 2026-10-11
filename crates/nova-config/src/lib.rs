@@ -10,7 +10,7 @@ pub mod cron;
 pub mod http;
 
 pub use http::{
-    AcmeChallenge, Balance, CacheRule, CertFiles, Cidr, DnsProvider, ForwardedHeader,
+    AcmeChallenge, AuthRequest, Balance, CacheRule, CertFiles, Cidr, DnsProvider, ForwardedHeader,
     RateLimitConfig, Redirect, SiteAuth, SiteCache, SiteProxy, TlsConfig, glob_match,
 };
 use serde::{Deserialize, Serialize};
@@ -631,6 +631,10 @@ pub struct SiteConfig {
     /// Reverse proxy to an application server.
     #[serde(default)]
     pub proxy: Option<SiteProxy>,
+    /// Ask an external service before serving (SSO such as Authelia or
+    /// oauth2-proxy, or a full OWASP CRS WAF).
+    #[serde(default)]
+    pub auth_request: Option<AuthRequest>,
     /// Commands run on a cron schedule (e.g. `php artisan schedule:run`).
     #[serde(default, rename = "task")]
     pub tasks: Vec<SiteTask>,

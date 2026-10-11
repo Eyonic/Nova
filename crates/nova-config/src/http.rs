@@ -362,6 +362,51 @@ fn default_redirect_status() -> u16 {
     301
 }
 
+/// `[site.auth_request]`: external authorization, nginx `auth_request` /
+/// Traefik `forwardAuth` style. A 2xx answer lets the request through;
+/// 401, 403 and redirects go back to the client; anything else (or no
+/// answer) is a 502 (fail closed).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthRequest {
+    /// `http://host:port/path`; `{uri}` is replaced by the original path and
+    /// query (e.g. `http://modsec:8080{uri}` to let a WAF see the request).
+    pub url: String,
+    /// Path globs that need the check (default: everything).
+    #[serde(default = "default_proxy_paths")]
+    pub paths: Vec<String>,
+    /// Send the original method and (urlencoded/JSON, up to 256 KiB) body,
+    /// as a WAF needs; otherwise a body-less GET, as SSO services expect.
+    #[serde(default)]
+    pub forward_body: bool,
+    /// Headers of the auth answer copied into the request for the
+    /// application (e.g. `Remote-User`, `Remote-Groups`).
+    #[serde(default)]
+    pub pass_headers: Vec<String>,
+    #[serde(default = "default_auth_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_auth_timeout() -> u64 {
+    5
+}
+
+impl AuthRequest {
+    /// `(host, port)` of the service; only `http://`.
+    pub fn addr(&self) -> Result<(String, u16), String> {
+        let rest = self
+            .url
+            .strip_prefix("http://")
+            .ok_or_else(|| format!("auth_request url {:?} must start with http://", self.url))?;
+        let authority = rest.split(['/', '{']).next().unwrap_or("");
+        parse_upstream(&format!("http://{authority}"))
+    }
+
+    pub fn matches(&self, path: &str) -> bool {
+        self.paths.iter().any(|g| glob_match(g, path))
+    }
+}
+
 /// `[site.auth]`: HTTP basic authentication (staging sites, admin areas).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -463,6 +508,21 @@ pub(crate) fn validate_site(site: &crate::SiteConfig, errs: &mut Vec<String>) {
         }
         if p.timeout_secs == 0 {
             errs.push(format!("site {n:?}: [site.proxy] timeout_secs must be > 0"));
+        }
+    }
+    if let Some(a) = &site.auth_request {
+        if let Err(e) = a.addr() {
+            errs.push(format!("site {n:?}: [site.auth_request] {e}"));
+        }
+        if a.pass_headers.iter().any(|h| {
+            h.is_empty()
+                || !h
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        }) {
+            errs.push(format!(
+                "site {n:?}: [site.auth_request] invalid pass_headers entry"
+            ));
         }
     }
     if let Some(a) = &site.auth {

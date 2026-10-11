@@ -191,6 +191,12 @@ pub fn worker_sandbox(cfg: &Config, config_path: &std::path::Path) -> Sandbox {
             .flatten()
             .map(|(_, port)| port),
     );
+    connect.extend(
+        cfg.sites
+            .iter()
+            .filter_map(|s| s.auth_request.as_ref()?.addr().ok())
+            .map(|(_, port)| port),
+    );
     if let Some(Ok((_, port))) = cfg.telemetry.collector_addr() {
         connect.push(port);
     }

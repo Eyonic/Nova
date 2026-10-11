@@ -430,6 +430,14 @@ impl App {
     }
 }
 
+fn request_host_of(parts: &http::request::Parts) -> Option<&str> {
+    parts
+        .headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| parts.uri.authority().map(|a| a.as_str()))
+}
+
 /// `Host` (HTTP/1.1) or `:authority` (HTTP/2, HTTP/3).
 fn request_host<B>(req: &Request<B>) -> Option<&str> {
     req.headers()
@@ -656,6 +664,19 @@ impl App {
                         Kind::Error,
                         name,
                     );
+                }
+            }
+        }
+
+        if let Some(ar) = site.auth_request.as_ref() {
+            // Never trust identity headers from the client.
+            for h in &ar.pass_headers {
+                req.headers_mut().remove(h.as_str());
+            }
+            if ar.matches(req.uri().path()) {
+                match self.auth_request(ar, req, client).await {
+                    Ok(r) => req = r,
+                    Err(resp) => return (resp, Kind::Error, name),
                 }
             }
         }
@@ -1792,6 +1813,163 @@ impl App {
         (ok, serde_json::Value::Object(checks))
     }
 
+    /// `[site.auth_request]`: ask the service; `Ok` returns the request
+    /// (with `pass_headers` added), `Err` the response for the client.
+    #[allow(clippy::result_large_err)]
+    async fn auth_request(
+        &self,
+        ar: &nova_config::AuthRequest,
+        req: Request<ReqBody>,
+        client: Client,
+    ) -> Result<Request<ReqBody>, Response<Body>> {
+        let (mut parts, body) = req.into_parts();
+        let pq = parts
+            .uri
+            .path_and_query()
+            .map_or("/", |p| p.as_str())
+            .to_string();
+        // Small form/JSON bodies go along when asked (a WAF needs them).
+        let mut body: ReqBody = body;
+        let mut copy = None;
+        if ar.forward_body
+            && parts
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::waf::body_kind)
+                .is_some()
+            && parts
+                .headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<usize>().ok())
+                .is_some_and(|l| l <= crate::waf::MAX_BODY)
+        {
+            let bytes = match tokio::time::timeout(self.http.body_timeout, body.collect()).await {
+                Ok(Ok(c)) => c.to_bytes(),
+                _ => {
+                    return Err(self.error(
+                        StatusCode::BAD_REQUEST,
+                        "Could not read request body.",
+                        None,
+                    ));
+                }
+            };
+            copy = Some(bytes.clone());
+            body = http_body_util::Full::new(bytes)
+                .map_err(|never| match never {})
+                .boxed();
+        }
+        let mut check = Request::new(match &copy {
+            Some(b) => http_body_util::Full::new(b.clone())
+                .map_err(|never| match never {})
+                .boxed(),
+            None => http_body_util::Empty::new()
+                .map_err(|never| match never {})
+                .boxed(),
+        });
+        *check.method_mut() = if ar.forward_body {
+            parts.method.clone()
+        } else {
+            Method::GET
+        };
+        let Ok(uri) = ar.url.replace("{uri}", &pq).parse::<http::Uri>() else {
+            return Err(self.error(StatusCode::BAD_GATEWAY, "Invalid auth_request url.", None));
+        };
+        *check.uri_mut() = uri;
+        let h = check.headers_mut();
+        for (k, v) in &parts.headers {
+            if !matches!(
+                k.as_str(),
+                "host"
+                    | "connection"
+                    | "keep-alive"
+                    | "transfer-encoding"
+                    | "te"
+                    | "upgrade"
+                    | "proxy-connection"
+                    | "expect"
+            ) && (copy.is_some() || k != header::CONTENT_LENGTH)
+            {
+                h.append(k.clone(), v.clone());
+            }
+        }
+        let host = request_host_of(&parts).unwrap_or("").to_string();
+        let scheme = if client.https { "https" } else { "http" };
+        for (k, v) in [
+            ("x-forwarded-method", parts.method.as_str().to_string()),
+            ("x-forwarded-proto", scheme.to_string()),
+            ("x-forwarded-host", host.clone()),
+            ("x-forwarded-uri", pq.clone()),
+            ("x-forwarded-for", client.ip.to_string()),
+            ("x-real-ip", client.ip.to_string()),
+            ("x-original-uri", pq.clone()),
+            ("x-original-method", parts.method.as_str().to_string()),
+            ("x-original-url", format!("{scheme}://{host}{pq}")),
+        ] {
+            if let Ok(v) = HeaderValue::from_str(&v) {
+                h.insert(http::HeaderName::from_static(k), v);
+            }
+        }
+        let timeout = Duration::from_secs(ar.timeout_secs.max(1));
+        let resp = match tokio::time::timeout(timeout, self.upstream.request(check)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!(url = ar.url, error = %e, "auth_request service unreachable");
+                return Err(self.error(
+                    StatusCode::BAD_GATEWAY,
+                    "Authorization service unavailable.",
+                    None,
+                ));
+            }
+            Err(_) => {
+                return Err(self.error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Authorization service timed out.",
+                    None,
+                ));
+            }
+        };
+        let status = resp.status();
+        if status.is_success() {
+            for name in &ar.pass_headers {
+                for v in resp.headers().get_all(name.as_str()) {
+                    if let Ok(n) = http::HeaderName::from_bytes(name.as_bytes()) {
+                        parts.headers.append(n, v.clone());
+                    }
+                }
+            }
+            return Ok(Request::from_parts(parts, body));
+        }
+        if status == StatusCode::UNAUTHORIZED
+            || status == StatusCode::FORBIDDEN
+            || status.is_redirection()
+        {
+            // The service's answer (login redirect, challenge, block page).
+            let (rparts, rbody) = resp.into_parts();
+            let mut out = Response::new(rbody.map_err(std::io::Error::other).boxed_unsync());
+            *out.status_mut() = rparts.status;
+            for k in [
+                header::LOCATION,
+                header::WWW_AUTHENTICATE,
+                header::SET_COOKIE,
+                header::CONTENT_TYPE,
+                header::CACHE_CONTROL,
+            ] {
+                for v in rparts.headers.get_all(&k) {
+                    out.headers_mut().append(k.clone(), v.clone());
+                }
+            }
+            return Err(out);
+        }
+        tracing::warn!(url = ar.url, %status, "auth_request: unexpected answer; denying");
+        Err(self.error(
+            StatusCode::BAD_GATEWAY,
+            "Authorization service error.",
+            None,
+        ))
+    }
+
     pub(crate) fn not_found(&self) -> Response<Body> {
         self.error(
             StatusCode::NOT_FOUND,
@@ -2143,6 +2321,7 @@ mod tests {
             }),
             proxy: None,
             balancer: None,
+            auth_request: None,
             optimize: false,
             html_rewrite: false,
             speculation_rules: false,

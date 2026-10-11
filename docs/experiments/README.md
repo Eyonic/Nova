@@ -52,6 +52,7 @@ clearly better (or a deliberate trade-off). Stable baseline: tag
 | 36 | sendfile(2) from 256 KiB instead of copying cached files (the 470 KB JPEG gap to nginx) | nginx's zero-copy; loopback benchmark 42% of nginx | local loopback x2, Unraid via Docker port mapping x3 | loopback 20,000 -> 39,400 req/s; Unraid 18,800 -> 15,000 (-20%): through a bridge/veth the copy from memory wins | rejected (the gap only exists on loopback) |
 | 37 | Admin API (status, effective config, validate, reload via a supervisor control pipe, purge) | report gap "dynamic configuration API" | integration (+10 checks) | reload over the API swaps workers like SIGHUP; CSRF guard (X-Nova-Admin) and optional bearer token | kept |
 | 38 | RFC 2136 + TSIG DNS-01 provider (native, no hook) | report gap "DNS providers beyond Cloudflare" | unit (RFC 4231 HMAC vector, message layout), BIND 9.20 + Pebble end to end | wildcard certificate issued in 2 s through signed dynamic updates | kept |
+| 39 | External authorization (`[site.auth_request]`, nginx auth_request / Traefik forwardAuth style) | report gaps "full OWASP CRS" and SSO; #32 showed no Rust CRS engine is ready, the official ModSecurity image is | owasp/modsecurity-crs:nginx and a test SSO service, end to end | CRS: benign GET/form pass (body still reaches PHP), 6/6 attacks 403; SSO: login redirect, identity header passed, forged header dropped | kept |
 
 Considered and skipped in an earlier round (since done as #28): `Link: rel=preload` hints without 103
 Early Hints (hyper cannot send 1xx; the browser's preload scanner already

@@ -235,7 +235,37 @@ found. Cost: within noise of the benchmarks (a few microseconds per
 parameter). This is not the OWASP Core Rule Set: a full CRS engine in
 Rust was evaluated (zentinel-modsec 0.4) and rejected (missed
 `1' OR '1'='1`, blocked a WordPress REST call, 1.6 ms per request). Start
-with `detect`, read the log, then switch to `block`.
+with `detect`, read the log, then switch to `block`. For the complete
+OWASP Core Rule Set, put the official ModSecurity image behind
+`[site.auth_request]` (next section).
+
+## External authorization (`[site.auth_request]`): SSO and the full OWASP CRS
+
+```toml
+# Single sign-on in front of any site (Authelia, Authentik, oauth2-proxy...)
+[site.auth_request]
+url = "http://authelia:9091/api/authz/forward-auth"
+pass_headers = ["Remote-User", "Remote-Groups", "Remote-Email"]
+
+# Or the full OWASP Core Rule Set: the official ModSecurity image as judge
+# (docker run -e BACKEND=http://ok-responder owasp/modsecurity-crs:nginx)
+[site.auth_request]
+url = "http://modsec:8080{uri}"      # {uri}: the original path and query
+forward_body = true                  # original method + form/JSON body (<= 256 KiB)
+```
+
+Before a matching request (`paths`, default all) is served, NOVA asks the
+service with the client's headers plus `X-Forwarded-Method/-Proto/-Host/-Uri/-For`
+and `X-Original-URI/-Method/-URL`. 2xx lets it through, with the
+`pass_headers` of the answer added (and always removed from what the
+client sent, so `Remote-User` cannot be forged); 401, 403 and redirects go
+back to the client as the service sent them (login pages, block pages);
+anything else is a 502 (fail closed). Verified end to end: with
+`owasp/modsecurity-crs:nginx` normal requests and form posts pass (the
+application still gets the body) and SQL injection in query and form,
+XSS, traversal, command injection and sqlmap get 403; with an SSO
+service, no session redirects to the login, a session reaches PHP as
+`HTTP_REMOTE_USER`, a forged header is dropped.
 
 ## Per-site rules
 

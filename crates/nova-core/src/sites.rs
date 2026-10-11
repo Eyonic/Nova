@@ -15,6 +15,7 @@ pub struct Site {
     pub php: Option<SitePhp>,
     /// `[site.proxy]`: application server behind this site.
     pub proxy: Option<nova_config::SiteProxy>,
+    pub auth_request: Option<nova_config::AuthRequest>,
     /// The proxy's upstreams and their health.
     pub balancer: Option<std::sync::Arc<crate::upstream::Balancer>>,
     pub optimize: bool,
@@ -113,6 +114,7 @@ impl Sites {
                 project_dir,
                 php,
                 proxy: s.proxy.clone(),
+                auth_request: s.auth_request.clone(),
                 balancer: s
                     .proxy
                     .as_ref()
