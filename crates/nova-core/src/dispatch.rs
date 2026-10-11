@@ -260,6 +260,7 @@ impl nova_http::Handler for App {
         }
         if let Some(site) = site
             && (site.speculation_rules || (site.html_rewrite && self.has_images(site)))
+            && resp.extensions().get::<RewrittenHtml>().is_none()
             && method == Method::GET
             && resp.status() == StatusCode::OK
             && !resp.headers().contains_key(header::CONTENT_ENCODING)
@@ -815,6 +816,13 @@ impl App {
                 .extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"));
+        if rewritten
+            && meta.len() <= REWRITE_CACHE_MAX_FILE
+            && !req.headers().contains_key(header::RANGE)
+            && let Some(resp) = self.rewritten_html(site, req, file, meta, cache).await
+        {
+            return (resp, Kind::Static);
+        }
         if site.optimize
             && !rewritten
             && !rel.is_empty()
@@ -1414,23 +1422,7 @@ impl App {
     /// `html_rewrite`: stream the page through the `<img>` rewriter with the
     /// site's image metadata from the Optimizer.
     fn rewrite_html(&self, site: &Site, resp: Response<Body>, path: &str) -> Response<Body> {
-        let manifest = self.optimizer.as_ref().and_then(|o| o.manifest(&site.name));
-        let lookup = move |p: &str| {
-            let asset = manifest.as_ref()?.assets.get(p.trim_start_matches('/'))?;
-            let mut widths: Vec<u32> = asset
-                .variants
-                .iter()
-                .map(|v| v.width)
-                .filter(|w| *w < asset.source.width)
-                .collect();
-            widths.sort_unstable();
-            widths.dedup();
-            Some(crate::htmlrewrite::ImageInfo {
-                width: asset.source.width,
-                height: asset.source.height,
-                widths,
-            })
-        };
+        let lookup = self.image_lookup(site);
         let (mut parts, body) = resp.into_parts();
         // The body changes: its length and strong validator no longer apply.
         parts.headers.remove(header::CONTENT_LENGTH);
@@ -1450,6 +1442,166 @@ impl App {
         };
         let body = crate::htmlrewrite::rewrite(body, path.to_string(), opts, lookup);
         Response::from_parts(parts, body)
+    }
+
+    /// Static HTML through the rewriter, compressed for the client: built
+    /// once per (file version, Optimizer manifest, encoding) and then served
+    /// from memory with a strong ETag, as cheaply as the stored copies.
+    async fn rewritten_html(
+        &self,
+        site: &Site,
+        req: &Request<ReqBody>,
+        file: &Path,
+        meta: &Metadata,
+        cache_control: &str,
+    ) -> Option<Response<Body>> {
+        use std::hash::{Hash, Hasher};
+        let generation = self
+            .optimizer
+            .as_ref()
+            .and_then(|o| o.manifest(&site.name))
+            .map_or(0, |m| m.generated_at);
+        let encoding = if self.compression.is_some() {
+            compress::accepted(
+                req.headers()
+                    .get(header::ACCEPT_ENCODING)
+                    .and_then(|v| v.to_str().ok()),
+            )
+            .first()
+            .copied()
+        } else {
+            None
+        };
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        let key = (
+            file.to_path_buf(),
+            mtime,
+            meta.len(),
+            generation,
+            encoding.map_or("identity", |e| e.token()),
+            site.html_rewrite,
+            site.speculation_rules,
+        );
+        let hit = REWRITE_CACHE.lock().unwrap().get(&key).cloned();
+        let (body, etag) = match hit {
+            Some(e) => e,
+            None => {
+                let raw = tokio::fs::read(file).await.ok()?;
+                let page_path = req.uri().path().to_string();
+                let opts = crate::htmlrewrite::Options {
+                    images: site.html_rewrite,
+                    speculation: site.speculation_rules,
+                };
+                let rewritten = crate::htmlrewrite::rewrite(
+                    full(Bytes::from(raw)),
+                    page_path,
+                    opts,
+                    self.image_lookup(site),
+                )
+                .collect()
+                .await
+                .ok()?
+                .to_bytes();
+                let body = match encoding {
+                    Some(enc) => {
+                        let enc = match enc {
+                            Encoding::Brotli => nova_optimize::text::Encoding::Br,
+                            Encoding::Zstd => nova_optimize::text::Encoding::Zstd,
+                            Encoding::Gzip => nova_optimize::text::Encoding::Gzip,
+                        };
+                        let input = rewritten.clone();
+                        tokio::task::spawn_blocking(move || {
+                            nova_optimize::text::compress(&input, enc)
+                        })
+                        .await
+                        .ok()?
+                        .ok()
+                        .map(Bytes::from)?
+                    }
+                    None => rewritten,
+                };
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                body.hash(&mut h);
+                let etag = HeaderValue::from_str(&format!("\"rw-{:016x}\"", h.finish())).ok()?;
+                let mut cache = REWRITE_CACHE.lock().unwrap();
+                let size: usize = cache.values().map(|(b, _)| b.len()).sum();
+                if cache.len() >= REWRITE_CACHE_ENTRIES || size + body.len() > REWRITE_CACHE_BYTES {
+                    cache.clear();
+                }
+                cache.insert(key, (body.clone(), etag.clone()));
+                (body, etag)
+            }
+        };
+        let fresh = req
+            .headers()
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.split(',')
+                    .any(|t| t.trim().trim_start_matches("W/") == etag)
+            });
+        let mut resp = if fresh {
+            let mut r = Response::new(empty());
+            *r.status_mut() = StatusCode::NOT_MODIFIED;
+            r
+        } else {
+            let len = body.len();
+            let mut r = Response::new(if req.method() == Method::HEAD {
+                empty()
+            } else {
+                full(body)
+            });
+            r.headers_mut()
+                .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+            r
+        };
+        let h = resp.headers_mut();
+        h.insert(header::ETAG, etag);
+        if let Ok(v) = HeaderValue::from_str(cache_control) {
+            h.insert(header::CACHE_CONTROL, v);
+        }
+        if let Ok(v) = HeaderValue::from_str(&static_files::guess_mime(file)) {
+            h.insert(header::CONTENT_TYPE, v);
+        }
+        if let Some(enc) = encoding {
+            h.insert(
+                header::CONTENT_ENCODING,
+                HeaderValue::from_static(enc.token()),
+            );
+        }
+        if self.compression.is_some() {
+            compress::add_vary(h, "Accept-Encoding");
+        }
+        resp.extensions_mut().insert(RewrittenHtml);
+        Some(resp)
+    }
+
+    /// The Optimizer's metadata of a site's images, for the `<img>` rewriter.
+    fn image_lookup(
+        &self,
+        site: &Site,
+    ) -> impl Fn(&str) -> Option<crate::htmlrewrite::ImageInfo> + Send + 'static + use<> {
+        let manifest = self.optimizer.as_ref().and_then(|o| o.manifest(&site.name));
+        move |p: &str| {
+            let asset = manifest.as_ref()?.assets.get(p.trim_start_matches('/'))?;
+            let mut widths: Vec<u32> = asset
+                .variants
+                .iter()
+                .map(|v| v.width)
+                .filter(|w| *w < asset.source.width)
+                .collect();
+            widths.sort_unstable();
+            widths.dedup();
+            Some(crate::htmlrewrite::ImageInfo {
+                width: asset.source.width,
+                height: asset.source.height,
+                widths,
+            })
+        }
     }
 
     /// Compression dictionaries for an immutable, fingerprinted JS/CSS
@@ -2137,6 +2289,20 @@ enum Probe {
 /// stat/readlink syscalls, which are slow on FUSE filesystems such as
 /// Unraid's /mnt/user. Entries live [`PROBE_TTL`]; missing paths are never
 /// cached, so new files appear immediately.
+/// Rewritten static HTML, by (file, mtime, length, manifest generation,
+/// encoding, rewrite options): body and ETag.
+type RewriteKey = (PathBuf, u128, u64, u64, &'static str, bool, bool);
+static REWRITE_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<RewriteKey, (Bytes, HeaderValue)>>,
+> = std::sync::LazyLock::new(Default::default);
+const REWRITE_CACHE_ENTRIES: usize = 512;
+const REWRITE_CACHE_BYTES: usize = 64 << 20;
+const REWRITE_CACHE_MAX_FILE: u64 = 2 << 20;
+
+/// Marks a response whose HTML was already rewritten (and compressed).
+#[derive(Clone, Copy)]
+struct RewrittenHtml;
+
 static PROBE_CACHE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<PathBuf, (Probe, Instant)>>,
 > = std::sync::LazyLock::new(Default::default);

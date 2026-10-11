@@ -219,7 +219,7 @@ pub fn minify_css(text: &str) -> Result<String, String> {
 /// percent less savings.
 const MAX_EFFORT_BYTES: usize = 512 << 10;
 
-fn compress(data: &[u8], enc: Encoding) -> std::io::Result<Vec<u8>> {
+pub fn compress(data: &[u8], enc: Encoding) -> std::io::Result<Vec<u8>> {
     let max = data.len() <= MAX_EFFORT_BYTES;
     match enc {
         Encoding::Br => {

@@ -234,6 +234,10 @@ has "Vary: Accept" "$(curl -sI -H 'Accept: image/avif' "$BASE/images/hero.jpg" |
 PAGE=$(curl -s --compressed -H 'Accept-Encoding: br, gzip' "$BASE/")
 has "image markup added by default (first image high priority)" "$PAGE" 'fetchpriority="high"'
 has "developer srcset kept" "$PAGE" 'srcset="/images/hero.jpg?w=640 640w'
+RH=$(curl -s -o /dev/null -D - -H 'Accept-Encoding: br' "$BASE/" | tr -d '\r')
+has "rewritten page stored compressed (exact length)" "$RH" "content-length:"
+RET=$(echo "$RH" | sed -n 's/^etag: //p')
+eq "rewritten page revalidates (304)" "$(code -H 'Accept-Encoding: br' -H "If-None-Match: $RET" "$BASE/")" 304
 read -r CT640 S640 < <(curl -s -o /dev/null -H 'Accept: image/webp' -w '%{content_type} %{size_download}' "$BASE/images/hero.jpg?w=600")
 eq "responsive variant format" "$CT640" image/webp
 curl -s -H 'Accept: image/webp' -o "$WORK/v.webp" "$BASE/images/hero.jpg?w=600"
