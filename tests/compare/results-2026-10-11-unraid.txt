@@ -1,0 +1,15 @@
+html   nova   median   99333 req/s   runs: 99333/1.4/0 94876/1.5/0 101910/1.3/0
+html   nginx  median   56099 req/s   runs: 57384/1.5/0 56099/1.5/0 56042/1.7/0
+html   fp     median   28794 req/s   runs: 29106/8.9/0 28794/9.0/0 28619/9.1/0
+jpg    nova   median   20580 req/s   runs: 20580/5.8/0 20317/5.8/0 22068/5.4/0
+jpg    nginx  median   21307 req/s   runs: 21307/3.8/0 21495/4.3/0 20473/5.4/0
+jpg    fp     median    5117 req/s   runs: 5075/75.8/0 5215/72.9/0 5117/73.5/0
+wp     nova   median     125 req/s   runs: 125/290.7/0 129/279.6/0 123/297.1/0
+wp     nginx  median     110 req/s   runs: 108/106.0/0 110/110.0/0 110/106.4/0
+wp     fp     median     109 req/s   runs: 109/386.4/0 109/378.9/0 109/379.0/0
+up     nova   median    5917 req/s   runs: 5708/13.0/0 5953/13.4/0 5917/13.3/0
+up     nginx  median    1100 req/s   runs: 1100/17.5/0 1100/17.8/0 1103/17.2/0
+up     fp     median    4622 req/s   runs: 4625/14.1/0 4621/14.1/0 4622/14.1/0
+lhome  nova   median     692 req/s   runs: 1246/185.6/0 692/445.9/0 606/562.2/0
+lhome  nginx  median     311 req/s   runs: 311/63.2/0 311/75.0/0 300/104.4/0
+lhome  fp     median     703 req/s   runs: 1103/188.7/0 703/430.3/0 586/572.0/0

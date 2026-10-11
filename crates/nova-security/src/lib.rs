@@ -220,6 +220,22 @@ pub fn chown_tree(root: &Path, uid: u32, gid: u32) -> io::Result<usize> {
     Ok(changed)
 }
 
+/// The Landlock ABI version the running kernel supports (`None`: no Landlock,
+/// e.g. kernels built without it or with it left out of the LSM list).
+pub fn landlock_abi() -> Option<i64> {
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+    // SAFETY: the documented version query: no ruleset pointer, size 0.
+    let v = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    (v > 0).then_some(v)
+}
+
 pub fn is_root() -> bool {
     // SAFETY: geteuid has no preconditions.
     unsafe { libc::geteuid() == 0 }

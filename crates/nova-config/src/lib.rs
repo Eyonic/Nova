@@ -397,6 +397,20 @@ pub struct IsolationConfig {
     /// Refuse to start the worker, PHP, tasks or workers unless the kernel
     /// enforces Landlock's filesystem (ABI 1) and TCP (ABI 4) rules.
     pub require_landlock: bool,
+    /// PHP's `open_basedir`, the fallback file boundary between sites on
+    /// kernels without Landlock. It turns off PHP's path cache (WordPress
+    /// pages ~25% slower), so `auto` sets it only where it protects
+    /// something: no Landlock and more than one PHP site.
+    pub php_open_basedir: OpenBasedir,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenBasedir {
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 impl Default for IsolationConfig {
@@ -406,6 +420,7 @@ impl Default for IsolationConfig {
             base_uid: 20000,
             worker_uid: 10001,
             require_landlock: true,
+            php_open_basedir: OpenBasedir::Auto,
         }
     }
 }

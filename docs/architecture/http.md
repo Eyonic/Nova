@@ -466,9 +466,17 @@ How it works and what NOVA adds:
   `max_execution_time` is not used (it would count the whole worker life);
   NOVA's timeout replaces it.
 
-Kernels without Landlock (Unraid's, for one) make NOVA fall back to PHP's
-`open_basedir`, which costs every file operation a full path check: on
-Unraid, Laravel's file-session garbage collection (a directory scan on 2%
+Kernels without Landlock (Unraid's, for one) can make NOVA fall back to
+PHP's `open_basedir`, which costs every file operation a full path check
+(PHP turns its path cache off): WordPress 133 -> 85 req/s on Unraid, the
+same drop nginx + PHP-FPM shows with `open_basedir`. So
+`isolation.php_open_basedir = "auto"` (default) sets it only where it
+protects something: no Landlock and more than one PHP site (each site's
+PHP already runs under its own uid; `open_basedir` keeps one site from
+reading another's world-readable files, such as `wp-config.php`).
+`"always"` and `"never"` decide explicitly; the choice and its reason are
+logged at start ("PHP file boundary"). With `open_basedir`, Laravel's
+file-session garbage collection (a directory scan on 2%
 of requests) took 2.7 s instead of 0.11 s over 14 500 sessions, about
 55 ms per request on average, in FPM and worker mode alike. On such hosts
 use `SESSION_DRIVER=redis`, `database` or `cookie`.

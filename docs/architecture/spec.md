@@ -80,7 +80,7 @@ Sections: `[server]`, `[paths]`, `[php]`, `[optimize]`,
 * Each master is launched as `nova sandbox <policy> -- php-fpm ...` under the
   site's uid (see §4a). Its stdout/stderr pipe is created by NOVA and handed
   to the site uid, because FPM reopens it through `/proc/self/fd/2`.
-* Per-pool hardening (defense in depth on top of §4a): `clear_env`, `open_basedir` = project dir + the site's
+* Per-pool hardening (defense in depth on top of §4a): `clear_env`, `open_basedir` = project dir + the site's (only without Landlock and with several PHP sites, see `isolation.php_open_basedir`)
   own state dir, per-site tmp/upload/session dirs, `disable_functions`
   (exec family by default), `security.limit_extensions = .php`,
   `expose_php = off`, admin-locked memory/time/upload limits.

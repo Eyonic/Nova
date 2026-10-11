@@ -36,9 +36,39 @@ pub fn pool_spec(cfg: &Config, site: &SiteConfig) -> Result<Option<PoolSpec>> {
             .collect(),
         master_ini: master_ini(cfg, site),
         display_errors: cfg.mode.is_dev(),
-        // Landlock (required by default) enforces the same boundary in the kernel.
-        open_basedir: !cfg.isolation.require_landlock,
+        open_basedir: open_basedir(cfg).0,
     }))
+}
+
+/// Whether PHP gets `open_basedir`, and why (logged at start).
+pub fn open_basedir(cfg: &Config) -> (bool, &'static str) {
+    use nova_config::OpenBasedir;
+    match cfg.isolation.php_open_basedir {
+        OpenBasedir::Always => (true, "isolation.php_open_basedir = \"always\""),
+        OpenBasedir::Never => (false, "isolation.php_open_basedir = \"never\""),
+        OpenBasedir::Auto => {
+            // Landlock enforces the same boundary in the kernel, faster.
+            if cfg.isolation.require_landlock || nova_security::landlock_abi().is_some() {
+                return (false, "Landlock separates the sites");
+            }
+            let php_sites = cfg
+                .sites
+                .iter()
+                .filter(|s| s.php.as_ref().is_some_and(|p| p.enabled))
+                .count();
+            if php_sites > 1 {
+                (
+                    true,
+                    "no Landlock on this kernel and several PHP sites: open_basedir keeps them apart (PHP's path cache is off, WordPress ~25% slower; isolation.php_open_basedir = \"never\" trades that boundary for speed)",
+                )
+            } else {
+                (
+                    false,
+                    "no Landlock, but only one PHP site: nothing for open_basedir to protect",
+                )
+            }
+        }
+    }
 }
 
 /// Settings PHP only reads at startup; they go to the FPM master.
@@ -170,6 +200,8 @@ pub fn sandbox_wrapper(cfg: &Config, site: &SiteConfig, nova: &std::path::Path) 
 
 /// FPM configuration for every PHP-enabled site, including how to launch it.
 pub fn fpm_configs(cfg: &Config, mode: Effective) -> Result<Vec<FpmConfig>> {
+    let (basedir, why) = open_basedir(cfg);
+    tracing::info!(open_basedir = basedir, reason = why, "PHP file boundary");
     let nova = std::env::current_exe().context("locating the nova binary")?;
     let mut out = Vec::new();
     for site in &cfg.sites {
@@ -276,4 +308,46 @@ pub async fn reconcile(cfg: &Config, mode: Effective, pools: &mut Vec<Pool>) -> 
 
 pub async fn stop_all(pools: Vec<Pool>) {
     futures_util::future::join_all(pools.into_iter().map(|p| p.fpm.shutdown())).await;
+}
+
+#[cfg(test)]
+mod open_basedir_tests {
+    use super::open_basedir;
+    use nova_config::Config;
+
+    fn cfg(extra: &str, sites: usize) -> Config {
+        let mut t = format!("version = 1\n[isolation]\n{extra}\n");
+        for i in 0..sites {
+            t.push_str(&format!(
+                "[[site]]\nname = \"s{i}\"\nhosts = [\"s{i}.test\"]\npath = \"/srv/s{i}\"\n[site.php]\n"
+            ));
+        }
+        Config::from_toml(&t).unwrap()
+    }
+
+    #[test]
+    fn explicit_settings_win() {
+        assert!(open_basedir(&cfg("php_open_basedir = \"always\"", 1)).0);
+        assert!(
+            !open_basedir(&cfg(
+                "php_open_basedir = \"never\"\nrequire_landlock = false",
+                3
+            ))
+            .0
+        );
+    }
+
+    #[test]
+    fn auto_relies_on_required_landlock() {
+        assert!(!open_basedir(&cfg("require_landlock = true", 3)).0);
+    }
+
+    #[test]
+    fn auto_without_landlock_needs_several_php_sites() {
+        // Only meaningful where the test host has no Landlock.
+        if nova_security::landlock_abi().is_none() {
+            assert!(!open_basedir(&cfg("require_landlock = false", 1)).0);
+            assert!(open_basedir(&cfg("require_landlock = false", 2)).0);
+        }
+    }
 }

@@ -5,6 +5,31 @@ the experiment rounds logged in [docs/experiments](../experiments/README.md)
 (#1-#28). All numbers are our own measurements; methods and caveats at the
 end.
 
+
+## Head-to-head on a real server (Unraid, 4 cores each, browser `Accept-Encoding`)
+
+Every server pinned to the same 4 cores, load from a container on the
+same Docker network, same PHP settings and Laravel environment, 3
+interleaved rounds, medians (harness: `tests/compare/`).
+
+| req/s | NOVA | nginx + PHP-FPM | FrankenPHP (Caddy) |
+|---|---:|---:|---:|
+| static 1 KB HTML | **99 333** | 56 099 | 28 794 |
+| static 470 KB JPEG | 20 580 | **21 307** | 5 117 |
+| WordPress home (no page cache) | **125** | 110 | 109 |
+| Laravel `/up` (worker modes; nginx: FPM) | **5 917** | 1 100 | 4 622 |
+| Laravel welcome page (file sessions) | 692 | 311 | **703** |
+
+NOVA leads or ties everywhere: +77% over nginx on small pages (stored
+brotli/zstd vs gzip on the fly), WordPress +14% over both, Laravel +28%
+over FrankenPHP's worker mode and 5.4x nginx + FPM. With its micro-cache
+(`micro_cache_secs = 2`) WordPress goes from ~125 to tens of thousands of
+req/s, which neither competitor offers built in. FrankenPHP's official image
+lacks mysqli (WordPress needs it) and did not compress WordPress output.
+On kernels without Landlock and with several PHP sites, NOVA adds
+`open_basedir` to keep sites apart (WordPress 85 req/s there; nginx + FPM
+with the same setting: 85 too); neither competitor isolates sites at all.
+
 ## 1. HTTP core vs nginx (same machine, loopback, `REF=1 tests/performance/run.sh`)
 
 | Scenario | NOVA | nginx 1.29 (+ php-fpm) | NOVA / nginx |
@@ -106,7 +131,7 @@ PHP request path; see experiments #29-#42.
 
 ## 5. Where others still lead
 
-* **FrankenPHP**: 0-16% more Laravel throughput depending on page size (in-process PHP; see §2).
+* **FrankenPHP**: on a loaded desktop lab, 0-16% more Laravel throughput depending on page size (see §2); on the real-server head-to-head above NOVA leads (`/up` +28%) or ties (welcome page).
 * **nginx / H2O**: a few percent on plain static files over loopback only
   (behind a Docker bridge NOVA is ahead, see §1).
 * **Features**: a CRS engine inside the server (NOVA runs the full OWASP
