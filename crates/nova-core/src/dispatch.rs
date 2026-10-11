@@ -469,7 +469,7 @@ async fn error_page(site: &Site, page: &str, resp: Response<Body>) -> Response<B
 impl App {
     async fn route<'a>(
         &'a self,
-        req: Request<ReqBody>,
+        mut req: Request<ReqBody>,
         client: Client,
         id: &str,
     ) -> (Response<Body>, Kind, Option<&'a Site>) {
@@ -578,6 +578,75 @@ impl App {
                     resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
                 }
                 return (resp, Kind::Error, name);
+            }
+        }
+
+        if crate::waf::active(site.waf) {
+            let body_kind = req
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::waf::body_kind)
+                .filter(|_| {
+                    req.headers()
+                        .get(header::CONTENT_LENGTH)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .is_some_and(|l| l <= crate::waf::MAX_BODY)
+                });
+            let mut body_bytes = None;
+            if body_kind.is_some() {
+                let (parts, body) = req.into_parts();
+                let collected = tokio::time::timeout(self.http.body_timeout, body.collect()).await;
+                let bytes = match collected {
+                    Ok(Ok(c)) => c.to_bytes(),
+                    _ => {
+                        return (
+                            self.error(
+                                StatusCode::BAD_REQUEST,
+                                "Could not read request body.",
+                                None,
+                            ),
+                            Kind::Error,
+                            name,
+                        );
+                    }
+                };
+                body_bytes = Some(bytes.clone());
+                req = Request::from_parts(
+                    parts,
+                    http_body_util::Full::new(bytes)
+                        .map_err(|never| match never {})
+                        .boxed(),
+                );
+            }
+            let finding = crate::waf::inspect(
+                req.uri().path(),
+                req.uri().query().unwrap_or(""),
+                req.headers(),
+                body_bytes.as_deref().zip(body_kind),
+            );
+            if let Some(f) = finding {
+                let block = site.waf == nova_config::WafMode::Block;
+                tracing::warn!(
+                    target: "nova::waf",
+                    site = site.name,
+                    client = %client.ip,
+                    rule = f.rule,
+                    target = f.target,
+                    path = req.uri().path(),
+                    request_id = id,
+                    blocked = block,
+                    "request matched a WAF rule"
+                );
+                self.metrics.waf_match(block);
+                if block {
+                    return (
+                        self.error(StatusCode::FORBIDDEN, "This request was blocked.", None),
+                        Kind::Error,
+                        name,
+                    );
+                }
             }
         }
 
@@ -2046,6 +2115,7 @@ mod tests {
             html_rewrite: false,
             speculation_rules: false,
             early_hints: false,
+            waf: nova_config::WafMode::Off,
         }
     }
 

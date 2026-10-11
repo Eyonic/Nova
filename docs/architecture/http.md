@@ -205,6 +205,33 @@ path = "downloads/**"
 cache_control = "private, no-store"
 ```
 
+## Request inspection (`waf`, opt-in)
+
+```toml
+[[site]]
+waf = "detect"     # off (default) | detect (log only) | block (403)
+```
+
+A fast first line against the attacks every public site sees: SQL
+injection and XSS (libinjection's tokenizers, pure Rust), command
+injection, path traversal, PHP code and stream-wrapper injection,
+Log4Shell-style lookups, probes for secrets (`/.env`, `/.git/`,
+`wp-config.php.bak`, ...) and self-announcing scanners (sqlmap, nikto,
+nuclei, ...). It reads the decoded query string, urlencoded form fields
+and JSON string values (SQL injection only: editors post HTML) up to
+256 KiB, and the headers that carry input. Matches are logged with target
+`nova::waf` (rule, field, client, request id) and counted in
+`nova_waf_matches_total`; `block` answers 403 with the site's error page.
+
+Each rule is picked for few false positives: WordPress logins, comments
+with quotes, `--`, `;` and HTML, the block editor's REST calls and Laravel
+forms pass; 0 matches on a WordPress/Laravel crawl, every test attack
+found. Cost: within noise of the benchmarks (a few microseconds per
+parameter). This is not the OWASP Core Rule Set: a full CRS engine in
+Rust was evaluated (zentinel-modsec 0.4) and rejected (missed
+`1' OR '1'='1`, blocked a WordPress REST call, 1.6 ms per request). Start
+with `detect`, read the log, then switch to `block`.
+
 ## Per-site rules
 
 ```toml

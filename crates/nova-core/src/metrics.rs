@@ -44,6 +44,8 @@ pub struct Metrics {
     php_errors: AtomicU64,
     bytes_saved: AtomicU64,
     text_saved: AtomicU64,
+    /// WAF matches: [detected only, blocked].
+    waf: [AtomicU64; 2],
 }
 
 impl Metrics {
@@ -63,6 +65,10 @@ impl Metrics {
         if !ok {
             self.php_errors.fetch_add(1, Relaxed);
         }
+    }
+
+    pub fn waf_match(&self, blocked: bool) {
+        self.waf[usize::from(blocked)].fetch_add(1, Relaxed);
     }
 
     pub fn image_saved(&self, bytes: u64) {
@@ -113,6 +119,14 @@ impl Metrics {
             "nova_text_bytes_saved_total {}",
             self.text_saved.load(Relaxed)
         );
+        let _ = writeln!(s, "# TYPE nova_waf_matches_total counter");
+        for (i, action) in ["detected", "blocked"].iter().enumerate() {
+            let _ = writeln!(
+                s,
+                "nova_waf_matches_total{{action=\"{action}\"}} {}",
+                self.waf[i].load(Relaxed)
+            );
+        }
         for (name, help, v) in extra {
             let _ = writeln!(s, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}");
         }

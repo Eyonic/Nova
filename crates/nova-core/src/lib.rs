@@ -33,6 +33,7 @@ pub mod tasks;
 pub mod telemetry;
 pub mod tls;
 pub mod upstream;
+pub mod waf;
 
 use anyhow::{Context, Result};
 use dispatch::App;

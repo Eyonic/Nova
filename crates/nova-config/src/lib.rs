@@ -235,6 +235,16 @@ impl Default for PathsConfig {
     }
 }
 
+/// `[[site]] waf`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WafMode {
+    #[default]
+    Off,
+    Detect,
+    Block,
+}
+
 /// OpenTelemetry tracing: spans for every request (and its PHP or
 /// upstream call) exported over OTLP/HTTP to a collector.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -579,6 +589,10 @@ pub struct SiteConfig {
     /// earlier responses of the same page while PHP builds it (HTTP/2, 3).
     #[serde(default = "default_true")]
     pub early_hints: bool,
+    /// Request inspection against common attacks: `off` (default),
+    /// `detect` (log only) or `block` (403).
+    #[serde(default)]
+    pub waf: WafMode,
     #[serde(default)]
     pub isolation: SiteIsolation,
     /// Framework integration; `auto` detects it from the project files.

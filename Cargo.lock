@@ -396,6 +396,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "barbacane-libinjection"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "836db2b79f5f4133d5e64aa99254833016ea0e8b74b306bee79db3c9716c8fba"
+dependencies = [
+ "bitflags",
+ "serde_json",
+ "smallvec",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2463,6 +2474,7 @@ name = "nova-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "barbacane-libinjection",
  "base64 0.22.1",
  "bcrypt",
  "bytes",

@@ -21,6 +21,7 @@ pub struct Site {
     pub html_rewrite: bool,
     pub speculation_rules: bool,
     pub early_hints: bool,
+    pub waf: nova_config::WafMode,
     pub rules: SiteRules,
 }
 
@@ -117,6 +118,7 @@ impl Sites {
                 html_rewrite: s.html_rewrite,
                 speculation_rules: s.speculation_rules,
                 early_hints: s.early_hints,
+                waf: s.waf,
                 rules,
             });
         }
