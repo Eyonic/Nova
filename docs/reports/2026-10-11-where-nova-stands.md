@@ -49,6 +49,15 @@ Laravel `/up` NOVA 11 700 vs FrankenPHP 12 300 req/s (95%), JSON route
 8 500 vs 9 600 (88%), 70 KB page about 76%. On Unraid with a 4-CPU limit
 for both: 5 160 vs 6 040 (85%; it was 57% before this work).
 
+After the worker transport redesign (experiments #44-#48: NOVA's PHP
+extension, queue in the manager, requests sent ahead), interleaved on the
+same desktop: 70 KB page 7 650 vs FrankenPHP ~8 300 req/s (92%, was 76%),
+small JSON route 9 860 vs ~9 800 (level, with NOVA's access log on;
+FrankenPHP logs nothing by default). With a browser's Accept-Encoding
+(both compress) on a loaded desktop: 70 KB page 5 800 vs 6 900 (84%),
+small route 9 000 vs 9 600. A syscall profile shows about 7 syscalls per
+request in NOVA's HTTP process: what remains is the process boundary.
+
 NOVA beats RoadRunner by 16-32% and runs Laravel at 3-4x its FPM speed.
 FrankenPHP stays ahead (8-25%) because it runs PHP inside the server
 process: one ZTS PHP for all sites. NOVA keeps every site's PHP out of
@@ -97,7 +106,7 @@ PHP request path; see experiments #29-#42.
 
 ## 5. Where others still lead
 
-* **FrankenPHP**: 8-25% more Laravel throughput (in-process PHP; see §2).
+* **FrankenPHP**: 0-16% more Laravel throughput depending on page size (in-process PHP; see §2).
 * **nginx / H2O**: a few percent on plain static files over loopback only
   (behind a Docker bridge NOVA is ahead, see §1).
 * **Features**: a CRS engine inside the server (NOVA runs the full OWASP
