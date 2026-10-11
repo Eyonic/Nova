@@ -37,6 +37,11 @@ files served from memory.
 Symfony 8 (`runtime/roadrunner-symfony-nyholm` on NOVA): 5 800 -> 25 000
 req/s on a JSON route, 4 800 -> 19 300 on a Twig page.
 
+After the request-path work of experiments #40-#41 (same lab, later run):
+Laravel `/up` NOVA 11 700 vs FrankenPHP 12 300 req/s (95%), JSON route
+8 500 vs 9 600 (88%), 70 KB page about 76%. On Unraid with a 4-CPU limit
+for both: 5 015 vs 6 050 (83%; it was 57% before the fix).
+
 NOVA beats RoadRunner by 16-32% and runs Laravel at 3-4x its FPM speed.
 FrankenPHP stays ahead (8-25%) because it runs PHP inside the server
 process: one ZTS PHP for all sites. NOVA keeps every site's PHP out of
@@ -72,21 +77,28 @@ welcome page went from 1 030 to 4 700 req/s under Chrome's header.
 | Load balancing + health checks | yes (least_conn/round_robin, passive + active, safe retry) | yes | yes | via Caddy | n/a | yes |
 | OpenTelemetry tracing (incl. PHP child spans) | yes (OTLP/HTTP, W3C trace context) | module | yes | via Caddy | yes | not checked |
 | ACME DNS-01 / wildcard certificates | yes (Cloudflare, any DNS via hook) | no (external tools) | yes (DNS plugins) | via Caddy | n/a | not checked |
-| Request inspection (WAF) | yes (libinjection + rules, detect/block) | ModSecurity module | Coraza plugin | via Caddy | no | ModSecurity |
+| Request inspection (WAF) | yes (built-in libinjection + rules; full OWASP CRS via auth_request) | ModSecurity module | Coraza plugin | via Caddy | no | ModSecurity |
+| External authorization / SSO (forward auth) | yes (`[site.auth_request]`) | auth_request | forward_auth | via Caddy | no | not checked |
+| Admin API | status, config, validate, reload, purge | no (Plus only) | full config API | via Caddy | RPC | WebAdmin |
+| ACME DNS-01 providers | Cloudflare, RFC 2136, any via hook | external tools | many (plugins) | via Caddy | n/a | not checked |
 
 Added after this report's first version (same day): load balancing,
-OpenTelemetry tracing, ACME DNS-01 with wildcard certificates and
-wildcard site hosts, and the WAF; see experiments #29-#34.
+OpenTelemetry tracing, ACME DNS-01 (Cloudflare, RFC 2136, hooks) with
+wildcard certificates and wildcard site hosts, the WAF, external
+authorization (SSO and the full OWASP CRS), the admin API and a faster
+PHP request path; see experiments #29-#42.
 
 ## 5. Where others still lead
 
 * **FrankenPHP**: 8-25% more Laravel throughput (in-process PHP; see §2).
 * **nginx / H2O**: a few percent on plain static files over loopback; zero
   copy for files served from memory on loopback.
-* **Features**: the full OWASP Core Rule Set (NOVA's WAF is a smaller,
-  faster rule set; the pure-Rust CRS engine we evaluated was not ready),
-  DNS providers beyond Cloudflare without a hook script, a dynamic
-  configuration API (NOVA reloads its file on SIGHUP).
+* **Features**: a CRS engine inside the server (NOVA runs the full OWASP
+  CRS through the official ModSecurity image via `[site.auth_request]`,
+  or its own faster rule set), token-API DNS providers other than
+  Cloudflare (RFC 2136 and hooks cover the rest), a configuration API
+  that accepts new configuration (NOVA's validates it and reloads the
+  file).
 * **Maturity**: decades of production use, fuzzing, packaging.
 
 ## Method notes
