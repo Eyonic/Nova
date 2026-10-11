@@ -1,5 +1,7 @@
 //! `nova` — the NOVA command line.
 
+mod logwriter;
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use nova_config::{Config, Mode};
@@ -100,7 +102,7 @@ fn load(path: &Path) -> Result<Config> {
 /// never blocks request handling. Nothing is dropped: when the queue is
 /// full, callers wait as they did with direct writes. Keep the returned
 /// guard alive; dropping it flushes the queue.
-fn init_logging(mode: Mode) -> tracing_appender::non_blocking::WorkerGuard {
+fn init_logging(mode: Mode) -> logwriter::Guard {
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_env("NOVA_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
     let json = match std::env::var("NOVA_LOG_FORMAT").as_deref() {
@@ -108,19 +110,12 @@ fn init_logging(mode: Mode) -> tracing_appender::non_blocking::WorkerGuard {
         Ok("text") => false,
         _ => !mode.is_dev(),
     };
-    let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
-        .lossy(false)
-        .buffered_lines_limit(64 * 1024)
-        .thread_name("nova-log")
-        .finish(std::io::stdout());
+    let (writer, guard) = logwriter::stdout();
     if json {
         // Access lines bypass the generic formatter (see nova_core::access)
         // but share the writer thread, so lines never interleave.
         let access = writer.clone();
-        nova_core::access::set_json_sink(move |line| {
-            use std::io::Write;
-            let _ = access.clone().write_all(line);
-        });
+        nova_core::access::set_json_sink(move |line| access.write_line(line));
         fmt()
             .json()
             .flatten_event(true)
