@@ -163,21 +163,39 @@ impl Tree {
 }
 
 pub(crate) fn json_str(s: &mut String, v: &str) {
+    s.reserve(v.len() + 2);
     s.push('"');
-    for c in v.chars() {
-        match c {
-            '"' => s.push_str("\\\""),
-            '\\' => s.push_str("\\\\"),
-            '\n' => s.push_str("\\n"),
-            '\r' => s.push_str("\\r"),
-            '\t' => s.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(s, "\\u{:04x}", c as u32);
-            }
-            c => s.push(c),
+    // Copy runs that need no escaping in one go (the common case: all of it).
+    let bytes = v.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc = match b {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            b if b < 0x20 => "",
+            _ => continue,
+        };
+        s.push_str(&v[start..i]);
+        if esc.is_empty() {
+            let _ = write!(s, "\\u{:04x}", b);
+        } else {
+            s.push_str(esc);
         }
+        start = i + 1;
     }
+    s.push_str(&v[start..]);
     s.push('"');
+}
+
+/// `json_str` for bytes that are usually UTF-8 (no copy when they are).
+pub(crate) fn json_bytes(s: &mut String, v: &[u8]) {
+    match std::str::from_utf8(v) {
+        Ok(t) => json_str(s, t),
+        Err(_) => json_str(s, &String::from_utf8_lossy(v)),
+    }
 }
 
 /// PHP's `php_register_variable_ex` key parsing: `a.b[x][]` ->

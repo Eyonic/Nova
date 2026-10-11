@@ -45,7 +45,9 @@ pub struct WorkerPool {
 }
 
 struct WorkerConn {
-    stream: UnixStream,
+    /// Reads are buffered (a frame usually arrives in one read); writes
+    /// pass straight through.
+    stream: tokio::io::BufReader<UnixStream>,
     requests: u32,
 }
 
@@ -134,7 +136,7 @@ impl WorkerPool {
                     }
                 }
                 pool.put(WorkerConn {
-                    stream,
+                    stream: tokio::io::BufReader::with_capacity(64 << 10, stream),
                     requests: 0,
                 });
             }
@@ -163,7 +165,7 @@ impl WorkerPool {
                 .expect("never closed");
             permit.forget();
             let conn = self.idle.lock().unwrap().pop().expect("permit per conn");
-            if crate::pool::alive(&conn.stream) {
+            if conn.stream.buffer().is_empty() && crate::pool::alive(conn.stream.get_ref()) {
                 return Ok(conn);
             }
             // Worker exited or the manager said goodbye: take the next one.
@@ -263,7 +265,7 @@ impl WorkerPool {
     /// stopping and must not get another request.
     async fn converse(
         &self,
-        stream: &mut UnixStream,
+        stream: &mut tokio::io::BufReader<UnixStream>,
         frame: Frame,
         head_tx: &mut Option<oneshot::Sender<Result<PhpResponse, PhpError>>>,
     ) -> Result<bool, PhpError> {
@@ -441,6 +443,11 @@ pub fn encode_request(req: &WorkerRequest<'_>, parse_urlencoded: bool) -> Frame 
     h.push_str(",\"headers\":{");
     let mut first = true;
     for name in req.headers.keys() {
+        // NOVA's own workers read headers from `server`; only the content
+        // type is needed here (the manager parses uploads with it).
+        if req.server.is_some() && name != http::header::CONTENT_TYPE {
+            continue;
+        }
         if !first {
             h.push(',');
         }
@@ -451,7 +458,7 @@ pub fn encode_request(req: &WorkerRequest<'_>, parse_urlencoded: bool) -> Frame 
             if i > 0 {
                 h.push(',');
             }
-            json_str(&mut h, &String::from_utf8_lossy(v.as_bytes()));
+            crate::form::json_bytes(&mut h, v.as_bytes());
         }
         h.push(']');
     }
@@ -484,9 +491,9 @@ pub fn encode_request(req: &WorkerRequest<'_>, parse_urlencoded: bool) -> Frame 
             if i > 0 {
                 h.push(',');
             }
-            json_str(&mut h, &String::from_utf8_lossy(k));
+            crate::form::json_bytes(&mut h, k);
             h.push(':');
-            json_str(&mut h, &String::from_utf8_lossy(v));
+            crate::form::json_bytes(&mut h, v);
         }
         h.push('}');
     }
