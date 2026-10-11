@@ -1085,6 +1085,26 @@ impl App {
                     }
                 }
                 let scheme = if client.https { "https" } else { "http" };
+                // NOVA's own workers get `$_SERVER` ready-made (as FPM would).
+                let server = (php.worker_native).then(|| {
+                    nova_runtime_php::build_params(&CgiRequest {
+                        method: parts.method.as_str(),
+                        request_uri,
+                        query: parts.uri.query().unwrap_or(""),
+                        script_name,
+                        script_filename: script,
+                        path_info,
+                        document_root: &site.root,
+                        server_name: strip_port(host),
+                        server_port,
+                        server_protocol: protocol,
+                        remote_addr: SocketAddr::new(client.ip, 0),
+                        https: client.https,
+                        headers: &parts.headers,
+                        content_length: Some(body.len() as u64),
+                        request_id: id,
+                    })
+                });
                 pool.execute(nova_runtime_php::WorkerRequest {
                     method: parts.method.as_str(),
                     uri: format!("{scheme}://{host}{request_uri}"),
@@ -1094,6 +1114,7 @@ impl App {
                     headers: &parts.headers,
                     body: body.freeze(),
                     timeout: php.timeout + Duration::from_secs(5),
+                    server,
                 })
                 .await
             }
@@ -2108,6 +2129,7 @@ mod tests {
                 micro_cache_grace: Duration::ZERO,
                 pool: nova_runtime_php::Pool::new("/nonexistent", 2),
                 worker: None,
+                worker_native: false,
             }),
             proxy: None,
             balancer: None,

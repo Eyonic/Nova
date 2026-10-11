@@ -220,7 +220,14 @@ try {
     while ($message = NovaWire::next()) {
         [$header, $body] = $message;
         $ctx = json_decode($header, true, 512, JSON_THROW_ON_ERROR);
-        $server = nova_server($baseServer, $ctx, $basePath);
+        if (isset($ctx['server'])) {
+            // NOVA sends what FPM would put in $_SERVER.
+            $server = $ctx['server'] + $baseServer;
+            $server['REQUEST_TIME_FLOAT'] = microtime(true);
+            $server['REQUEST_TIME'] = (int) $server['REQUEST_TIME_FLOAT'];
+        } else {
+            $server = nova_server($baseServer, $ctx, $basePath);
+        }
         parse_str($ctx['rawQuery'], $query);
         $post = [];
         if ($ctx['parsed']) {

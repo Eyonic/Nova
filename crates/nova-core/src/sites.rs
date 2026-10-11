@@ -44,6 +44,8 @@ pub struct SitePhp {
     pub pool: std::sync::Arc<nova_runtime_php::Pool>,
     /// Worker mode: booted application workers for front-controller requests.
     pub worker: Option<std::sync::Arc<nova_runtime_php::WorkerPool>>,
+    /// The worker is NOVA's own (`worker = "laravel"`).
+    pub worker_native: bool,
 }
 
 pub struct Sites {
@@ -84,6 +86,7 @@ impl Sites {
                     .then(|| Duration::from_secs(p.micro_cache_secs)),
                 micro_cache_grace: Duration::from_secs(p.micro_cache_grace_secs),
                 pool: nova_runtime_php::Pool::new(php_socket(cfg, s), p.max_children),
+                worker_native: p.worker.as_deref() == Some(crate::php::LARAVEL_WORKER),
                 worker: p.worker.as_ref().map(|w| {
                     // SAFETY: getuid has no preconditions.
                     let own = unsafe { libc::getuid() };

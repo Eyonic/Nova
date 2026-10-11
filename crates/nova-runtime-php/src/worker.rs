@@ -70,6 +70,9 @@ pub struct WorkerRequest<'a> {
     pub body: Bytes,
     /// Time allowed for the complete response.
     pub timeout: Duration,
+    /// The CGI parameters FPM would get (`$_SERVER`), sent as `server`
+    /// for NOVA's own workers; RoadRunner workers ignore the field.
+    pub server: Option<Vec<(Vec<u8>, Vec<u8>)>>,
 }
 
 impl WorkerPool {
@@ -475,6 +478,18 @@ pub fn encode_request(req: &WorkerRequest<'_>, parse_urlencoded: bool) -> Frame 
         }
     }
     h.push_str("},\"attributes\":{}");
+    if let Some(server) = &req.server {
+        h.push_str(",\"server\":{");
+        for (i, (k, v)) in server.iter().enumerate() {
+            if i > 0 {
+                h.push(',');
+            }
+            json_str(&mut h, &String::from_utf8_lossy(k));
+            h.push(':');
+            json_str(&mut h, &String::from_utf8_lossy(v));
+        }
+        h.push('}');
+    }
     h.push_str(crate::form::UNPARSED_TAIL);
     let mut f = Frame::message(h.as_bytes(), &req.body);
     let ct = req
@@ -523,6 +538,7 @@ mod tests {
                 headers: &headers,
                 body: Bytes::from_static(b"a=1"),
                 timeout: Duration::from_secs(1),
+                server: None,
             },
             true,
         );
@@ -603,6 +619,7 @@ mod tests {
             headers: &headers,
             body: Bytes::new(),
             timeout: Duration::from_secs(5),
+            server: None,
         };
         let mut r = pool.execute(req()).await.unwrap();
         assert_eq!(r.status, 200);
