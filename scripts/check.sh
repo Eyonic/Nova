@@ -4,8 +4,9 @@
 #
 #   scripts/check.sh            # quick: fmt, clippy (warnings fail), unit tests
 #   scripts/check.sh full       # quick + integration suite + NOVA Live browser
-#                               #   tests + performance regression vs baseline
-#   scripts/check.sh integration|browser|perf   # one stage
+#                               #   tests + feature suite (load balancing, OTel,
+#                               #   WAF, CRS, SSO, DNS-01) + performance regression
+#   scripts/check.sh integration|browser|features|perf   # one stage
 #
 # Logs: target/check-logs/<stage>.log (also the place to look after a FAIL).
 set -uo pipefail
@@ -71,6 +72,10 @@ teardown() {
     echo "warning: nova-test volumes still present after teardown" >&2
   fi
 }
+features() {
+  tests/features/run.sh 2>&1 | strip
+  return "${PIPESTATUS[0]}"
+}
 perf() {
   command -v "${OHA:-oha}" >/dev/null || [ -x "$HOME/.local/bin/oha" ] || { echo "oha not installed (cargo install oha)"; return 1; }
   OHA=${OHA:-$(command -v oha || echo "$HOME/.local/bin/oha")} tests/performance/run.sh 2>&1 | strip
@@ -85,11 +90,13 @@ case $MODE in
     stage integration integration
     stage browser browser
     teardown
+    stage features features
     stage perf perf ;;
   integration) stage integration integration; teardown ;;
   browser) stage browser browser ;;
+  features) stage features features ;;
   perf) stage perf perf ;;
-  *) echo "usage: $0 [quick|full|integration|browser|perf]"; exit 2 ;;
+  *) echo "usage: $0 [quick|full|integration|browser|features|perf]"; exit 2 ;;
 esac
 
 echo
@@ -101,4 +108,5 @@ for i in "${!NAMES[@]}"; do
 done
 # Integration count, when that stage ran.
 grep -hE "[0-9]+ passed, [0-9]+ failed" "$LOGS/integration.log" 2>/dev/null | tail -1 | strip | sed 's/^/integration: /'
+grep -hE "[0-9]+ passed, [0-9]+ failed" "$LOGS/features.log" 2>/dev/null | tail -1 | strip | sed 's/^/features: /'
 exit $fail

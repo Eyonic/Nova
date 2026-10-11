@@ -1,0 +1,80 @@
+# NOVA feature tests: load balancing, OpenTelemetry, WAF, external
+# authorization (SSO and the OWASP CRS), ACME DNS-01 with wildcards.
+version = 1
+mode = "production"
+
+[server]
+listen = "0.0.0.0:8080"
+admin_allow = ["0.0.0.0/0"]
+
+[server.tls]
+enabled = true
+listen = "0.0.0.0:8443"
+public_port = 8443
+http3 = false
+acme = true
+acme_email = "ops@nova-e2e.net"
+acme_directory = "https://pebble:14000/dir"
+acme_ca_file = "/etc/nova/pebble.minica.pem"
+acme_challenge = "dns-01"
+acme_dns_provider = "hook"
+acme_dns_hook = "/etc/nova/dns-hook.sh"
+acme_dns_propagation_secs = 1
+
+[paths]
+state_dir = "/var/lib/nova"
+run_dir = "/run/nova"
+
+[optimize]
+enabled = false
+
+[telemetry]
+otlp_endpoint = "http://helper:4318"
+service_name = "nova-features"
+sample_ratio = 1.0
+
+[[site]]
+name = "lb"
+hosts = ["lb.test"]
+path = "/srv/sites/lb"
+[site.proxy]
+upstreams = ["http://helper:9001", "http://helper:9002"]
+balance = "round_robin"
+health_path = "/health"
+health_interval_secs = 1
+fail_timeout_secs = 2
+static_first = true
+
+[[site]]
+name = "waf"
+hosts = ["waf.test"]
+path = "/srv/sites/waf"
+waf = "block"
+[site.php]
+max_children = 2
+
+[[site]]
+name = "crs"
+hosts = ["crs.test"]
+path = "/srv/sites/crs"
+[site.php]
+max_children = 2
+[site.auth_request]
+url = "http://modsec:8080{uri}"
+forward_body = true
+
+[[site]]
+name = "sso"
+hosts = ["sso.test"]
+path = "/srv/sites/sso"
+[site.php]
+max_children = 2
+[site.auth_request]
+url = "http://helper:9003/auth"
+pass_headers = ["Remote-User"]
+
+[[site]]
+name = "wild"
+hosts = ["shop.nova-e2e.net", "*.shop.nova-e2e.net"]
+default = true
+path = "/srv/sites/wild"

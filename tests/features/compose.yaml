@@ -1,0 +1,39 @@
+# Feature test stack (tests/features/run.sh). Throwaway: own project name.
+services:
+  nova:
+    image: ${NOVA_IMAGE:-nova:dev}
+    ports: ["${NOVA_FEAT_PORT:-18188}:8080", "${NOVA_FEAT_TLS:-18543}:8443"]
+    environment: {NOVA_MODE: production}
+    volumes:
+      - ./sites:/srv/sites:ro
+      - ./nova.toml:/etc/nova/nova.toml:ro
+      - ./dns-hook.sh:/etc/nova/dns-hook.sh:ro
+      - ./pebble.minica.pem:/etc/nova/pebble.minica.pem:ro
+    read_only: true
+    tmpfs: [/run/nova:mode=0755, /tmp, /var/lib/nova]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL]
+    security_opt: [no-new-privileges:true]
+    depends_on: [helper, modsec, pebble]
+  helper:
+    image: docker.io/library/python:3.13-alpine
+    command: ["python3", "-u", "/helper.py"]
+    volumes: ["./helper.py:/helper.py:ro"]
+    ports: ["${NOVA_FEAT_CTL:-18190}:9010"]
+  modsec:
+    image: docker.io/owasp/modsecurity-crs:nginx
+    environment:
+      BACKEND: http://helper:9004
+      PORT: "8080"
+      PARANOIA: "1"
+      ANOMALY_INBOUND: "5"
+      MODSEC_RULE_ENGINE: "On"
+  challtestsrv:
+    image: ghcr.io/letsencrypt/pebble-challtestsrv:latest
+    command: ["-defaultIPv6", "", "-defaultIPv4", "127.0.0.1"]
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    command: ["-config", "test/config/pebble-config.json", "-strict", "-dnsserver", "challtestsrv:8053"]
+    environment: {PEBBLE_VA_NOSLEEP: "1"}
+    ports: ["${NOVA_FEAT_PEBBLE:-18500}:15000"]
+    depends_on: [challtestsrv]
