@@ -99,8 +99,31 @@ pub fn prepare_state(cfg: &Config, site: &SiteConfig) -> io::Result<()> {
     for d in LARAVEL_STORAGE_DIRS {
         std::fs::create_dir_all(storage.join(d))?;
     }
-    std::fs::create_dir_all(laravel_bootstrap_cache(cfg, site))?;
+    let cache = laravel_bootstrap_cache(cfg, site);
+    std::fs::create_dir_all(&cache)?;
+    drop_stale_discovery(site, &cache);
     Ok(())
+}
+
+/// Laravel rebuilds its package discovery cache only when the file is
+/// missing; `composer require` refreshes the project's own copy, not the
+/// one NOVA keeps in the state directory. Drop it (and the provider cache
+/// built from it) when Composer installed packages after it was written.
+fn drop_stale_discovery(site: &SiteConfig, cache: &Path) {
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let Some(installed) = modified(&site.path.join("vendor/composer/installed.json")) else {
+        return;
+    };
+    let packages = cache.join("packages.php");
+    if modified(&packages).is_some_and(|built| built < installed) {
+        for f in ["packages.php", "services.php"] {
+            let _ = std::fs::remove_file(cache.join(f));
+        }
+        tracing::info!(
+            site = site.name,
+            "Composer packages changed; Laravel will rediscover them"
+        );
+    }
 }
 
 /// Copy regular files and directories; symlinks and special files are skipped.
@@ -177,6 +200,25 @@ mod tests {
             std::fs::read_to_string(&seeded).unwrap(),
             "changed in state"
         );
+
+        // `composer require` after Laravel cached its package discovery.
+        let cache = base.join("state/sites/shop/bootstrap-cache");
+        std::fs::write(cache.join("packages.php"), "<?php return [];").unwrap();
+        std::fs::write(cache.join("services.php"), "<?php return [];").unwrap();
+        std::fs::create_dir_all(project.join("vendor/composer")).unwrap();
+        prepare_state(&cfg, site).unwrap();
+        assert!(cache.join("packages.php").exists(), "no installed.json yet");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(project.join("vendor/composer/installed.json"), "{}").unwrap();
+        prepare_state(&cfg, site).unwrap();
+        assert!(
+            !cache.join("packages.php").exists(),
+            "stale discovery dropped"
+        );
+        assert!(!cache.join("services.php").exists());
+        std::fs::write(cache.join("packages.php"), "<?php return [];").unwrap();
+        prepare_state(&cfg, site).unwrap();
+        assert!(cache.join("packages.php").exists(), "fresh discovery kept");
         let _ = std::fs::remove_dir_all(&base);
     }
 

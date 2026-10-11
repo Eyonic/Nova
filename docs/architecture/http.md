@@ -354,6 +354,13 @@ How it works and what NOVA adds:
   `max_execution_time` is not used (it would count the whole worker life);
   NOVA's timeout replaces it.
 
+Kernels without Landlock (Unraid's, for one) make NOVA fall back to PHP's
+`open_basedir`, which costs every file operation a full path check: on
+Unraid, Laravel's file-session garbage collection (a directory scan on 2%
+of requests) took 2.7 s instead of 0.11 s over 14 500 sessions, about
+55 ms per request on average, in FPM and worker mode alike. On such hosts
+use `SESSION_DRIVER=redis`, `database` or `cookie`.
+
 Worker mode keeps application state between requests: code must not leak
 per-request state into globals or singletons (Octane documents the rules).
 WordPress and other classic PHP apps are not built for that; keep them on
