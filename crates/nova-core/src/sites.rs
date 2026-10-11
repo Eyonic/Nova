@@ -80,7 +80,7 @@ impl Sites {
                     .then(|| Duration::from_secs(p.micro_cache_secs)),
                 micro_cache_grace: Duration::from_secs(p.micro_cache_grace_secs),
                 pool: nova_runtime_php::Pool::new(php_socket(cfg, s), p.max_children),
-                worker: p.worker.as_ref().map(|_| {
+                worker: p.worker.as_ref().map(|w| {
                     // SAFETY: getuid has no preconditions.
                     let own = unsafe { libc::getuid() };
                     nova_runtime_php::WorkerPool::new(
@@ -88,6 +88,7 @@ impl Sites {
                         vec![cfg.site_uid(s), own],
                         p.max_requests,
                         cfg.mode.is_dev(),
+                        w != crate::php::LARAVEL_WORKER,
                         &s.name,
                     )
                 }),
@@ -172,6 +173,11 @@ pub fn php_run_dir(cfg: &Config, site: &SiteConfig) -> PathBuf {
 
 pub fn php_socket(cfg: &Config, site: &SiteConfig) -> PathBuf {
     php_run_dir(cfg, site).join("fpm.sock")
+}
+
+/// NOVA's built-in Laravel worker, written here at start.
+pub fn bundled_laravel_worker(cfg: &Config, site: &SiteConfig) -> PathBuf {
+    php_run_dir(cfg, site).join("laravel-worker.php")
 }
 
 /// Where NOVA listens for the site's worker-mode PHP workers.

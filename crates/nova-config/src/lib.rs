@@ -649,8 +649,10 @@ pub struct SitePhpConfig {
     /// After expiry, keep serving a cached page for this long while one
     /// request refreshes it, and whenever PHP fails (stale-if-error).
     pub micro_cache_grace_secs: u64,
-    /// Worker mode: a RoadRunner-compatible worker script, relative to the
-    /// project (e.g. `vendor/laravel/octane/bin/roadrunner-worker`). The
+    /// Worker mode: `"laravel"` for NOVA's built-in Laravel Octane worker
+    /// (needs `laravel/octane`), or a RoadRunner-compatible worker script
+    /// relative to the project (e.g. Symfony's `public/index.php` with
+    /// `runtime/roadrunner-symfony-nyholm`). The
     /// application stays booted in `max_children` long-running workers and
     /// serves every front-controller request; other `.php` files still run
     /// in FPM. Each worker is replaced after `max_requests`.

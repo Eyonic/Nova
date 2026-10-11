@@ -33,6 +33,9 @@ pub struct WorkerPool {
     peer_uids: Vec<u32>,
     max_requests: u32,
     expose_errors: bool,
+    /// RoadRunner workers expect urlencoded forms parsed by the server;
+    /// NOVA's own workers parse them in PHP and keep the raw body.
+    parse_urlencoded: bool,
     site: String,
     idle: Mutex<Vec<WorkerConn>>,
     /// One permit per idle connection.
@@ -75,6 +78,7 @@ impl WorkerPool {
         peer_uids: Vec<u32>,
         max_requests: u32,
         expose_errors: bool,
+        parse_urlencoded: bool,
         site: &str,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -82,6 +86,7 @@ impl WorkerPool {
             peer_uids,
             max_requests: max_requests.max(1),
             expose_errors,
+            parse_urlencoded,
             site: site.to_string(),
             idle: Mutex::new(Vec::new()),
             ready: Semaphore::new(0),
@@ -170,7 +175,7 @@ impl WorkerPool {
     ) -> Result<PhpResponse, PhpError> {
         let timeout = req.timeout;
         let deadline = Instant::now() + timeout;
-        let frame = encode_request(&req);
+        let frame = encode_request(&req, self.parse_urlencoded);
         let conn = self.take(timeout).await?;
         let (head_tx, head_rx) = oneshot::channel();
         tokio::spawn(Arc::clone(self).exchange(conn, frame, deadline, timeout, head_tx));
@@ -417,7 +422,7 @@ fn parse_head(head: &[u8]) -> Result<Option<(StatusCode, HeaderMap)>, PhpError> 
 
 /// Request frame: RoadRunner's JSON context, then the raw body. Form
 /// bodies are flagged for the manager, which parses them in the sandbox.
-pub fn encode_request(req: &WorkerRequest<'_>) -> Frame {
+pub fn encode_request(req: &WorkerRequest<'_>, parse_urlencoded: bool) -> Frame {
     use crate::form::json_str;
     let mut h = String::with_capacity(512);
     h.push_str("{\"remoteAddr\":");
@@ -477,7 +482,7 @@ pub fn encode_request(req: &WorkerRequest<'_>) -> Frame {
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !req.body.is_empty() && crate::form::is_form(ct) {
+    if !req.body.is_empty() && crate::form::needs_parsing(ct, parse_urlencoded) {
         f.byte11 = goridge::NOVA_PARSE_FORM;
     }
     f
@@ -508,16 +513,19 @@ mod tests {
         headers.append("x-multi", "a".parse().unwrap());
         headers.append("x-multi", "b\"c".parse().unwrap());
         headers.insert("cookie", "s=a%3Db; s=second; t=1".parse().unwrap());
-        let f = encode_request(&WorkerRequest {
-            method: "POST",
-            uri: "https://example.test/x?y=1".into(),
-            query: "y=1",
-            protocol: "HTTP/2.0",
-            remote_addr: "192.0.2.1".into(),
-            headers: &headers,
-            body: Bytes::from_static(b"a=1"),
-            timeout: Duration::from_secs(1),
-        });
+        let f = encode_request(
+            &WorkerRequest {
+                method: "POST",
+                uri: "https://example.test/x?y=1".into(),
+                query: "y=1",
+                protocol: "HTTP/2.0",
+                remote_addr: "192.0.2.1".into(),
+                headers: &headers,
+                body: Bytes::from_static(b"a=1"),
+                timeout: Duration::from_secs(1),
+            },
+            true,
+        );
         assert_eq!(f.byte11, goridge::NOVA_PARSE_FORM);
         let (h, b) = f.split().unwrap();
         assert_eq!(&b[..], b"a=1");
@@ -553,7 +561,7 @@ mod tests {
     async fn exchange_with_a_fake_worker() {
         let dir = std::env::temp_dir().join(format!("nova-wk-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let pool = WorkerPool::new(dir.join("w.sock"), vec![], 2, false, "t");
+        let pool = WorkerPool::new(dir.join("w.sock"), vec![], 2, false, true, "t");
         pool.listen().unwrap();
         // A worker that streams two chunks, then answers plainly.
         let mut php = UnixStream::connect(pool.socket()).await.unwrap();

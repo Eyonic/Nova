@@ -26,7 +26,7 @@ dropping a request, and shuts down gracefully.
 |---|---|---|
 | Static sites, SPAs, build output (Vite, Mix, Hugo, Astro static) | **yes** | served directly, optimized |
 | PHP (Laravel, Symfony, WordPress, plain PHP) | **yes** | supervised PHP-FPM per site over FastCGI |
-| PHP worker mode (Laravel Octane, Symfony Runtime, any RoadRunner worker) | **yes** | `[site.php] worker`: booted application, 2.8-3.6x FPM on Laravel |
+| PHP worker mode (Laravel Octane, Symfony Runtime, any RoadRunner worker) | **yes** | `[site.php] worker = "laravel"` (built in) or a RoadRunner worker: booted application, 3-4x FPM |
 | Node.js, Python (ASGI/WSGI server), Go, Ruby, Java or any other HTTP app server | **yes** | `[site.proxy]`: reverse proxy over HTTP/1.1, static files still served by NOVA |
 | WebSocket backends | **yes** | tunneled through `[site.proxy]` |
 | gRPC backends, load balancing across several upstreams | **no** | one HTTP/1.1 upstream per site |

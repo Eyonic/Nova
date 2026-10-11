@@ -77,6 +77,7 @@ pub fn prepare_dirs(cfg: &Config, mode: Effective) -> Result<()> {
         std::fs::create_dir_all(state.join("optimize"))?;
         std::fs::create_dir_all(state.join("tls"))?;
         std::fs::create_dir_all(run.join("conf"))?;
+        crate::php::install_bundled_workers(cfg).context("writing the built-in PHP workers")?;
         return Ok(());
     }
 
@@ -120,6 +121,7 @@ pub fn prepare_dirs(cfg: &Config, mode: Effective) -> Result<()> {
         let mode = if worker_mode { 0o730 } else { 0o710 };
         ensure_dir(&rdir, uid, wgid, mode).with_context(|| ctx(&rdir))?;
     }
+    crate::php::install_bundled_workers(cfg).context("writing the built-in PHP workers")?;
     Ok(())
 }
 

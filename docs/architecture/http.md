@@ -294,10 +294,19 @@ long-running PHP processes that answer request after request:
 ```toml
 [site.php]
 front_controller = "index.php"
-worker = "vendor/laravel/octane/bin/roadrunner-worker"   # composer require laravel/octane spiral/roadrunner-http spiral/roadrunner-cli
+worker = "laravel"        # NOVA's built-in Octane worker: composer require laravel/octane
 max_children = 8          # workers
 max_requests = 10000      # each worker is replaced after this many requests
 ```
+
+`worker = "laravel"` runs Laravel Octane's worker (sandboxing, listeners,
+state flushing) with NOVA's own transport: the request is built the way
+PHP-FPM fills the superglobals and the response serialized straight from
+Symfony's Response, without Octane's PSR-7 round trip (12-13% faster than
+Octane's RoadRunner worker, which also works:
+`worker = "vendor/laravel/octane/bin/roadrunner-worker"` with
+`spiral/roadrunner-http` and `spiral/roadrunner-cli`). Urlencoded bodies
+stay available raw (`$request->getContent()`, e.g. for webhook signatures).
 
 NOVA speaks the RoadRunner worker protocol (goridge frames over the
 worker's stdin/stdout, JSON request context), so anything written for
@@ -311,7 +320,13 @@ Measured on Laravel 13 (8 workers, same machine, uncompressed responses):
 |---|---:|---:|
 | NOVA + PHP-FPM | 2 270 req/s | 2 170 req/s |
 | RoadRunner 3.0 + Octane | 7 090 req/s | 5 210 req/s |
-| **NOVA worker mode + Octane** | **8 220 req/s** | **6 090 req/s** |
+| NOVA worker mode, Octane's RoadRunner worker | 8 220 req/s | 6 090 req/s |
+| **NOVA worker mode, `worker = "laravel"`** | **9 290 req/s** | **6 900 req/s** |
+| FrankenPHP 1.13 worker mode + Octane | 10 020 req/s | 8 610 req/s |
+
+FrankenPHP embeds PHP in the server process (one ZTS PHP shared by all
+sites); NOVA keeps PHP out of process, as each site's own uid inside its
+Landlock sandbox, which costs about 0.2-0.3 ms per request in transport.
 
 Symfony 8 with `composer require runtime/roadrunner-symfony-nyholm` (also
 tested: 5 800 -> 25 000 req/s on a JSON route, 4 800 -> 19 300 on a Twig page):

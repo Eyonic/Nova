@@ -96,6 +96,25 @@ pub fn master_ini(cfg: &Config, site: &SiteConfig) -> BTreeMap<String, String> {
     ini
 }
 
+/// `[site.php] worker = "laravel"`: NOVA's own Octane worker.
+pub const LARAVEL_WORKER: &str = "laravel";
+const LARAVEL_WORKER_SOURCE: &str = include_str!("php/laravel-worker.php");
+
+/// Write the built-in worker for sites that use it (root-owned, readable).
+pub fn install_bundled_workers(cfg: &Config) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for site in &cfg.sites {
+        if site.php.as_ref().and_then(|p| p.worker.as_deref()) == Some(LARAVEL_WORKER) {
+            let path = sites::bundled_laravel_worker(cfg, site);
+            let tmp = path.with_extension("php.new");
+            std::fs::write(&tmp, LARAVEL_WORKER_SOURCE)?;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
+            std::fs::rename(&tmp, &path)?;
+        }
+    }
+    Ok(())
+}
+
 /// `php -d` settings for worker-mode PHP: the FPM master's startup
 /// settings plus what FPM sets per pool (`php_admin_value`), so a worker
 /// runs under the same limits. `max_execution_time` stays 0: it would

@@ -16,11 +16,12 @@ use std::path::{Path, PathBuf};
 /// body is parsed.
 pub const UNPARSED_TAIL: &str = r#","parsed":false,"uploads":{}}"#;
 
-/// Bodies PHP itself would parse into `$_POST` / `$_FILES`.
-pub fn is_form(content_type: &str) -> bool {
+/// Bodies the manager parses: multipart always (files must land in the
+/// site's sandbox), urlencoded only for workers that expect it parsed.
+pub fn needs_parsing(content_type: &str, urlencoded: bool) -> bool {
     let mime = content_type.split(';').next().unwrap_or("").trim();
-    mime.eq_ignore_ascii_case("application/x-www-form-urlencoded")
-        || mime.eq_ignore_ascii_case("multipart/form-data")
+    mime.eq_ignore_ascii_case("multipart/form-data")
+        || (urlencoded && mime.eq_ignore_ascii_case("application/x-www-form-urlencoded"))
 }
 
 /// Turn a flagged request (JSON header + raw form body) into RoadRunner's

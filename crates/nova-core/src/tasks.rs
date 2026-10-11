@@ -173,11 +173,16 @@ fn php_workers_spec(cfg: &Config, site: &SiteConfig, mode: Effective) -> Result<
         command.push("-d".into());
         command.push(format!("{k}={v}"));
     }
-    command.push(site.path.join(script).display().to_string());
+    let script_path = if script == php::LARAVEL_WORKER {
+        sites::bundled_laravel_worker(cfg, site)
+    } else {
+        site.path.join(script)
+    };
+    command.push(script_path.display().to_string());
     let mut spec = spec(cfg, site, mode, "php-workers", &command)?;
     spec.env
         .insert("APP_BASE_PATH".into(), site.path.display().to_string());
-    if script.contains("laravel/octane") {
+    if script == php::LARAVEL_WORKER || script.contains("laravel/octane") {
         spec.env.insert("LARAVEL_OCTANE".into(), "1".into());
     }
     // These are web workers even though PHP_SAPI is "cli": without this,
