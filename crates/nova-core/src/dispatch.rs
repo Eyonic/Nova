@@ -61,6 +61,8 @@ pub struct App {
     pub early: Arc<crate::earlyhints::EarlyHints>,
     /// OpenTelemetry span export (`[telemetry]`).
     pub tracer: Option<Arc<crate::telemetry::Tracer>>,
+    /// `/_nova/admin/...` (configuration, reload, purge).
+    pub admin: Option<Arc<crate::admin::Admin>>,
     /// Remembered asset versions for compression dictionaries (RFC 9842).
     dictionaries: crate::dictionaries::Dictionaries,
     /// Keep-alive pool for `[site.proxy]` upstreams.
@@ -107,6 +109,7 @@ impl App {
             micro: Arc::default(),
             early: Arc::default(),
             tracer: None,
+            admin: None,
             dictionaries: Default::default(),
             upstream: crate::upstream::http_client(),
             acme_http01: std::sync::OnceLock::new(),
@@ -523,6 +526,13 @@ impl App {
                     .header(header::CONTENT_TYPE, "application/octet-stream")
                     .body(full(key_auth))
                     .unwrap(),
+                None => self.not_found(),
+            };
+            return (resp, Kind::Internal, None);
+        }
+        if req.uri().path().starts_with("/_nova/admin/") {
+            let resp = match &self.admin {
+                Some(admin) => admin.handle(self, req, client).await,
                 None => self.not_found(),
             };
             return (resp, Kind::Internal, None);
@@ -1782,7 +1792,7 @@ impl App {
         (ok, serde_json::Value::Object(checks))
     }
 
-    fn not_found(&self) -> Response<Body> {
+    pub(crate) fn not_found(&self) -> Response<Body> {
         self.error(
             StatusCode::NOT_FOUND,
             "The requested resource was not found.",

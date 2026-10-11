@@ -50,6 +50,8 @@ clearly better (or a deliberate trade-off). Stable baseline: tag
 | 34 | Built-in Laravel worker gets `$_SERVER` ready-made from NOVA (the CGI params FPM gets) | PHP glue spent ~53 us per request rebuilding it | local, 3 alternating rounds | no measurable difference (+-10% run-to-run on a loaded desktop); request semantics still identical to FPM | kept for exact FPM parity, not for speed |
 | 35 | 1 MiB PHP stream chunks in the built-in worker (one write per response instead of 8 KiB pieces) | idea: syscalls and manager wake-ups per 70 KB page explain part of the FrankenPHP gap | CPU per request of the whole container, 4 alternating pairs | 1.43 vs 1.43 ms (medians) | rejected |
 | 36 | sendfile(2) from 256 KiB instead of copying cached files (the 470 KB JPEG gap to nginx) | nginx's zero-copy; loopback benchmark 42% of nginx | local loopback x2, Unraid via Docker port mapping x3 | loopback 20,000 -> 39,400 req/s; Unraid 18,800 -> 15,000 (-20%): through a bridge/veth the copy from memory wins | rejected (the gap only exists on loopback) |
+| 37 | Admin API (status, effective config, validate, reload via a supervisor control pipe, purge) | report gap "dynamic configuration API" | integration (+10 checks) | reload over the API swaps workers like SIGHUP; CSRF guard (X-Nova-Admin) and optional bearer token | kept |
+| 38 | RFC 2136 + TSIG DNS-01 provider (native, no hook) | report gap "DNS providers beyond Cloudflare" | unit (RFC 4231 HMAC vector, message layout), BIND 9.20 + Pebble end to end | wildcard certificate issued in 2 s through signed dynamic updates | kept |
 
 Considered and skipped in an earlier round (since done as #28): `Link: rel=preload` hints without 103
 Early Hints (hyper cannot send 1xx; the browser's preload scanner already

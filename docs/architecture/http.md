@@ -60,7 +60,11 @@ acme_email = "ops@example.com"
 acme_challenge = "dns-01"
 acme_dns_provider = "cloudflare"            # token with Zone.DNS:Edit in $CLOUDFLARE_API_TOKEN
 # acme_dns_token_env = "CLOUDFLARE_API_TOKEN"
-# acme_dns_provider = "hook"                # any other DNS host:
+# acme_dns_provider = "rfc2136"             # BIND, PowerDNS, Knot, Technitium...: signed dynamic updates
+# acme_dns_server = "ns1.example.com:53"
+# acme_dns_zone = "example.com"
+# acme_dns_tsig_key = "acme"                # HMAC-SHA256; base64 secret in $NOVA_TSIG_SECRET
+# acme_dns_provider = "hook"                # anything else:
 # acme_dns_hook = "/etc/nova/dns-hook"      #   <hook> set|clear <record name> <value>
 acme_dns_propagation_secs = 30
 
@@ -77,7 +81,8 @@ Cloudflare's API or the hook (run as the worker's user, not root), removes
 them afterwards, and stores the certificate in `<state>/tls/dns01/`. The
 worker loads new certificates within 30 s without a restart; renewal starts
 after 60 days, and configuration reloads that add hosts trigger a new
-order. Verified end to end against Pebble with its test DNS server.
+order. Verified end to end against Pebble with its test DNS server (hook)
+and with BIND 9.20 accepting TSIG-signed RFC 2136 updates.
 
 HSTS and the automatic HTTP→HTTPS redirect apply only to hosts with a
 publicly trusted certificate (ACME or configured files); a self-signed
@@ -644,6 +649,27 @@ own parent span, so OpenTelemetry instrumentation in the application lands
 in the same trace. Spans leave in batches (512, or every second) from a
 bounded queue; when the collector is slow or down spans are dropped, never
 requests delayed. Verified against Jaeger.
+
+## Admin API
+
+```toml
+[server]
+admin_allow = ["10.0.0.0/8"]          # who may reach /_nova/admin/ (and metrics)
+admin_token_env = "NOVA_ADMIN_TOKEN"  # optional: also require Authorization: Bearer <token>
+```
+
+| Request | |
+|---|---|
+| `GET /_nova/admin/status` | version, uptime, per site: PHP mode (FPM/worker), idle workers, micro-cache, upstream health, WAF mode |
+| `GET /_nova/admin/config` | the configuration this process runs (JSON; secrets are only ever variable names) |
+| `POST /_nova/admin/config/validate` | body: a TOML configuration; `200 {"valid":true}` or `422` with the errors (for CI) |
+| `POST /_nova/admin/reload` | re-read the configuration file and swap workers with zero downtime (strict isolation) |
+| `POST /_nova/admin/purge?site=shop[&tags=post-1,home]` | drop micro-cached pages, all or by tag |
+
+`POST` requests must carry `X-Nova-Admin: 1` (no browser can add it to a
+cross-site form, so a page an admin visits cannot trigger them). Reload
+goes through a pipe from the unprivileged worker to the supervisor, which
+validates the file first: an invalid file changes nothing.
 
 ## Access log
 

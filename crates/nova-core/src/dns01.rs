@@ -283,6 +283,7 @@ enum Dns {
         program: PathBuf,
         user: Option<(u32, u32)>,
     },
+    Rfc2136(crate::rfc2136::Updater),
 }
 
 impl Dns {
@@ -308,6 +309,28 @@ impl Dns {
                     ),
                 }
             }
+            DnsProvider::Rfc2136 => {
+                use base64::Engine;
+                let secret = std::env::var(&t.acme_dns_tsig_secret_env)
+                    .with_context(|| format!("{} is not set", t.acme_dns_tsig_secret_env))?;
+                Dns::Rfc2136(crate::rfc2136::Updater {
+                    server: t
+                        .acme_dns_server
+                        .clone()
+                        .context("acme_dns_server is not set")?,
+                    zone: t
+                        .acme_dns_zone
+                        .clone()
+                        .context("acme_dns_zone is not set")?,
+                    key_name: t
+                        .acme_dns_tsig_key
+                        .clone()
+                        .context("acme_dns_tsig_key is not set")?,
+                    secret: base64::engine::general_purpose::STANDARD
+                        .decode(secret.trim())
+                        .context("the TSIG secret is not base64")?,
+                })
+            }
             DnsProvider::Hook => Dns::Hook {
                 program: t
                     .acme_dns_hook
@@ -322,6 +345,10 @@ impl Dns {
     /// Create the TXT record; returns what `clear` needs to remove it.
     async fn set(&self, name: &str, value: &str) -> Result<String> {
         match self {
+            Dns::Rfc2136(u) => {
+                u.add_txt(name, value, 60).await?;
+                Ok(String::new())
+            }
             Dns::Hook { .. } => {
                 self.hook("set", name, value).await?;
                 Ok(String::new())
@@ -349,6 +376,7 @@ impl Dns {
 
     async fn clear(&self, name: &str, value: &str, id: &str) -> Result<()> {
         match self {
+            Dns::Rfc2136(u) => u.delete_txt(name, value).await,
             Dns::Hook { .. } => self.hook("clear", name, value).await,
             Dns::Cloudflare { .. } => {
                 let (zone, record) = id.split_once('/').unwrap_or_default();

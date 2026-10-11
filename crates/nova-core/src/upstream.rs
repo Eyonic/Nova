@@ -198,6 +198,17 @@ pub struct Backend {
     down_until: Mutex<Option<Instant>>,
 }
 
+impl Backend {
+    /// Not resting after a failure or a failed health check.
+    pub fn is_up(&self) -> bool {
+        Balancer::up(self, Instant::now())
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+}
+
 /// A chosen upstream; counts as in flight until dropped.
 pub struct Lease<'a> {
     pub backend: &'a Backend,

@@ -198,6 +198,13 @@ pub struct TlsConfig {
     pub acme_dns_hook: Option<PathBuf>,
     /// Wait this long after setting the records before asking the CA.
     pub acme_dns_propagation_secs: u64,
+    /// `rfc2136`: the primary DNS server (`host:port`) accepting signed
+    /// dynamic updates, the zone, and the TSIG key (HMAC-SHA256) whose
+    /// base64 secret is in the named environment variable.
+    pub acme_dns_server: Option<String>,
+    pub acme_dns_zone: Option<String>,
+    pub acme_dns_tsig_key: Option<String>,
+    pub acme_dns_tsig_secret_env: String,
     /// Generate a self-signed certificate for hosts ACME cannot serve
     /// (`localhost`, `*.localhost`, `*.test`, IP addresses, or everything when ACME is off).
     pub self_signed: bool,
@@ -225,6 +232,10 @@ impl Default for TlsConfig {
             acme_dns_api: "https://api.cloudflare.com/client/v4".into(),
             acme_dns_hook: None,
             acme_dns_propagation_secs: 30,
+            acme_dns_server: None,
+            acme_dns_zone: None,
+            acme_dns_tsig_key: None,
+            acme_dns_tsig_secret_env: "NOVA_TSIG_SECRET".into(),
             self_signed: true,
             hsts_max_age_secs: 31_536_000,
             certs: Vec::new(),
@@ -253,6 +264,9 @@ pub enum DnsProvider {
     #[default]
     Cloudflare,
     Hook,
+    /// RFC 2136 dynamic updates signed with TSIG (BIND, PowerDNS, Knot,
+    /// Technitium, many hosted DNS services).
+    Rfc2136,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

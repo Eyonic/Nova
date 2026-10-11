@@ -435,5 +435,22 @@ has "PHP pools ready gauge" "$METRICS" 'nova_php_ready 1'
 has "structured JSON logs in production" "$(dc logs nova 2>&1 | grep '"target":"nova::access"' | tail -1)" '"status":'
 has "x-request-id header" "$(curl -sI "$BASE/" | tr -d '\r')" "x-request-id:"
 
+section "Admin API"
+ADM=(-H 'X-Nova-Admin: 1')
+has "status lists the sites" "$(curl -s "$BASE/_nova/admin/status")" '"name":"worker"'
+has "status shows worker mode" "$(curl -s "$BASE/_nova/admin/status")" '"mode":"worker"'
+has "effective configuration" "$(curl -s "$BASE/_nova/admin/config")" '"site":['
+eq "POST without X-Nova-Admin refused" "$(code -X POST "$BASE/_nova/admin/reload")" 403
+eq "invalid configuration rejected" "$(code -X POST "${ADM[@]}" --data-binary 'version = 1
+[server]
+listen = "nonsense"' "$BASE/_nova/admin/config/validate")" 422
+eq "valid configuration accepted" "$(code -X POST "${ADM[@]}" --data-binary @config/nova.toml "$BASE/_nova/admin/config/validate")" 200
+eq "purge by tag" "$(code -X POST "${ADM[@]}" "$BASE/_nova/admin/purge?site=example&tags=post-1")" 200
+eq "purge needs a known site" "$(code -X POST "${ADM[@]}" "$BASE/_nova/admin/purge?site=nope")" 400
+RL=$(dc logs nova 2>&1 | grep -c "configuration reloaded")
+eq "reload accepted" "$(code -X POST "${ADM[@]}" "$BASE/_nova/admin/reload")" 202
+check "reload done through the control pipe" reloaded $((RL + 1)) "configuration reloaded"
+eq "serving after an API reload" "$(code "$BASE/")" 200
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -13,6 +13,7 @@
 //! in-flight requests drain, then the optimizer and PHP stop.
 
 pub mod access;
+pub mod admin;
 pub mod client;
 pub mod dbchanges;
 pub mod dictionaries;
@@ -27,6 +28,7 @@ pub mod metrics;
 pub mod microcache;
 pub mod php;
 pub mod ratelimit;
+pub mod rfc2136;
 pub mod rules;
 pub mod sites;
 pub mod tasks;
@@ -111,6 +113,8 @@ struct Runtime {
 struct Worker {
     child: tokio::process::Child,
     started: std::time::Instant,
+    /// Commands from the worker's admin API (`R` = reload).
+    control: Option<tokio::net::unix::pipe::Receiver>,
 }
 
 impl Worker {
@@ -143,6 +147,12 @@ impl Worker {
                 cmd.env(&c.password_env, v);
             }
         }
+        // The admin API token, if one is configured.
+        if let Some(var) = &cfg.server.admin_token_env
+            && let Ok(v) = std::env::var(var)
+        {
+            cmd.env(var, v);
+        }
         // Basic-auth password hashes (not secrets in themselves) the worker checks.
         for var in cfg
             .sites
@@ -169,11 +179,27 @@ impl Worker {
         };
         let write_fd = std::os::fd::AsRawFd::as_raw_fd(&write);
         cmd.env("NOVA_READY_FD", READY_FD.to_string());
+        // Control pipe: the worker's admin API asks the supervisor to reload.
+        let mut cfds = [0; 2];
+        // SAFETY: as above.
+        if unsafe { libc::pipe2(cfds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("creating the control pipe");
+        }
+        // SAFETY: both descriptors were just created and are owned here.
+        let (control_read, control_write) = unsafe {
+            use std::os::fd::FromRawFd;
+            (
+                std::os::fd::OwnedFd::from_raw_fd(cfds[0]),
+                std::os::fd::OwnedFd::from_raw_fd(cfds[1]),
+            )
+        };
+        let control_fd = std::os::fd::AsRawFd::as_raw_fd(&control_write);
+        cmd.env("NOVA_CONTROL_FD", CONTROL_FD.to_string());
         // SAFETY: dup2 is async-signal-safe; it only places the inherited
-        // write end at a fixed descriptor number without CLOEXEC.
+        // write ends at fixed descriptor numbers without CLOEXEC.
         unsafe {
             cmd.pre_exec(move || {
-                if libc::dup2(write_fd, READY_FD) < 0 {
+                if libc::dup2(write_fd, READY_FD) < 0 || libc::dup2(control_fd, CONTROL_FD) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -184,10 +210,12 @@ impl Worker {
             .spawn()
             .context("starting the worker")?;
         drop(write);
+        drop(control_write);
         tracing::info!(pid = child.id(), uid, "worker started");
         let mut w = Worker {
             child,
             started: std::time::Instant::now(),
+            control: tokio::net::unix::pipe::Receiver::from_owned_fd(control_read).ok(),
         };
         if wait_ready {
             let mut pipe =
@@ -224,6 +252,15 @@ impl Worker {
 
 /// Descriptor number of the readiness pipe inside the worker.
 const READY_FD: i32 = 3;
+const CONTROL_FD: i32 = 4;
+
+/// The worker's end of the control pipe (strict isolation only).
+pub fn control_pipe() -> Option<std::fs::File> {
+    let fd = std::env::var("NOVA_CONTROL_FD").ok()?.parse::<i32>().ok()?;
+    // SAFETY: the supervisor placed the pipe's write end at this descriptor;
+    // it is taken exactly once, at worker start.
+    Some(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+}
 
 /// Strict mode: run the worker, restart it if it crashes, reload on SIGHUP
 /// without dropping connections, and drain on SIGTERM/SIGINT.
@@ -260,6 +297,25 @@ async fn supervise(rt: &mut Runtime, config_path: &Path) -> Result<()> {
                 worker.stop(grace).await;
                 return Ok(());
             }
+            cmd = read_control(&mut worker.control) => {
+                if cmd != Some(b'R') {
+                    // The pipe closed (worker exiting): stop watching it.
+                    worker.control = None;
+                    continue;
+                }
+                tracing::info!("admin API asked for a reload");
+                match reload(rt, config_path).await {
+                    Ok(()) => match Worker::spawn(&rt.cfg, config_path, true).await {
+                        Ok(new) => {
+                            let mut old = std::mem::replace(&mut worker, new);
+                            tokio::spawn(async move { old.stop(grace).await });
+                            tracing::info!("configuration reloaded");
+                        }
+                        Err(e) => tracing::error!(error = %e, "reload: keeping the previous worker"),
+                    },
+                    Err(e) => tracing::error!(error = format!("{e:#}"), "reload rejected; nothing changed"),
+                }
+            }
             _ = hup.recv() => {
                 tracing::info!("received SIGHUP; reloading configuration");
                 match reload(rt, config_path).await {
@@ -277,6 +333,18 @@ async fn supervise(rt: &mut Runtime, config_path: &Path) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+/// Next command byte from the worker; pending forever without a pipe.
+async fn read_control(pipe: &mut Option<tokio::net::unix::pipe::Receiver>) -> Option<u8> {
+    let Some(p) = pipe else {
+        return std::future::pending().await;
+    };
+    let mut b = [0u8; 1];
+    match tokio::io::AsyncReadExt::read(p, &mut b).await {
+        Ok(1) => Some(b[0]),
+        _ => None,
     }
 }
 
@@ -372,6 +440,7 @@ async fn run_worker(
         Arc::new(live::LiveHub::new(cfg.live.clone())),
     );
     app.tracer = crate::telemetry::Tracer::start(&cfg.telemetry).map(Arc::new);
+    app.admin = Some(Arc::new(crate::admin::Admin::new(&cfg, control_pipe())));
     let comp = &cfg.server.compression;
     if comp.enabled {
         app.compression = Some(nova_http::compress::Options {

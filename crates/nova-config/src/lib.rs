@@ -156,6 +156,9 @@ pub struct ServerConfig {
     pub metrics: bool,
     pub compression: CompressionConfig,
     /// Clients allowed to read `/_nova/metrics` and `/_nova/optimize/status`.
+    /// Environment variable with a bearer token the admin API
+    /// (`/_nova/admin/...`) requires on top of `admin_allow`.
+    pub admin_token_env: Option<String>,
     pub admin_allow: Vec<Cidr>,
     /// Reverse proxies whose forwarding headers (see `forwarded_header`)
     /// and PROXY protocol headers are trusted. List the proxies themselves,
@@ -206,6 +209,7 @@ impl Default for ServerConfig {
             metrics: true,
             compression: CompressionConfig::default(),
             admin_allow: http::default_admin_allow(),
+            admin_token_env: None,
             trusted_proxies: Vec::new(),
             forwarded_header: ForwardedHeader::default(),
             proxy_protocol: false,
@@ -982,6 +986,14 @@ impl Config {
                 match tls.acme_dns_provider {
                     DnsProvider::Cloudflare if !valid_env_name(&tls.acme_dns_token_env) => {
                         errs.push("server.tls.acme_dns_token_env must be a variable name".into())
+                    }
+                    DnsProvider::Rfc2136
+                        if tls.acme_dns_server.is_none()
+                            || tls.acme_dns_zone.is_none()
+                            || tls.acme_dns_tsig_key.is_none()
+                            || !valid_env_name(&tls.acme_dns_tsig_secret_env) =>
+                    {
+                        errs.push("server.tls.acme_dns_provider = \"rfc2136\" needs acme_dns_server, acme_dns_zone, acme_dns_tsig_key and acme_dns_tsig_secret_env".into())
                     }
                     DnsProvider::Hook if !tls.acme_dns_hook.as_ref().is_some_and(|h| h.is_absolute()) => {
                         errs.push("server.tls.acme_dns_provider = \"hook\" needs an absolute acme_dns_hook".into())
