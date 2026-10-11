@@ -727,6 +727,31 @@ pub struct SitePhpConfig {
     /// serves every front-controller request; other `.php` files still run
     /// in FPM. Each worker is replaced after `max_requests`.
     pub worker: Option<String>,
+    /// How the worker script takes requests: `roadrunner` (spiral/
+    /// roadrunner-http, Octane's RoadRunner worker) or `frankenphp`
+    /// (`frankenphp_handle_request()`, provided by NOVA's PHP extension:
+    /// Octane's FrankenPHP worker, Symfony's FrankenPHP runtime). `worker
+    /// = "laravel"` always uses `frankenphp`.
+    pub worker_api: WorkerApi,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerApi {
+    #[default]
+    Roadrunner,
+    Frankenphp,
+}
+
+impl SitePhpConfig {
+    /// The API the configured worker speaks.
+    pub fn effective_worker_api(&self) -> WorkerApi {
+        if self.worker.as_deref() == Some("laravel") {
+            WorkerApi::Frankenphp
+        } else {
+            self.worker_api
+        }
+    }
 }
 
 impl Default for SitePhpConfig {
@@ -743,6 +768,7 @@ impl Default for SitePhpConfig {
             micro_cache_secs: 0,
             micro_cache_grace_secs: 10,
             worker: None,
+            worker_api: WorkerApi::default(),
         }
     }
 }

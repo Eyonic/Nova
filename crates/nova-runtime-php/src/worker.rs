@@ -36,6 +36,9 @@ pub struct WorkerPool {
     /// RoadRunner workers expect urlencoded forms parsed by the server;
     /// NOVA's own workers parse them in PHP and keep the raw body.
     parse_urlencoded: bool,
+    /// The worker uses NOVA's PHP extension (`frankenphp_handle_request`):
+    /// CGI parameters in, CGI response out.
+    fastcgi: bool,
     site: String,
     idle: Mutex<Vec<WorkerConn>>,
     /// One permit per idle connection.
@@ -84,6 +87,7 @@ impl WorkerPool {
         max_requests: u32,
         expose_errors: bool,
         parse_urlencoded: bool,
+        fastcgi: bool,
         site: &str,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -92,6 +96,7 @@ impl WorkerPool {
             max_requests: max_requests.max(1),
             expose_errors,
             parse_urlencoded,
+            fastcgi,
             site: site.to_string(),
             idle: Mutex::new(Vec::new()),
             ready: Semaphore::new(0),
@@ -180,7 +185,10 @@ impl WorkerPool {
     ) -> Result<PhpResponse, PhpError> {
         let timeout = req.timeout;
         let deadline = Instant::now() + timeout;
-        let frame = encode_request(&req, self.parse_urlencoded);
+        let frame = match &req.server {
+            Some(params) if self.fastcgi => encode_fastcgi(params, &req.body),
+            _ => encode_request(&req, self.parse_urlencoded),
+        };
         let conn = self.take(timeout).await?;
         let (head_tx, head_rx) = oneshot::channel();
         tokio::spawn(Arc::clone(self).exchange(conn, frame, deadline, timeout, head_tx));
@@ -305,7 +313,12 @@ impl WorkerPool {
             let (head, body) = f.split().map_err(|e| PhpError::Protocol(e.to_string()))?;
             let more = f.byte10 & goridge::STREAM != 0;
             if let Some(tx) = head_tx.take() {
-                let Some((status, headers)) = parse_head(&head)? else {
+                let parsed = if f.byte11 & goridge::NOVA_CGI_HEAD != 0 {
+                    crate::client::parse_cgi_headers(&head).map(Some)?
+                } else {
+                    parse_head(&head)?
+                };
+                let Some((status, headers)) = parsed else {
                     // `{"stop":true}`: the worker is quitting instead of answering.
                     let _ = tx.send(Err(PhpError::Protocol("PHP worker stopped".into())));
                     return Ok(false);
@@ -423,6 +436,15 @@ fn parse_head(head: &[u8]) -> Result<Option<(StatusCode, HeaderMap)>, PhpError> 
         }
     }
     Ok(Some((status, headers)))
+}
+
+/// Request frame for NOVA's PHP extension: FastCGI-encoded parameters
+/// (exactly what PHP-FPM would get), then the raw body.
+pub fn encode_fastcgi(params: &[(Vec<u8>, Vec<u8>)], body: &[u8]) -> Frame {
+    let encoded = crate::fastcgi::encode_params(params.iter().map(|(k, v)| (&k[..], &v[..])));
+    let mut f = Frame::message(&encoded, body);
+    f.byte11 = goridge::NOVA_FASTCGI;
+    f
 }
 
 /// Request frame: RoadRunner's JSON context, then the raw body. Form
@@ -584,7 +606,7 @@ mod tests {
     async fn exchange_with_a_fake_worker() {
         let dir = std::env::temp_dir().join(format!("nova-wk-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let pool = WorkerPool::new(dir.join("w.sock"), vec![], 2, false, true, "t");
+        let pool = WorkerPool::new(dir.join("w.sock"), vec![], 2, false, true, false, "t");
         pool.listen().unwrap();
         // A worker that streams two chunks, then answers plainly.
         let mut php = UnixStream::connect(pool.socket()).await.unwrap();

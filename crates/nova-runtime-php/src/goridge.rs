@@ -33,6 +33,11 @@ pub const PONG: u8 = 0x08;
 /// byte11: the body is `application/x-www-form-urlencoded` or
 /// `multipart/form-data` and still has to be parsed (see [`crate::form`]).
 pub const NOVA_PARSE_FORM: u8 = 0x01;
+/// byte11 of a request: the header part is FastCGI-encoded CGI parameters
+/// (NOVA's PHP extension, `frankenphp_handle_request()`).
+pub const NOVA_FASTCGI: u8 = 0x02;
+/// byte11 of a response: the header part is a CGI header block.
+pub const NOVA_CGI_HEAD: u8 = 0x02;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Frame {

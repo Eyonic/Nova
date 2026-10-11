@@ -96,7 +96,8 @@ pub fn master_ini(cfg: &Config, site: &SiteConfig) -> BTreeMap<String, String> {
     ini
 }
 
-/// `[site.php] worker = "laravel"`: NOVA's own Octane worker.
+/// `[site.php] worker = "laravel"`: Laravel Octane's FrankenPHP worker,
+/// run on NOVA's PHP extension.
 pub const LARAVEL_WORKER: &str = "laravel";
 const LARAVEL_WORKER_SOURCE: &str = include_str!("php/laravel-worker.php");
 

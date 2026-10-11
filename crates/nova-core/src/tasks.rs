@@ -178,12 +178,29 @@ fn php_workers_spec(cfg: &Config, site: &SiteConfig, mode: Effective) -> Result<
     } else {
         site.path.join(script)
     };
+    let frankenphp = php.effective_worker_api() == nova_config::WorkerApi::Frankenphp;
+    if frankenphp {
+        // NOVA's PHP extension provides frankenphp_handle_request().
+        command.push("-d".into());
+        command.push("extension=nova".into());
+    }
     command.push(script_path.display().to_string());
     let mut spec = spec(cfg, site, mode, "php-workers", &command)?;
     spec.env
         .insert("APP_BASE_PATH".into(), site.path.display().to_string());
     if script == php::LARAVEL_WORKER || script.contains("laravel/octane") {
         spec.env.insert("LARAVEL_OCTANE".into(), "1".into());
+    }
+    if frankenphp {
+        spec.env.insert("NOVA_WORKER".into(), "1".into());
+        spec.env.insert("FRANKENPHP_WORKER".into(), "1".into());
+        spec.env.insert(
+            "APP_PUBLIC_PATH".into(),
+            site.document_root().display().to_string(),
+        );
+        // Octane's FrankenPHP worker exits after MAX_REQUESTS (default 1000).
+        spec.env
+            .insert("MAX_REQUESTS".into(), php.max_requests.to_string());
     }
     // These are web workers even though PHP_SAPI is "cli": without this,
     // Symfony picks its CLI error renderer, which prints full exception

@@ -45,7 +45,7 @@ pub struct SitePhp {
     pub pool: std::sync::Arc<nova_runtime_php::Pool>,
     /// Worker mode: booted application workers for front-controller requests.
     pub worker: Option<std::sync::Arc<nova_runtime_php::WorkerPool>>,
-    /// The worker is NOVA's own (`worker = "laravel"`).
+    /// The worker takes CGI parameters (`worker_api = "frankenphp"`).
     pub worker_native: bool,
 }
 
@@ -87,8 +87,9 @@ impl Sites {
                     .then(|| Duration::from_secs(p.micro_cache_secs)),
                 micro_cache_grace: Duration::from_secs(p.micro_cache_grace_secs),
                 pool: nova_runtime_php::Pool::new(php_socket(cfg, s), p.max_children),
-                worker_native: p.worker.as_deref() == Some(crate::php::LARAVEL_WORKER),
-                worker: p.worker.as_ref().map(|w| {
+                worker_native: p.effective_worker_api() == nova_config::WorkerApi::Frankenphp,
+                worker: p.worker.as_ref().map(|_| {
+                    let frankenphp = p.effective_worker_api() == nova_config::WorkerApi::Frankenphp;
                     // SAFETY: getuid has no preconditions.
                     let own = unsafe { libc::getuid() };
                     nova_runtime_php::WorkerPool::new(
@@ -96,7 +97,8 @@ impl Sites {
                         vec![cfg.site_uid(s), own],
                         p.max_requests,
                         cfg.mode.is_dev(),
-                        w != crate::php::LARAVEL_WORKER,
+                        !frankenphp,
+                        frankenphp,
                         &s.name,
                     )
                 }),

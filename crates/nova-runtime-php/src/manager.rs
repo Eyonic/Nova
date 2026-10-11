@@ -380,7 +380,7 @@ async fn relay(
                             }
                         }
                     }
-                    f.byte11 = 0;
+                    f.byte11 &= !goridge::NOVA_PARSE_FORM;
                 }
                 if f.write_to(&mut w.stdin).await.is_err() {
                     return Outcome::Respawn;
