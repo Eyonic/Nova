@@ -93,7 +93,13 @@ Trust is deliberately narrow:
 |---|---|
 | Script Optimizer objects | text assets in the document root, precompressed in the background (brotli 11, zstd 19, gzip 9; lighter levels above 512 KiB) |
 | `file.br` / `file.zst` / `file.gz` next to a static file | build output that ships its own precompressed files (must be at least as new as the original) |
-| On the fly (brotli 5, zstd 3, gzip 6) | PHP output, error pages and anything else compressible |
+| On the fly (zstd 3, brotli 5, gzip 6) | PHP output, error pages and anything else compressible |
+
+Stored and precompressed objects prefer brotli (best ratio, cost paid once).
+On the fly NOVA prefers zstd when the client accepts it (Chrome, Edge,
+Firefox): a tenth of brotli's CPU for about 12% more bytes on HTML, which
+turned a CPU-bound Laravel page from 1 030 into 4 700 req/s. Explicit
+q-values in `Accept-Encoding` still decide.
 
 Never compressed: images other than SVG/ICO, fonts already compressed
 (WOFF/WOFF2), archives, `text/event-stream`, 206 responses, responses with

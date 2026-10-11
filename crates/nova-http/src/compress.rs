@@ -28,6 +28,11 @@ pub enum Encoding {
 impl Encoding {
     /// Server preference when the client rates several encodings equally.
     pub const PREFERENCE: [Encoding; 3] = [Encoding::Brotli, Encoding::Zstd, Encoding::Gzip];
+    /// For compressing on the fly: zstd (level 3) costs a tenth of the CPU
+    /// of brotli (level 5) for ~12% more bytes on HTML; precompressed files
+    /// keep [`Self::PREFERENCE`], their cost is paid once.
+    pub const DYNAMIC_PREFERENCE: [Encoding; 3] =
+        [Encoding::Zstd, Encoding::Brotli, Encoding::Gzip];
 
     /// The `Content-Encoding` token.
     pub fn token(self) -> &'static str {
@@ -57,6 +62,16 @@ pub struct Options {
 /// Encodings the client accepts, best first: by q-value, then by
 /// [`Encoding::PREFERENCE`]. `*` covers encodings not listed explicitly.
 pub fn accepted(accept_encoding: Option<&str>) -> Vec<Encoding> {
+    accepted_by(accept_encoding, &Encoding::PREFERENCE)
+}
+
+/// Like [`accepted`], with [`Encoding::DYNAMIC_PREFERENCE`] among equal
+/// q-values.
+pub fn accepted_dynamic(accept_encoding: Option<&str>) -> Vec<Encoding> {
+    accepted_by(accept_encoding, &Encoding::DYNAMIC_PREFERENCE)
+}
+
+fn accepted_by(accept_encoding: Option<&str>, preference: &[Encoding]) -> Vec<Encoding> {
     let Some(value) = accept_encoding else {
         return Vec::new();
     };
@@ -75,7 +90,7 @@ pub fn accepted(accept_encoding: Option<&str>) -> Vec<Encoding> {
     }
     let q_of = |name: &str| explicit.iter().find(|(t, _)| t == name).map(|(_, q)| *q);
     let star = q_of("*").unwrap_or(0.0);
-    let mut out: Vec<(Encoding, f32)> = Encoding::PREFERENCE
+    let mut out: Vec<(Encoding, f32)> = preference
         .iter()
         .map(|&e| {
             let q = match e {
@@ -178,7 +193,7 @@ pub fn apply(
     add_vary(resp.headers_mut(), "Accept-Encoding");
 
     let status = resp.status();
-    let Some(encoding) = accepted(accept_encoding).first().copied() else {
+    let Some(encoding) = accepted_dynamic(accept_encoding).first().copied() else {
         return resp;
     };
     if status == StatusCode::NOT_MODIFIED {
@@ -271,6 +286,13 @@ mod tests {
         assert_eq!(accepted(Some("identity")), vec![]);
         assert_eq!(accepted(Some("x-gzip")), vec![Gzip]);
         assert_eq!(accepted(Some("*;q=0")), vec![]);
+        // On the fly, zstd wins ties; explicit q-values still decide.
+        assert_eq!(
+            accepted_dynamic(Some("gzip, deflate, br, zstd")),
+            vec![Zstd, Brotli, Gzip]
+        );
+        assert_eq!(accepted_dynamic(Some("gzip, br")), vec![Brotli, Gzip]);
+        assert_eq!(accepted_dynamic(Some("zstd;q=0.5, br")), vec![Brotli, Zstd]);
     }
 
     #[test]
