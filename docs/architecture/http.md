@@ -307,6 +307,25 @@ Measured on Laravel 13 (8 workers, same machine, uncompressed responses):
 | RoadRunner 3.0 + Octane | 7 090 req/s | 5 210 req/s |
 | **NOVA worker mode + Octane** | **8 220 req/s** | **6 090 req/s** |
 
+Symfony 8 with `composer require runtime/roadrunner-symfony-nyholm` (also
+tested: 5 800 -> 25 000 req/s on a JSON route, 4 800 -> 19 300 on a Twig page):
+
+```toml
+[site.env]
+APP_ENV = "prod"
+APP_RUNTIME = 'Runtime\RoadRunnerSymfonyNyholm\Runtime'
+APP_CACHE_DIR = "/var/lib/nova/sites/shop/cache"   # the project is read-only to PHP
+
+[site.php]
+front_controller = "index.php"
+worker = "public/index.php"
+```
+
+NOVA sets `APP_RUNTIME_MODE=web=1&worker=1` for workers (unless the site
+sets it): without it Symfony treats a CLI worker as a console process and
+renders exceptions with its CLI renderer, full details included, even in
+production. Plain RoadRunner setups have that leak.
+
 How it works and what NOVA adds:
 
 * Only front-controller requests go to the workers; other `.php` files
