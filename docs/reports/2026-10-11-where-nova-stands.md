@@ -40,7 +40,7 @@ req/s on a JSON route, 4 800 -> 19 300 on a Twig page.
 After the request-path work of experiments #40-#41 (same lab, later run):
 Laravel `/up` NOVA 11 700 vs FrankenPHP 12 300 req/s (95%), JSON route
 8 500 vs 9 600 (88%), 70 KB page about 76%. On Unraid with a 4-CPU limit
-for both: 5 015 vs 6 050 (83%; it was 57% before the fix).
+for both: 5 160 vs 6 040 (85%; it was 57% before this work).
 
 NOVA beats RoadRunner by 16-32% and runs Laravel at 3-4x its FPM speed.
 FrankenPHP stays ahead (8-25%) because it runs PHP inside the server
