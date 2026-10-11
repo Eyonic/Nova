@@ -167,10 +167,8 @@ fn main() -> ExitCode {
             grace,
             watch,
             command,
-        } => tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+        } => tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .thread_name("nova-php-workers")
             .build()
             .map_err(anyhow::Error::from)
             .and_then(|rt| {

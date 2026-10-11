@@ -26,7 +26,7 @@ use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, watch};
@@ -395,9 +395,7 @@ async fn relay(
                     return Outcome::Respawn;
                 };
                 let last = f.flags & goridge::CONTROL == 0 && f.byte10 & goridge::STREAM == 0;
-                let mut buf = bytes::BytesMut::new();
-                f.encode(&mut buf);
-                if wr.write_all(&buf).await.is_err() {
+                if f.write_to(&mut wr).await.is_err() {
                     return if busy { Outcome::Respawn } else { Outcome::Reconnect };
                 }
                 if busy && last {

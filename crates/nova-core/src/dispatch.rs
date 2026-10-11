@@ -2191,7 +2191,14 @@ async fn probe_with(site: &Site, p: &Path, cache_missing: bool) -> Probe {
 
 async fn resolve_target(site: &Site, safe: &SafePath, query: Option<&str>) -> Target {
     let full = site.root.join(safe.to_path());
-    match probe(site, &full).await {
+    // With a front controller most URLs are routes, not files: remember
+    // "missing" too (a new file shows up within PROBE_TTL), or every
+    // route costs a stat in the blocking pool.
+    let routes = site
+        .php
+        .as_ref()
+        .is_some_and(|p| p.front_controller.is_some());
+    match probe_with(site, &full, routes).await {
         Probe::Escapes => return Target::NotFound,
         Probe::File(c, m) => {
             if is_php(&c) {
@@ -2268,9 +2275,8 @@ async fn resolve_target(site: &Site, safe: &SafePath, query: Option<&str>) -> Ta
         .and_then(|p| p.front_controller.as_deref())
     {
         let f = site.root.join(fc.trim_start_matches('/'));
-        if file_meta(&f).await.is_some()
-            && let Some(c) = contained(site, &f).await
-        {
+        // Through the probe cache: this runs for every pretty URL.
+        if let Probe::File(c, _) = probe(site, &f).await {
             return Target::Php {
                 script: c,
                 script_name: fc.to_string(),

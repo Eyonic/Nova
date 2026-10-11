@@ -76,6 +76,12 @@ impl Frame {
     }
 
     pub fn encode(&self, out: &mut BytesMut) {
+        self.encode_head(out);
+        out.put_slice(&self.payload);
+    }
+
+    /// The 12-byte header and the options (everything before the payload).
+    fn encode_head(&self, out: &mut BytesMut) {
         let words = 3 + self.options.len() as u8;
         let mut head = [0u8; 12];
         head[0] = VERSION << 4 | words;
@@ -90,12 +96,17 @@ impl Frame {
         for o in &self.options {
             out.put_u32_le(*o);
         }
-        out.put_slice(&self.payload);
     }
 
     pub async fn write_to<W: AsyncWrite + Unpin>(&self, w: &mut W) -> io::Result<()> {
         let mut buf = BytesMut::new();
-        self.encode(&mut buf);
+        self.encode_head(&mut buf);
+        if self.payload.len() >= 16 * 1024 {
+            // Large payloads go out as they are: one copy fewer.
+            w.write_all(&buf).await?;
+            return w.write_all(&self.payload).await;
+        }
+        buf.put_slice(&self.payload);
         w.write_all(&buf).await
     }
 }
@@ -126,8 +137,15 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> io::Resu
     }
     let mut opts = vec![0u8; (words - 3) * 4];
     r.read_exact(&mut opts).await?;
-    let mut payload = BytesMut::zeroed(len);
-    r.read_exact(&mut payload).await?;
+    // Read straight into uninitialised capacity: no zeroing of (possibly
+    // large) response bodies, and never past this frame.
+    let mut payload = BytesMut::with_capacity(len);
+    while payload.len() < len {
+        let want = (len - payload.len()) as u64;
+        if (&mut *r).take(want).read_buf(&mut payload).await? == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+    }
     Ok(Frame {
         flags: head[1],
         byte10: head[10],
