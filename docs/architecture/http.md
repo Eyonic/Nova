@@ -464,6 +464,32 @@ Measured on a naive 12-image gallery (Chromium, Fast 4G): load 1.2 s ->
 bytes before load 974 KB -> 59 KB, whole page on a phone 974 KB -> 110 KB.
 Reproduce: `tests/browser/rewrite/` (page + Playwright script).
 
+## Early Hints (`early_hints`, on by default)
+
+While PHP builds a page, the browser waits for the HTML before it can even
+start fetching the stylesheets and scripts. NOVA remembers, per page path,
+what the page's `<head>` loads (learned from its own responses, refreshed
+every minute) and sends it as `103 Early Hints` the moment a navigation
+arrives, before PHP runs:
+
+```
+HTTP/2 103
+link: </wp-includes/css/style.min.css?ver=7.1>; rel=preload; as=style
+link: </js/app.js>; rel=preload; as=script
+link: <https://fonts.googleapis.com>; rel=preconnect
+```
+
+Chrome, Edge and Firefox start those downloads during the server's think
+time (HTTP/2 and HTTP/3; browsers ignore 103 on HTTP/1.1). Measured with
+`tests/browser/earlyhints` (Chromium, 200 ms of PHP, 160 KB stylesheet):
+page load 392 -> 296 ms at 80 ms latency, 461 -> 367 ms at 150 ms.
+
+Only navigations get hints (`Sec-Fetch-Mode: navigate`, or `Accept:
+text/html`), only for requests that reach PHP (micro-cache hits are
+answered at once), at most eight links: same-origin stylesheets, scripts,
+module scripts and explicit preloads, plus up to three `preconnect`s for
+third-party origins. `early_hints = false` on a `[[site]]` turns it off.
+
 ## Instant navigation (`speculation_rules`, opt-in)
 
 ```toml

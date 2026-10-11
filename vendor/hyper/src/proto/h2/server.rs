@@ -16,7 +16,7 @@ use crate::body::{Body, Incoming as IncomingBody};
 use crate::common::date;
 use crate::common::io::Compat;
 use crate::common::time::Time;
-use crate::ext::Protocol;
+use crate::ext::{informational_channel, InformationalReceiver, Protocol};
 use crate::headers;
 use crate::proto::h2::ping::Recorder;
 use crate::proto::Dispatched;
@@ -304,11 +304,14 @@ where
                         if let Some(protocol) = req.extensions_mut().remove::<h2::ext::Protocol>() {
                             req.extensions_mut().insert(Protocol::from_inner(protocol));
                         }
+                        let (informational_tx, informational_rx) = informational_channel();
+                        req.extensions_mut().insert(informational_tx);
 
                         let fut = H2Stream::new(
                             service.call(req),
                             connect_parts,
                             respond,
+                            informational_rx,
                             self.date_header,
                             exec.clone(),
                         );
@@ -365,6 +368,7 @@ pin_project! {
         B: Body,
     {
         reply: SendResponse<SendBuf<B::Data>>,
+        informational: InformationalReceiver,
         #[pin]
         state: H2StreamState<F, B>,
         date_header: bool,
@@ -404,11 +408,13 @@ where
         fut: F,
         connect_parts: Option<ConnectParts>,
         respond: SendResponse<SendBuf<B::Data>>,
+        informational: InformationalReceiver,
         date_header: bool,
         exec: E,
     ) -> H2Stream<F, B, E> {
         H2Stream {
             reply: respond,
+            informational,
             state: H2StreamState::Service { fut, connect_parts },
             date_header,
             exec,
@@ -446,7 +452,21 @@ where
                     fut: h,
                     connect_parts,
                 } => {
-                    let res = match h.poll(cx) {
+                    let polled = h.poll(cx);
+                    // Interim responses the service queued (e.g. 103 Early
+                    // Hints) go out while it keeps working.
+                    if polled.is_pending() {
+                        while let Poll::Ready(interim) = me.informational.poll_take(cx) {
+                            for res in interim {
+                                if let Err(_e) = me.reply.send_informational(res) {
+                                    debug!("send informational response error: {}", _e);
+                                }
+                            }
+                        }
+                    } else {
+                        me.informational.close();
+                    }
+                    let res = match polled {
                         Poll::Ready(Ok(r)) => r,
                         Poll::Pending => {
                             // Response is not yet ready, so we want to check if the client has sent a

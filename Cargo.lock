@@ -2360,6 +2360,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "lol_html",
+ "memchr",
  "mysql_async",
  "nova-config",
  "nova-http",

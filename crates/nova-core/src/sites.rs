@@ -18,6 +18,7 @@ pub struct Site {
     pub optimize: bool,
     pub html_rewrite: bool,
     pub speculation_rules: bool,
+    pub early_hints: bool,
     pub rules: SiteRules,
 }
 
@@ -109,6 +110,7 @@ impl Sites {
                 optimize: s.optimize,
                 html_rewrite: s.html_rewrite,
                 speculation_rules: s.speculation_rules,
+                early_hints: s.early_hints,
                 rules,
             });
         }

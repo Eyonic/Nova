@@ -197,7 +197,25 @@ async fn request<H: Handler>(
         tls: true,
         http3: true,
     };
-    let resp = handler.handle(req, info).await;
+    // 103 Early Hints sent while the handler works on the final response.
+    let (hints_tx, mut hints_rx) = tokio::sync::mpsc::unbounded_channel::<http::HeaderMap>();
+    let mut req = req;
+    req.extensions_mut()
+        .insert(crate::EarlyHints::new(move |headers| {
+            hints_tx.send(headers).is_ok()
+        }));
+    let resp = {
+        let mut handling = std::pin::pin!(handler.handle(req, info));
+        loop {
+            tokio::select! {
+                resp = &mut handling => break resp,
+                Some(headers) = hints_rx.recv() => {
+                    let _ = send.send_response(crate::early_hints_response(headers)).await;
+                }
+            }
+        }
+    };
+    drop(hints_rx);
     let (mut parts, mut body) = resp.into_parts();
     // Connection-specific headers are not allowed in HTTP/3 (RFC 9114 §4.2).
     for h in [

@@ -153,6 +153,12 @@ section "HTTPS, HTTP/2, HTTP/3"
 eq "HTTPS with HTTP/2" "$(curl -sk -o /dev/null -w '%{http_code} %{http_version}' "$TBASE/")" "200 2"
 has "PHP sees HTTPS" "$(curl -sk "$TBASE/info.php")" '"https": "on"'
 has "HTTP/3 advertised" "$(curl -skI "$TBASE/" | tr -d '\r')" 'alt-svc: h3=":'
+EH=(-sk --http2 -o /dev/null -D - -H 'Host: showcase.localhost' -H 'Sec-Fetch-Mode: navigate' -H 'Accept: text/html')
+curl "${EH[@]}" "$TBASE/" >/dev/null
+H=$(curl "${EH[@]}" "$TBASE/" | tr -d '\r')
+has "103 Early Hints learned from the page" "$H" "HTTP/2 103"
+has "early hint preloads the page's stylesheet" "$H" "rel=preload; as=style"
+hasnt "no Early Hints for non-navigations" "$(curl -sk --http2 -o /dev/null -D - -H 'Host: showcase.localhost' "$TBASE/" | tr -d '\r')" "103"
 eq "HTTP/3 over QUIC" "$(curl -sk --http3-only -o /dev/null -w '%{http_code} %{http_version}' "$TBASE/")" "200 3"
 eq "HTTP/3 PHP request with a body" "$(curl -sk --http3-only -d 'a=1' "$TBASE/info.php" | grep -c '"a": "1"')" 1
 eq "plain HTTP not forced to HTTPS for local hosts" "$(code "$BASE/")" 200

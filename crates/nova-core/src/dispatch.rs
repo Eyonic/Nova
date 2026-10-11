@@ -58,6 +58,7 @@ pub struct App {
     seq: AtomicU64,
     /// `[site.php] micro_cache_secs` storage, shared by all sites.
     pub micro: Arc<crate::microcache::MicroCache>,
+    pub early: Arc<crate::earlyhints::EarlyHints>,
     /// Remembered asset versions for compression dictionaries (RFC 9842).
     dictionaries: crate::dictionaries::Dictionaries,
     /// Keep-alive pool for `[site.proxy]` upstreams.
@@ -102,6 +103,7 @@ impl App {
             boot,
             seq: AtomicU64::new(0),
             micro: Arc::default(),
+            early: Arc::default(),
             dictionaries: Default::default(),
             upstream: crate::upstream::http_client(),
             acme_http01: std::sync::OnceLock::new(),
@@ -855,6 +857,26 @@ impl App {
             Version::HTTP_3 => "HTTP/3.0",
             _ => "HTTP/1.1",
         };
+        // 103 Early Hints: what this page loaded last time, while PHP works.
+        let navigation = site.early_hints
+            && parts.method == Method::GET
+            && parts.headers.get("sec-fetch-mode").map_or_else(
+                || {
+                    parts
+                        .headers
+                        .get(header::ACCEPT)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|v| v.contains("text/html"))
+                },
+                |m| m == "navigate",
+            );
+        if navigation
+            && let Some(sender) = parts.extensions.get::<nova_http::EarlyHints>()
+            && let Some(links) = self.early.hints(&site.name, parts.uri.path())
+        {
+            sender.send(links);
+        }
+        let page_path = parts.uri.path().to_string();
         let worker = php
             .worker
             .as_ref()
@@ -1021,6 +1043,22 @@ impl App {
             HeaderValue::from_static("Nova-Live, Nova-Target"),
         );
 
+        // Early Hints: learn what this page loads from its <head>.
+        let learn = (navigation
+            && r.status == StatusCode::OK
+            && headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("text/html"))
+            && self.early.wants(&site.name, &page_path))
+        .then(|| {
+            (
+                Arc::clone(&self.early),
+                site.name.clone(),
+                page_path.clone(),
+                host.to_string(),
+            )
+        });
         let mut rx = r.body;
         // Cacheable: buffer up to MAX_ENTRY; anything larger (or failing)
         // is streamed on from where buffering stopped, and not stored.
@@ -1046,6 +1084,9 @@ impl App {
                             body.extend_from_slice(b);
                         }
                         let body = body.freeze();
+                        if let Some((early, site_name, path, host)) = &learn {
+                            early.learn(site_name, host, path, &body);
+                        }
                         self.micro.put(
                             key,
                             r.status,
@@ -1071,8 +1112,28 @@ impl App {
         let rest = futures_util::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
         });
+        let mut scan = learn.map(|l| (l, Vec::new()));
         let body = futures_util::stream::iter(prefix)
             .chain(rest)
+            .inspect(move |item| {
+                // Copy the start of the page until `</head>`, then learn once.
+                let Some(((early, site_name, path, host), head)) = &mut scan else {
+                    return;
+                };
+                let done = match item {
+                    Ok(b) => {
+                        let take = b.len().min(crate::earlyhints::SCAN_LIMIT - head.len());
+                        head.extend_from_slice(&b[..take]);
+                        head.len() >= crate::earlyhints::SCAN_LIMIT
+                            || memchr::memmem::find(head, b"</head").is_some()
+                    }
+                    Err(_) => true,
+                };
+                if done {
+                    early.learn(site_name, host, path, head);
+                    scan = None;
+                }
+            })
             .map(|item| item.map(Frame::data));
         let mut resp = Response::new(StreamBody::new(body).boxed_unsync());
         *resp.status_mut() = r.status;
@@ -1778,6 +1839,7 @@ mod tests {
             optimize: false,
             html_rewrite: false,
             speculation_rules: false,
+            early_hints: false,
         }
     }
 

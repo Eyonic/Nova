@@ -60,6 +60,13 @@ mod send_file;
 #[cfg(all(feature = "http1", feature = "server"))]
 pub use send_file::SendFile;
 
+#[cfg(all(feature = "http2", feature = "server"))]
+mod informational_sender;
+#[cfg(all(feature = "http2", feature = "server"))]
+pub use informational_sender::InformationalSender;
+#[cfg(all(feature = "http2", feature = "server"))]
+pub(crate) use informational_sender::{informational_channel, InformationalReceiver};
+
 #[cfg(all(feature = "http1", feature = "client"))]
 mod informational;
 #[cfg(all(feature = "http1", feature = "client"))]

@@ -326,7 +326,17 @@ where
     let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
         let h = Arc::clone(&h);
         async move {
-            let req = req.map(|b| b.map_err(std::io::Error::other).boxed());
+            let mut req = req.map(|b| b.map_err(std::io::Error::other).boxed());
+            if let Some(tx) = req
+                .extensions()
+                .get::<hyper::ext::InformationalSender>()
+                .cloned()
+            {
+                req.extensions_mut()
+                    .insert(crate::EarlyHints::new(move |headers| {
+                        tx.send(crate::early_hints_response(headers))
+                    }));
+            }
             Ok::<_, Infallible>(h.handle(req, info).await)
         }
     });

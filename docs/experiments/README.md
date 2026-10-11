@@ -41,8 +41,9 @@ clearly better (or a deliberate trade-off). Stable baseline: tag
 | 25 | 1 MiB worker pipes (F_SETPIPE_SZ) so a 70 KB response never blocks PHP | PHP-bound workers at 96% CPU; 64 KiB pipes block on larger responses | local x2 | 6,800 vs 6,960 req/s, within noise | rejected |
 | 26 | Built-in Laravel worker (`worker = "laravel"`): Octane's Worker with NOVA's transport, no PSR-7 | FrankenPHP (in-process, superglobals) measured 10,020 / 8,610 req/s vs 8,260 / 6,090 for Octane's RoadRunner worker on NOVA; PSR-7 conversion both ways is pure overhead | local x3, correctness vs FPM (forms, uploads, cookies, JSON, raw urlencoded body, streams) | 8,260 -> 9,290 req/s (JSON), 6,090 -> 6,900 (welcome page); identical request semantics to FPM; the remaining gap to FrankenPHP is out-of-process transport (~0.2-0.3 ms) | kept |
 | 27 | Workers talk to NOVA directly (no manager relay) | the relay is the one extra hop vs in-process servers | instrumented PHP loop (local) | the whole gap between two requests inside a PHP worker is 67 us of 1,240 us (5%); a direct channel could recover about half, at the cost of fd passing, losing warm workers across reloads and moving upload parsing out of the site sandbox | not pursued (bounded at ~2-3%) |
+| 28 | Automatic 103 Early Hints (learned from each page's `<head>`, sent before PHP runs) | 2026-10 report gap #9; Cloudflare learns hints the same way; hyper could not send 1xx (added to the vendored hyper's HTTP/2 server, h2 already supports it; HTTP/3 in NOVA's own server) | Chromium x5 per side at 80 and 150 ms latency, integration (+3), real WordPress | page load 392 -> 296 ms (80 ms RTT), 461 -> 367 ms (150 ms); needs a trusted certificate (Chrome ignores 103 on certificate errors) | kept, on by default |
 
-Considered and skipped this round: `Link: rel=preload` hints without 103
+Considered and skipped in an earlier round (since done as #28): `Link: rel=preload` hints without 103
 Early Hints (hyper cannot send 1xx; the browser's preload scanner already
 finds `<head>` resources at once, so the research expects little gain for a
 fast origin).

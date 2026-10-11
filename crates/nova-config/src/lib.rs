@@ -531,6 +531,10 @@ pub struct SiteConfig {
     /// to HTML pages, unless the page has its own.
     #[serde(default)]
     pub speculation_rules: bool,
+    /// Send `103 Early Hints` with the stylesheets and scripts learned from
+    /// earlier responses of the same page while PHP builds it (HTTP/2, 3).
+    #[serde(default = "default_true")]
+    pub early_hints: bool,
     #[serde(default)]
     pub isolation: SiteIsolation,
     /// Framework integration; `auto` detects it from the project files.

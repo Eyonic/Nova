@@ -21,6 +21,7 @@ base64 = "0.22"
 mysql_async = { version = "0.37.1", default-features = false, features = ["binlog", "minimal-rust"] }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
 libc = "0.2.190"
+memchr = "2.8.3"
 nova-config = { version = "0.1.0", path = "../nova-config" }
 nova-http = { version = "0.1.0", path = "../nova-http" }
 nova-optimize = { version = "0.1.0", path = "../nova-optimize" }
