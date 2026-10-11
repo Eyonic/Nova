@@ -17,6 +17,13 @@ end.
 | PHP "hello" (FPM) | **51 451** | 45 517 | **113%** |
 | 470 KB JPEG | 25 084 | 59 706 | 42% |
 
+On the path real traffic takes (load from a container on the Docker
+bridge, both servers capped at 4 CPUs, Unraid): **NOVA 18 100 vs nginx
+15 100 req/s on the 470 KB JPEG (+20%) and 74 500 vs 63 000 on 1 KB HTML
+(+18%)**. The loopback JPEG gap below is an artifact: nginx's sendfile
+wins on loopback and loses behind a bridge (NOVA's sendfile variant: 15 400
+there, its memory copy 18 500).
+
 In the first report NOVA was at 71% of nginx on small files and 59% on
 HTTP/2. It is now within 4-10% on plain static files, ahead on compressed
 files and on PHP-FPM, with a lower p99. The JPEG gap only exists on
@@ -91,8 +98,8 @@ PHP request path; see experiments #29-#42.
 ## 5. Where others still lead
 
 * **FrankenPHP**: 8-25% more Laravel throughput (in-process PHP; see §2).
-* **nginx / H2O**: a few percent on plain static files over loopback; zero
-  copy for files served from memory on loopback.
+* **nginx / H2O**: a few percent on plain static files over loopback only
+  (behind a Docker bridge NOVA is ahead, see §1).
 * **Features**: a CRS engine inside the server (NOVA runs the full OWASP
   CRS through the official ModSecurity image via `[site.auth_request]`,
   or its own faster rule set), token-API DNS providers other than
