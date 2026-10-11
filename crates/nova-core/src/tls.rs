@@ -54,7 +54,7 @@ pub fn acme_eligible(host: &str) -> bool {
         && !host.starts_with("*.")
 }
 
-fn wildcard_match(pattern: &str, host: &str) -> bool {
+pub(crate) fn wildcard_match(pattern: &str, host: &str) -> bool {
     match pattern.strip_prefix("*.") {
         Some(suffix) => host
             .split_once('.')
@@ -63,9 +63,14 @@ fn wildcard_match(pattern: &str, host: &str) -> bool {
     }
 }
 
+/// A certificate and the host patterns it covers.
+type HostCert = (Vec<String>, Arc<CertifiedKey>);
+
 #[derive(Debug)]
 struct Resolver {
     manual: Vec<(Vec<String>, Arc<CertifiedKey>)>,
+    /// DNS-01 certificate (hosts, key), replaced when renewed.
+    dns01: Arc<std::sync::RwLock<Option<HostCert>>>,
     acme_hosts: BTreeSet<String>,
     acme: Option<Arc<ResolvesServerCertAcme>>,
     fallback: Option<Arc<CertifiedKey>>,
@@ -79,6 +84,11 @@ impl ResolvesServerCert for Resolver {
                 .manual
                 .iter()
                 .find(|(hosts, _)| hosts.iter().any(|p| wildcard_match(p, sni)))
+            {
+                return Some(Arc::clone(key));
+            }
+            if let Some((hosts, key)) = &*self.dns01.read().unwrap()
+                && hosts.iter().any(|p| wildcard_match(p, sni))
             {
                 return Some(Arc::clone(key));
             }
@@ -150,15 +160,41 @@ pub fn setup(cfg: &Config) -> Result<Tls> {
             .any(|(hs, _): &(Vec<String>, _)| hs.iter().any(|p| wildcard_match(p, h)))
     };
 
-    let acme_hosts: BTreeSet<String> = if t.acme {
-        hosts
-            .iter()
-            .filter(|h| acme_eligible(h) && !covered(h))
-            .cloned()
-            .collect()
-    } else {
-        BTreeSet::new()
-    };
+    let dns01 = Arc::new(std::sync::RwLock::new(None));
+    if crate::dns01::enabled(cfg) {
+        let d = crate::dns01::dir(cfg);
+        *dns01.write().unwrap() = load_dns01(&d);
+        let slot = Arc::clone(&dns01);
+        // The supervisor renews; pick the new files up without a restart.
+        tokio::spawn(async move {
+            let mut seen = std::fs::metadata(d.join("cert.pem"))
+                .and_then(|m| m.modified())
+                .ok();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let now = std::fs::metadata(d.join("cert.pem"))
+                    .and_then(|m| m.modified())
+                    .ok();
+                if now != seen {
+                    seen = now;
+                    if let Some(c) = load_dns01(&d) {
+                        tracing::info!(hosts = ?c.0, "DNS-01 certificate loaded");
+                        *slot.write().unwrap() = Some(c);
+                    }
+                }
+            }
+        });
+    }
+    let acme_hosts: BTreeSet<String> =
+        if t.acme && t.acme_challenge != nova_config::AcmeChallenge::Dns01 {
+            hosts
+                .iter()
+                .filter(|h| acme_eligible(h) && !covered(h))
+                .cloned()
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
 
     let (acme, challenge, acme_task) = if acme_hosts.is_empty() {
         (None, None, None)
@@ -206,6 +242,7 @@ pub fn setup(cfg: &Config) -> Result<Tls> {
 
     let resolver = Arc::new(Resolver {
         manual,
+        dns01,
         acme_hosts,
         acme,
         fallback,
@@ -249,6 +286,15 @@ pub fn setup(cfg: &Config) -> Result<Tls> {
         acme_task,
         http01,
     })
+}
+
+/// The DNS-01 certificate and the hosts it covers, if issued.
+fn load_dns01(dir: &Path) -> Option<HostCert> {
+    let hosts = std::fs::read_to_string(dir.join("hosts")).ok()?;
+    let key = load_pem(&dir.join("cert.pem"), &dir.join("key.pem"))
+        .map_err(|e| tracing::warn!(error = format!("{e:#}"), "DNS-01 certificate unreadable"))
+        .ok()?;
+    Some((hosts.lines().map(str::to_string).collect(), key))
 }
 
 /// TLS client settings for a private ACME directory: trust only its root.

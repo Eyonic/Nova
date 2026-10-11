@@ -186,6 +186,18 @@ pub struct TlsConfig {
     /// Extra root certificate (PEM) for a private ACME CA (step-ca,
     /// Pebble). Replaces the public roots for talking to the directory.
     pub acme_ca_file: Option<PathBuf>,
+    /// `dns-01`: who sets the `_acme-challenge` TXT records.
+    pub acme_dns_provider: DnsProvider,
+    /// `cloudflare`: environment variable holding an API token with
+    /// Zone.DNS edit permission.
+    pub acme_dns_token_env: String,
+    /// `cloudflare`: API base (another Cloudflare-compatible API, tests).
+    pub acme_dns_api: String,
+    /// `hook`: program run as `<hook> set|clear <record name> <value>`
+    /// (works with any DNS host: wrap acme.sh/lego DNS scripts, nsupdate...).
+    pub acme_dns_hook: Option<PathBuf>,
+    /// Wait this long after setting the records before asking the CA.
+    pub acme_dns_propagation_secs: u64,
     /// Generate a self-signed certificate for hosts ACME cannot serve
     /// (`localhost`, `*.localhost`, `*.test`, IP addresses, or everything when ACME is off).
     pub self_signed: bool,
@@ -208,6 +220,11 @@ impl Default for TlsConfig {
             acme_directory: "https://acme-v02.api.letsencrypt.org/directory".into(),
             acme_challenge: AcmeChallenge::default(),
             acme_ca_file: None,
+            acme_dns_provider: DnsProvider::default(),
+            acme_dns_token_env: "CLOUDFLARE_API_TOKEN".into(),
+            acme_dns_api: "https://api.cloudflare.com/client/v4".into(),
+            acme_dns_hook: None,
+            acme_dns_propagation_secs: 30,
             self_signed: true,
             hsts_max_age_secs: 31_536_000,
             certs: Vec::new(),
@@ -223,6 +240,19 @@ pub enum AcmeChallenge {
     TlsAlpn01,
     #[serde(rename = "http-01")]
     Http01,
+    /// TXT records under `_acme-challenge`: wildcard certificates, and no
+    /// inbound connection needed at all (private networks, CDNs).
+    #[serde(rename = "dns-01")]
+    Dns01,
+}
+
+/// `server.tls.acme_dns_provider`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsProvider {
+    #[default]
+    Cloudflare,
+    Hook,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

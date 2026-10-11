@@ -10,8 +10,8 @@ pub mod cron;
 pub mod http;
 
 pub use http::{
-    AcmeChallenge, Balance, CacheRule, CertFiles, Cidr, ForwardedHeader, RateLimitConfig, Redirect,
-    SiteAuth, SiteCache, SiteProxy, TlsConfig, glob_match,
+    AcmeChallenge, Balance, CacheRule, CertFiles, Cidr, DnsProvider, ForwardedHeader,
+    RateLimitConfig, Redirect, SiteAuth, SiteCache, SiteProxy, TlsConfig, glob_match,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -963,6 +963,17 @@ impl Config {
         if tls.enabled {
             if tls.listen.port() == self.server.listen.port() {
                 errs.push("server.tls.listen must use another port than server.listen".into());
+            }
+            if tls.acme && tls.acme_challenge == AcmeChallenge::Dns01 {
+                match tls.acme_dns_provider {
+                    DnsProvider::Cloudflare if !valid_env_name(&tls.acme_dns_token_env) => {
+                        errs.push("server.tls.acme_dns_token_env must be a variable name".into())
+                    }
+                    DnsProvider::Hook if !tls.acme_dns_hook.as_ref().is_some_and(|h| h.is_absolute()) => {
+                        errs.push("server.tls.acme_dns_provider = \"hook\" needs an absolute acme_dns_hook".into())
+                    }
+                    _ => {}
+                }
             }
             if tls.acme && tls.acme_email.as_deref().is_none_or(|e| !e.contains('@')) {
                 errs.push("server.tls.acme needs server.tls.acme_email".into());

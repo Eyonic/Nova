@@ -131,7 +131,13 @@ impl Sites {
     pub fn lookup(&self, host: Option<&str>) -> Option<&Site> {
         let idx = host
             .map(|h| strip_port(h).trim_end_matches('.').to_ascii_lowercase())
-            .and_then(|h| self.by_host.get(&h).copied())
+            .and_then(|h| {
+                self.by_host.get(&h).copied().or_else(|| {
+                    // `*.shop.example` serves any single-label subdomain.
+                    let (_, parent) = h.split_once('.')?;
+                    self.by_host.get(&format!("*.{parent}")).copied()
+                })
+            })
             .or(self.default)?;
         self.sites.get(idx)
     }

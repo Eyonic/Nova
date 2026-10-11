@@ -22,7 +22,8 @@ http3 = true
 acme = true                     # Let's Encrypt
 acme_email = "ops@example.com"
 acme_challenge = "tls-alpn-01"  # or "http-01": validated on port 80 (server.listen),
-                                # works behind CDNs/load balancers that terminate TLS
+                                # works behind CDNs/load balancers that terminate TLS;
+                                # or "dns-01" (wildcards, see below)
 # acme_directory = "https://ca.internal:9000/acme/acme/directory"   # private CA (step-ca)
 # acme_ca_file = "/etc/nova/ca/root.pem"                            # its root certificate
 self_signed = true              # fallback for local names and while ACME is pending
@@ -49,6 +50,34 @@ Certificate per SNI host: configured files first, then ACME for public names
 self-signed certificate persisted in `<state>/tls/self-signed/` so browsers
 keep their exception across restarts. ACME account keys and certificates are
 cached in `<state>/tls/acme/` (worker-owned, mode 0700).
+
+### DNS-01: wildcards, and no inbound connection needed
+
+```toml
+[server.tls]
+acme = true
+acme_email = "ops@example.com"
+acme_challenge = "dns-01"
+acme_dns_provider = "cloudflare"            # token with Zone.DNS:Edit in $CLOUDFLARE_API_TOKEN
+# acme_dns_token_env = "CLOUDFLARE_API_TOKEN"
+# acme_dns_provider = "hook"                # any other DNS host:
+# acme_dns_hook = "/etc/nova/dns-hook"      #   <hook> set|clear <record name> <value>
+acme_dns_propagation_secs = 30
+
+[[site]]
+hosts = ["shop.example.com", "*.shop.example.com"]   # wildcard hosts route any subdomain
+```
+
+The CA checks `_acme-challenge` TXT records instead of connecting to NOVA:
+this is the only challenge that issues wildcard certificates, and it works
+on machines no CA can reach (home servers, private networks, behind a CDN
+or VPN). The supervisor runs the order (one certificate for all public
+hosts; names a wildcard covers are left out), sets the records through
+Cloudflare's API or the hook (run as the worker's user, not root), removes
+them afterwards, and stores the certificate in `<state>/tls/dns01/`. The
+worker loads new certificates within 30 s without a restart; renewal starts
+after 60 days, and configuration reloads that add hosts trigger a new
+order. Verified end to end against Pebble with its test DNS server.
 
 HSTS and the automatic HTTP→HTTPS redirect apply only to hosts with a
 publicly trusted certificate (ACME or configured files); a self-signed

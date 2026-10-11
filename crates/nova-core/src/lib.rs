@@ -17,6 +17,7 @@ pub mod client;
 pub mod dbchanges;
 pub mod dictionaries;
 pub mod dispatch;
+pub mod dns01;
 pub mod earlyhints;
 pub mod framework;
 pub mod htmlrewrite;
@@ -77,6 +78,9 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
         "starting NOVA"
     );
     isolation::prepare_dirs(&cfg, mode)?;
+    if dns01::enabled(&cfg) {
+        tokio::spawn(dns01::run(config_path.clone(), mode));
+    }
     let mut rt = Runtime {
         pools: php::start_all(&cfg, mode).await?,
         tasks: tasks::start_all(&cfg, mode)?,

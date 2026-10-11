@@ -22,6 +22,8 @@ mysql_async = { version = "0.37.1", default-features = false, features = ["binlo
 hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
 libc = "0.2.190"
 memchr = "2.8.3"
+instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "aws-lc-rs", "rcgen"] }
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "tls12", "aws-lc-rs", "webpki-tokio"] }
 nova-config = { version = "0.1.0", path = "../nova-config" }
 nova-http = { version = "0.1.0", path = "../nova-http" }
 nova-optimize = { version = "0.1.0", path = "../nova-optimize" }
