@@ -59,6 +59,8 @@ pub struct App {
     /// `[site.php] micro_cache_secs` storage, shared by all sites.
     pub micro: Arc<crate::microcache::MicroCache>,
     pub early: Arc<crate::earlyhints::EarlyHints>,
+    /// OpenTelemetry span export (`[telemetry]`).
+    pub tracer: Option<Arc<crate::telemetry::Tracer>>,
     /// Remembered asset versions for compression dictionaries (RFC 9842).
     dictionaries: crate::dictionaries::Dictionaries,
     /// Keep-alive pool for `[site.proxy]` upstreams.
@@ -104,6 +106,7 @@ impl App {
             seq: AtomicU64::new(0),
             micro: Arc::default(),
             early: Arc::default(),
+            tracer: None,
             dictionaries: Default::default(),
             upstream: crate::upstream::http_client(),
             acme_http01: std::sync::OnceLock::new(),
@@ -187,8 +190,22 @@ enum Target {
 }
 
 impl nova_http::Handler for App {
-    async fn handle(&self, req: Request<ReqBody>, conn: ConnInfo) -> Response<Body> {
+    async fn handle(&self, mut req: Request<ReqBody>, conn: ConnInfo) -> Response<Body> {
         let start = Instant::now();
+        let trace = self.tracer.as_ref().map(|t| {
+            let ctx = crate::telemetry::TraceCtx::start(
+                req.headers()
+                    .get("traceparent")
+                    .and_then(|v| v.to_str().ok()),
+                t.ratio,
+            );
+            if ctx.sampled {
+                req.headers_mut()
+                    .insert("traceparent", ctx.traceparent(ctx.span_id));
+                req.extensions_mut().insert(ctx);
+            }
+            (ctx, std::time::SystemTime::now())
+        });
         let id = self.next_request_id();
         let method = req.method().clone();
         let version = req.version();
@@ -317,7 +334,96 @@ impl nova_http::Handler for App {
                 );
             }
         }
+        if let (Some(tracer), Some((ctx, started))) = (&self.tracer, trace)
+            && ctx.sampled
+        {
+            use crate::telemetry::{Kind as SpanKind, Span};
+            let status = resp.status().as_u16();
+            let mut attributes = vec![
+                ("http.request.method", method.as_str().into()),
+                ("url.path", uri_path.as_str().into()),
+                (
+                    "url.scheme",
+                    if client.https { "https" } else { "http" }.into(),
+                ),
+                ("http.response.status_code", i64::from(status).into()),
+                ("client.address", client.ip.to_string().into()),
+                (
+                    "network.protocol.version",
+                    if conn.http3 {
+                        "3"
+                    } else {
+                        match version {
+                            Version::HTTP_2 => "2",
+                            Version::HTTP_10 => "1.0",
+                            _ => "1.1",
+                        }
+                    }
+                    .into(),
+                ),
+                ("nova.kind", kind.as_str().into()),
+                ("nova.request_id", id.as_str().into()),
+            ];
+            if let Some(h) = &host {
+                attributes.push(("server.address", strip_port(h).into()));
+            }
+            if let Some(s) = site {
+                attributes.push(("nova.site", s.name.as_str().into()));
+            }
+            if let Some(ua) = &user_agent {
+                attributes.push(("user_agent.original", ua.as_str().into()));
+            }
+            tracer.record(Span {
+                trace_id: ctx.trace_id,
+                span_id: ctx.span_id,
+                parent: ctx.parent,
+                name: method.as_str().to_string(),
+                kind: SpanKind::Server,
+                start: started,
+                end: std::time::SystemTime::now(),
+                attributes,
+                error: status >= 500,
+            });
+        }
         resp
+    }
+}
+
+impl App {
+    /// A child span of the request's span, if it is traced: returns its id
+    /// and sets `traceparent` so the callee continues from it.
+    fn child_span(
+        &self,
+        ctx: Option<crate::telemetry::TraceCtx>,
+        headers: &mut HeaderMap,
+    ) -> Option<(crate::telemetry::TraceCtx, [u8; 8], std::time::SystemTime)> {
+        self.tracer.as_ref()?;
+        let ctx = ctx?;
+        let id = crate::telemetry::random_id();
+        headers.insert("traceparent", ctx.traceparent(id));
+        Some((ctx, id, std::time::SystemTime::now()))
+    }
+
+    fn end_child_span(
+        &self,
+        child: Option<(crate::telemetry::TraceCtx, [u8; 8], std::time::SystemTime)>,
+        name: &str,
+        attributes: Vec<(&'static str, crate::telemetry::Value)>,
+        error: bool,
+    ) {
+        if let (Some(tracer), Some((ctx, id, started))) = (&self.tracer, child) {
+            tracer.record(crate::telemetry::Span {
+                trace_id: ctx.trace_id,
+                span_id: id,
+                parent: Some(ctx.span_id),
+                name: name.to_string(),
+                kind: crate::telemetry::Kind::Client,
+                start: started,
+                end: std::time::SystemTime::now(),
+                attributes,
+                error,
+            });
+        }
     }
 }
 
@@ -733,7 +839,14 @@ impl App {
         path_info: &str,
     ) -> Response<Body> {
         let started = Instant::now();
-        let (parts, body) = req.into_parts();
+        let (mut parts, body) = req.into_parts();
+        let span = self.child_span(
+            parts
+                .extensions
+                .get::<crate::telemetry::TraceCtx>()
+                .copied(),
+            &mut parts.headers,
+        );
         let cache_key = php.micro_cache.and_then(|_| {
             crate::microcache::key(
                 &site.name,
@@ -947,6 +1060,25 @@ impl App {
             }
         };
         let micros = started.elapsed().as_micros() as u64;
+        self.end_child_span(
+            span,
+            if worker.is_some() {
+                "php worker"
+            } else {
+                "php-fpm"
+            },
+            vec![
+                ("nova.php.script", script_name.into()),
+                (
+                    "http.response.status_code",
+                    result
+                        .as_ref()
+                        .map_or(502, |r| i64::from(r.status.as_u16()))
+                        .into(),
+                ),
+            ],
+            result.as_ref().map_or(true, |r| r.status.is_server_error()),
+        );
 
         let r = match result {
             // stale-if-error: a failing PHP keeps the last good page online.
@@ -1357,6 +1489,14 @@ impl App {
         let Some((index, lease)) = balancer.pick(None) else {
             return self.error(StatusCode::BAD_GATEWAY, "No upstream configured.", None);
         };
+        let mut req = req;
+        let span = self.child_span(
+            req.extensions()
+                .get::<crate::telemetry::TraceCtx>()
+                .copied(),
+            req.headers_mut(),
+        );
+        let upstream_base = lease.backend.base.clone();
         let mut result =
             crate::upstream::forward(&self.upstream, &lease.backend.base, req, client, timeout)
                 .await;
@@ -1388,6 +1528,23 @@ impl App {
                 }
             }
         }
+        self.end_child_span(
+            span,
+            "proxy",
+            vec![
+                ("server.address", upstream_base.into()),
+                (
+                    "http.response.status_code",
+                    result
+                        .as_ref()
+                        .map_or(502, |r| i64::from(r.status().as_u16()))
+                        .into(),
+                ),
+            ],
+            result
+                .as_ref()
+                .map_or(true, |r| r.status().is_server_error()),
+        );
         match result {
             Ok(resp) => resp,
             Err(crate::upstream::ProxyError::Timeout) => self.error(

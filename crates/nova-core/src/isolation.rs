@@ -191,6 +191,9 @@ pub fn worker_sandbox(cfg: &Config, config_path: &std::path::Path) -> Sandbox {
             .flatten()
             .map(|(_, port)| port),
     );
+    if let Some(Ok((_, port))) = cfg.telemetry.collector_addr() {
+        connect.push(port);
+    }
     let mut bind = vec![cfg.server.listen.port()];
     if tls.enabled {
         bind.push(tls.listen.port());

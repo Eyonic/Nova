@@ -134,6 +134,8 @@ pub struct Config {
     pub isolation: IsolationConfig,
     #[serde(default)]
     pub live: LiveConfig,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
     /// Named backing services (currently databases) that sites refer to.
     #[serde(default)]
     pub services: ServicesConfig,
@@ -230,6 +232,48 @@ impl Default for PathsConfig {
             state_dir: "/var/lib/nova".into(),
             run_dir: "/run/nova".into(),
         }
+    }
+}
+
+/// OpenTelemetry tracing: spans for every request (and its PHP or
+/// upstream call) exported over OTLP/HTTP to a collector.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TelemetryConfig {
+    /// Collector base URL, e.g. `http://otel-collector:4318` (spans are
+    /// POSTed to `/v1/traces`). Unset: tracing off.
+    pub otlp_endpoint: Option<String>,
+    pub service_name: String,
+    /// Share of new traces recorded (0.0-1.0); a sampled `traceparent`
+    /// from the client or a proxy is always followed.
+    pub sample_ratio: f64,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: None,
+            service_name: "nova".into(),
+            sample_ratio: 1.0,
+        }
+    }
+}
+
+impl TelemetryConfig {
+    /// `(host, port)` of the collector; only `http://host:port`.
+    pub fn collector_addr(&self) -> Option<Result<(String, u16), String>> {
+        let e = self.otlp_endpoint.as_deref()?;
+        let rest = match e.strip_prefix("http://") {
+            Some(r) => r.trim_end_matches('/'),
+            None => return Some(Err(format!("otlp_endpoint {e:?} must start with http://"))),
+        };
+        Some(match rest.rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() && !rest.contains('/') => p
+                .parse()
+                .map(|p| (h.trim_matches(['[', ']']).to_string(), p))
+                .map_err(|_| format!("otlp_endpoint {e:?} has an invalid port")),
+            _ => Err(format!("otlp_endpoint {e:?} must be http://host:port")),
+        })
     }
 }
 
@@ -729,6 +773,12 @@ impl Config {
     /// of stopping at the first one.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut errs = Vec::new();
+        if let Some(Err(e)) = self.telemetry.collector_addr() {
+            errs.push(format!("[telemetry] {e}"));
+        }
+        if !(0.0..=1.0).contains(&self.telemetry.sample_ratio) {
+            errs.push("[telemetry] sample_ratio must be between 0 and 1".into());
+        }
         if self.version != SCHEMA_VERSION {
             errs.push(format!(
                 "unsupported config version {} (this build supports version {SCHEMA_VERSION})",

@@ -568,6 +568,27 @@ the same ports (`SO_REUSEPORT`). Once it reports ready, the old worker stops
 accepting and drains. Requires strict isolation (NOVA started as root, the
 default in Compose).
 
+## Tracing (OpenTelemetry)
+
+```toml
+[telemetry]
+otlp_endpoint = "http://otel-collector:4318"   # OTLP/HTTP; Jaeger, Tempo, Honeycomb via a collector...
+service_name = "nova"
+sample_ratio = 1.0                              # share of new traces kept
+```
+
+Each request becomes a server span (`http.request.method`, `url.path`,
+`http.response.status_code`, `client.address`, `server.address`,
+`nova.site`, `nova.kind`, `nova.request_id`, ...) with a child span for
+its PHP execution (`php-fpm` / `php worker`) or upstream call (`proxy`).
+W3C trace context is followed both ways: an incoming `traceparent`
+continues its trace (a sampled flag is always honoured), and PHP
+(`$_SERVER['HTTP_TRACEPARENT']`) and upstreams receive one naming their
+own parent span, so OpenTelemetry instrumentation in the application lands
+in the same trace. Spans leave in batches (512, or every second) from a
+bounded queue; when the collector is slow or down spans are dropped, never
+requests delayed. Verified against Jaeger.
+
 ## Access log
 
 One structured line per request (`target: nova::access`): request id, site,

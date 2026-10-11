@@ -29,6 +29,7 @@ pub mod ratelimit;
 pub mod rules;
 pub mod sites;
 pub mod tasks;
+pub mod telemetry;
 pub mod tls;
 pub mod upstream;
 
@@ -365,6 +366,7 @@ async fn run_worker(
         databases,
         Arc::new(live::LiveHub::new(cfg.live.clone())),
     );
+    app.tracer = crate::telemetry::Tracer::start(&cfg.telemetry).map(Arc::new);
     let comp = &cfg.server.compression;
     if comp.enabled {
         app.compression = Some(nova_http::compress::Options {
