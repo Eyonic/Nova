@@ -98,7 +98,8 @@ impl Admin {
                 if let Some(php) = &s.php {
                     v["php"] = serde_json::json!({
                         "mode": if php.worker.is_some() { "worker" } else { "fpm" },
-                        "idle_workers": php.worker.as_ref().map(|w| w.idle_count()),
+                        "worker_links": php.worker.as_ref().map(|w| w.links()),
+                        "in_flight": php.worker.as_ref().map(|w| w.in_flight()),
                         "micro_cache_secs": php.micro_cache.map(|d| d.as_secs()),
                     });
                 }

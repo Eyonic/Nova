@@ -132,3 +132,18 @@ worker = "worker.php"
 max_children = 2
 max_requests = 20
 timeout_secs = 2
+
+# The same on NOVA's PHP extension: the FrankenPHP worker API
+# (frankenphp_handle_request), with PHP's own superglobals and output.
+[[site]]
+name = "native"
+hosts = ["native.localhost"]
+path = "/srv/sites/native"
+
+[site.php]
+front_controller = "index.php"
+worker = "worker.php"
+worker_api = "frankenphp"
+max_children = 2
+max_requests = 20
+timeout_secs = 2

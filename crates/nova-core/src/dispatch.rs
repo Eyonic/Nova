@@ -2227,7 +2227,10 @@ async fn resolve_target(site: &Site, safe: &SafePath, query: Option<&str>) -> Ta
             };
             for index in indexes {
                 let f = full.join(index);
-                if let Probe::File(c, meta) = probe(site, &f).await {
+                // Missing indexes are remembered too: `/` of a PHP site
+                // would otherwise stat index.html and index.htm in the
+                // blocking pool on every request.
+                if let Probe::File(c, meta) = probe_optional(site, &f).await {
                     if is_php(&c) {
                         return Target::Php {
                             script: c,

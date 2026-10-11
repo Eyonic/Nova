@@ -335,9 +335,35 @@ static void collect(const char *name, size_t nl, char *val, size_t vl, void *ctx
 
 static info_ctx info;
 
+/* Tell the manager this worker waits for a request: it hands requests
+ * only to workers that asked, so none goes to a worker that is leaving
+ * its loop (max requests, exit). */
+static void send_ready(void)
+{
+	static const char json[] = "{\"ready\":true}";
+	unsigned char f[12 + sizeof json - 1];
+	size_t len = sizeof json - 1;
+	f[0] = (1 << 4) | 3;
+	f[1] = G_CONTROL;
+	f[2] = len & 0xFF;
+	f[3] = (len >> 8) & 0xFF;
+	f[4] = 0;
+	f[5] = 0;
+	uint32_t crc = crc32_6(f);
+	f[6] = crc & 0xFF;
+	f[7] = (crc >> 8) & 0xFF;
+	f[8] = (crc >> 16) & 0xFF;
+	f[9] = (crc >> 24) & 0xFF;
+	f[10] = 0;
+	f[11] = 0;
+	memcpy(f + 12, json, len);
+	(void)write_full(STDOUT_FILENO, f, sizeof f);
+}
+
 /* Read the next request. 0: got one, 1: stop (control frame or EOF). */
 static int next_request(void)
 {
+	send_ready();
 	for (;;) {
 		unsigned char h[12];
 		if (read_full(STDIN_FILENO, h, sizeof h) < 0) {

@@ -42,6 +42,9 @@ FROM php:${PHP_VERSION}-fpm-trixie AS runtime
 # Extensions common PHP applications (Laravel, WordPress) need. Build
 # headers are removed afterwards; only the shared libraries the extensions
 # link against stay (same technique as the official PHP images).
+# NOVA's own extension (worker mode, frankenphp_handle_request) is built
+# too; workers load it with -d extension=nova, so it is not enabled globally.
+COPY php-ext/nova /usr/src/nova-ext
 RUN set -eux \
  && savedAptMark="$(apt-mark showmanual)" \
  && apt-get update \
@@ -49,6 +52,8 @@ RUN set -eux \
       libpng-dev libjpeg62-turbo-dev libwebp-dev libfreetype-dev libicu-dev libzip-dev \
  && docker-php-ext-configure gd --with-jpeg --with-webp --with-freetype \
  && docker-php-ext-install -j"$(nproc)" pdo_mysql mysqli gd intl exif zip bcmath \
+ && docker-php-ext-install /usr/src/nova-ext \
+ && rm -rf /usr/src/nova-ext "$PHP_INI_DIR/conf.d/docker-php-ext-nova.ini" \
  && apt-mark auto '.*' > /dev/null \
  && apt-mark manual $savedAptMark tini > /dev/null \
  && find /usr/local -type f -name '*.so*' -exec ldd '{}' ';' \

@@ -1,26 +1,30 @@
 //! Worker mode, HTTP side: requests go to long-running PHP workers that
 //! keep the application booted between requests (Laravel Octane, Symfony
-//! Runtime, Spiral, ... through their RoadRunner integration).
+//! Runtime, Spiral, ... through their RoadRunner integration, or
+//! FrankenPHP-style workers on NOVA's PHP extension).
 //!
 //! NOVA listens on a per-site socket; the site's worker manager (`nova
-//! php-workers`, running as the site inside its sandbox) connects once per
-//! PHP worker. A connection is one worker: NOVA writes a request frame and
-//! reads the response frames, one request at a time. The manager kills a
-//! worker whose connection closes mid-request (timeout), and says goodbye
-//! with a control frame before closing an idle one, so a request is never
-//! lost in between.
+//! php-workers`, running as the site inside its sandbox) connects a few
+//! times. Requests are multiplexed over those connections, each frame
+//! tagged with the request id (second goridge option): NOVA sends a
+//! request the moment it arrives, the manager queues it and hands it to
+//! the next free PHP worker without another round trip. NOVA's timeout
+//! sends `{"cancel":true}`, which drops the request from the queue or
+//! replaces the worker stuck on it.
 
 use crate::goridge::{self, Frame};
 use crate::{PhpError, PhpResponse};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::net::UnixListener;
+use tokio::net::unix::OwnedWriteHalf;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
 
 /// Largest response frame accepted from PHP (bigger bodies should stream).
@@ -31,7 +35,6 @@ pub struct WorkerPool {
     /// Only connections from these uids are workers (empty: anyone who
     /// can reach the socket).
     peer_uids: Vec<u32>,
-    max_requests: u32,
     expose_errors: bool,
     /// RoadRunner workers expect urlencoded forms parsed by the server;
     /// NOVA's own workers parse them in PHP and keep the raw body.
@@ -40,25 +43,35 @@ pub struct WorkerPool {
     /// CGI parameters in, CGI response out.
     fastcgi: bool,
     site: String,
-    idle: Mutex<Vec<WorkerConn>>,
-    /// One permit per idle connection.
-    ready: Semaphore,
+    links: Mutex<Vec<Arc<Link>>>,
+    /// Signalled when a manager connects.
+    linked: Notify,
+    next_id: AtomicU32,
+    next_link: AtomicUsize,
+    in_flight: AtomicUsize,
     listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub served: AtomicU64,
 }
 
-struct WorkerConn {
-    /// Reads are buffered (a frame usually arrives in one read); writes
-    /// pass straight through.
-    stream: tokio::io::BufReader<UnixStream>,
-    requests: u32,
+/// One connection from the manager.
+struct Link {
+    wr: tokio::sync::Mutex<OwnedWriteHalf>,
+    /// Requests sent on this link, by id: where their frames go.
+    pending: Mutex<HashMap<u32, mpsc::UnboundedSender<Frame>>>,
+    closed: AtomicBool,
+}
+
+impl Link {
+    async fn send(&self, f: &Frame) -> io::Result<()> {
+        f.write_to(&mut *self.wr.lock().await).await
+    }
 }
 
 impl std::fmt::Debug for WorkerPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkerPool")
             .field("socket", &self.socket)
-            .field("idle", &self.ready.available_permits())
+            .field("in_flight", &self.in_flight())
             .finish()
     }
 }
@@ -80,11 +93,24 @@ pub struct WorkerRequest<'a> {
     pub server: Option<Vec<(Vec<u8>, Vec<u8>)>>,
 }
 
+/// Removes a request from its link's table when its exchange ends.
+struct Registered {
+    link: Arc<Link>,
+    id: u32,
+    pool: Arc<WorkerPool>,
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        self.link.pending.lock().unwrap().remove(&self.id);
+        self.pool.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl WorkerPool {
     pub fn new(
         socket: impl Into<PathBuf>,
         peer_uids: Vec<u32>,
-        max_requests: u32,
         expose_errors: bool,
         parse_urlencoded: bool,
         fastcgi: bool,
@@ -93,13 +119,15 @@ impl WorkerPool {
         Arc::new(Self {
             socket: socket.into(),
             peer_uids,
-            max_requests: max_requests.max(1),
             expose_errors,
             parse_urlencoded,
             fastcgi,
             site: site.to_string(),
-            idle: Mutex::new(Vec::new()),
-            ready: Semaphore::new(0),
+            links: Mutex::new(Vec::new()),
+            linked: Notify::new(),
+            next_id: AtomicU32::new(1),
+            next_link: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
             listener: Mutex::new(None),
             served: AtomicU64::new(0),
         })
@@ -109,8 +137,8 @@ impl WorkerPool {
         &self.socket
     }
 
-    /// Start accepting worker connections (idempotent). Replaces a socket
-    /// left by a previous NOVA process; its workers move over as their
+    /// Start accepting manager connections (idempotent). Replaces a socket
+    /// left by a previous NOVA process; the manager moves over as its
     /// connections to the old process end.
     pub fn listen(self: &Arc<Self>) -> io::Result<()> {
         let mut slot = self.listener.lock().unwrap();
@@ -140,40 +168,47 @@ impl WorkerPool {
                         }
                     }
                 }
-                pool.put(WorkerConn {
-                    stream: tokio::io::BufReader::with_capacity(64 << 10, stream),
-                    requests: 0,
+                let (rd, wr) = stream.into_split();
+                let link = Arc::new(Link {
+                    wr: tokio::sync::Mutex::new(wr),
+                    pending: Mutex::new(HashMap::new()),
+                    closed: AtomicBool::new(false),
                 });
+                pool.links.lock().unwrap().push(Arc::clone(&link));
+                pool.linked.notify_waiters();
+                tokio::spawn(route(Arc::downgrade(&pool), link, rd));
             }
         }));
         Ok(())
     }
 
-    fn put(&self, conn: WorkerConn) {
-        self.idle.lock().unwrap().push(conn);
-        self.ready.add_permits(1);
+    /// Manager connections.
+    pub fn links(&self) -> usize {
+        self.links.lock().unwrap().len()
     }
 
-    /// Connected workers waiting for a request.
-    pub fn idle_count(&self) -> usize {
-        self.ready.available_permits()
+    /// Requests sent to the workers and not yet answered (queued or running).
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
     }
 
-    /// The most recently used live worker (warm caches), waiting up to
-    /// `wait` for one to become free.
-    async fn take(&self, wait: Duration) -> Result<WorkerConn, PhpError> {
-        let deadline = Instant::now() + wait;
+    /// A live link (round robin), waiting until `deadline` for the
+    /// manager to connect.
+    async fn link(&self, deadline: Instant, wait: Duration) -> Result<Arc<Link>, PhpError> {
         loop {
-            let permit = tokio::time::timeout_at(deadline, self.ready.acquire())
-                .await
-                .map_err(|_| PhpError::Timeout(wait))?
-                .expect("never closed");
-            permit.forget();
-            let conn = self.idle.lock().unwrap().pop().expect("permit per conn");
-            if conn.stream.buffer().is_empty() && crate::pool::alive(conn.stream.get_ref()) {
-                return Ok(conn);
+            let notified = self.linked.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let links = self.links.lock().unwrap();
+                if !links.is_empty() {
+                    let n = self.next_link.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Arc::clone(&links[n % links.len()]));
+                }
             }
-            // Worker exited or the manager said goodbye: take the next one.
+            tokio::time::timeout_at(deadline, notified)
+                .await
+                .map_err(|_| PhpError::Timeout(wait))?;
         }
     }
 
@@ -185,13 +220,43 @@ impl WorkerPool {
     ) -> Result<PhpResponse, PhpError> {
         let timeout = req.timeout;
         let deadline = Instant::now() + timeout;
-        let frame = match &req.server {
+        let mut frame = match &req.server {
             Some(params) if self.fastcgi => encode_fastcgi(params, &req.body),
             _ => encode_request(&req, self.parse_urlencoded),
         };
-        let conn = self.take(timeout).await?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        frame.options.push(id);
+        let mut tries = 0;
+        let (link, rx) = loop {
+            let link = self.link(deadline, timeout).await?;
+            let (tx, rx) = mpsc::unbounded_channel();
+            link.pending.lock().unwrap().insert(id, tx);
+            let sent = if link.closed.load(Ordering::Relaxed) {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                link.send(&frame).await
+            };
+            match sent {
+                Ok(()) => break (link, rx),
+                Err(e) => {
+                    // The manager went away: the request did not reach it.
+                    link.pending.lock().unwrap().remove(&id);
+                    tries += 1;
+                    if tries == 3 {
+                        return Err(PhpError::Unavailable(e));
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let reg = Registered {
+            link,
+            id,
+            pool: Arc::clone(self),
+        };
         let (head_tx, head_rx) = oneshot::channel();
-        tokio::spawn(Arc::clone(self).exchange(conn, frame, deadline, timeout, head_tx));
+        tokio::spawn(Arc::clone(self).exchange(reg, rx, deadline, timeout, head_tx));
         head_rx
             .await
             .unwrap_or_else(|_| Err(PhpError::Protocol("worker task ended".into())))
@@ -199,61 +264,24 @@ impl WorkerPool {
 
     async fn exchange(
         self: Arc<Self>,
-        mut conn: WorkerConn,
-        frame: Frame,
+        reg: Registered,
+        mut rx: mpsc::UnboundedReceiver<Frame>,
         deadline: Instant,
         timeout: Duration,
         head_tx: oneshot::Sender<Result<PhpResponse, PhpError>>,
     ) {
         let mut head_tx = Some(head_tx);
-        let mut result;
-        let mut tries = 0;
-        loop {
-            result = tokio::time::timeout_at(
-                deadline,
-                self.converse(&mut conn.stream, frame.clone(), &mut head_tx),
-            )
-            .await;
-            // The manager closed this worker's connection before reading
-            // the request: it never ran, so another worker may take it.
-            let unsent = matches!(&result, Ok(Err(PhpError::Unavailable(e))) if e.kind() == io::ErrorKind::ConnectionAborted);
-            tries += 1;
-            if !unsent || tries == 3 {
-                break;
-            }
-            match self
-                .take(deadline.saturating_duration_since(Instant::now()))
-                .await
-            {
-                Ok(c) => conn = c,
-                Err(e) => {
-                    result = Ok(Err(e));
-                    break;
-                }
-            }
-        }
+        let result =
+            tokio::time::timeout_at(deadline, self.converse(&reg, &mut rx, &mut head_tx)).await;
         let fail = |e: PhpError, head_tx: &mut Option<oneshot::Sender<_>>| {
             if let Some(tx) = head_tx.take() {
                 let _ = tx.send(Err(e));
             }
         };
         match result {
-            Ok(Ok(reusable)) => {
+            Ok(Ok(())) => {
                 self.served.fetch_add(1, Ordering::Relaxed);
-                conn.requests += 1;
-                if !reusable {
-                    return;
-                }
-                if conn.requests >= self.max_requests {
-                    // The manager starts a fresh worker in its place.
-                    let _ = Frame::control(r#"{"stop":true}"#)
-                        .write_to(&mut conn.stream)
-                        .await;
-                    return;
-                }
-                self.put(conn);
             }
-            // The connection is dropped: the manager kills the worker.
             Ok(Err(e)) => {
                 tracing::warn!(site = self.site, error = %e, "PHP worker failed");
                 fail(e, &mut head_tx)
@@ -264,37 +292,36 @@ impl WorkerPool {
                     ?timeout,
                     "PHP worker timed out; restarting it"
                 );
+                let mut cancel = Frame::control(r#"{"cancel":true}"#);
+                cancel.options = vec![0, reg.id];
+                let _ = reg.link.send(&cancel).await;
                 fail(PhpError::Timeout(timeout), &mut head_tx)
             }
         }
     }
 
-    /// Send the request, deliver the response. `Ok(false)`: the worker is
-    /// stopping and must not get another request.
+    /// Deliver the response frames of one request.
     async fn converse(
         &self,
-        stream: &mut tokio::io::BufReader<UnixStream>,
-        frame: Frame,
+        reg: &Registered,
+        rx: &mut mpsc::UnboundedReceiver<Frame>,
         head_tx: &mut Option<oneshot::Sender<Result<PhpResponse, PhpError>>>,
-    ) -> Result<bool, PhpError> {
-        frame.write_to(stream).await.map_err(|e| {
-            PhpError::Unavailable(io::Error::new(io::ErrorKind::ConnectionAborted, e))
-        })?;
+    ) -> Result<(), PhpError> {
         let mut body_tx: Option<mpsc::Sender<io::Result<Bytes>>> = None;
         let mut stopped = false;
         loop {
-            let f = goridge::read_frame(stream, MAX_FRAME)
-                .await
-                .map_err(|e| PhpError::Protocol(format!("reading from PHP worker: {e}")))?;
+            let Some(f) = rx.recv().await else {
+                return Err(PhpError::Unavailable(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "PHP worker manager went away",
+                )));
+            };
             if f.flags & goridge::CONTROL != 0 {
-                if head_tx.is_some() && f.payload.windows(4).any(|w| w == b"stop") {
-                    // Goodbye from the manager, sent before it read the request.
-                    return Err(PhpError::Unavailable(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "worker left before the request",
-                    )));
+                if f.payload.windows(6).any(|w| w == b"failed") {
+                    return Err(PhpError::Protocol(
+                        "PHP worker exited during the request".into(),
+                    ));
                 }
-                // e.g. a pid announcement; nothing to do.
                 continue;
             }
             if f.flags & goridge::ERROR != 0 {
@@ -308,7 +335,7 @@ impl WorkerPool {
                     };
                     let _ = tx.send(Ok(simple(StatusCode::INTERNAL_SERVER_ERROR, body)));
                 }
-                return Ok(true);
+                return Ok(());
             }
             let (head, body) = f.split().map_err(|e| PhpError::Protocol(e.to_string()))?;
             let more = f.byte10 & goridge::STREAM != 0;
@@ -319,9 +346,8 @@ impl WorkerPool {
                     parse_head(&head)?
                 };
                 let Some((status, headers)) = parsed else {
-                    // `{"stop":true}`: the worker is quitting instead of answering.
                     let _ = tx.send(Err(PhpError::Protocol("PHP worker stopped".into())));
-                    return Ok(false);
+                    return Ok(());
                 };
                 let (btx, brx) = mpsc::channel(8);
                 let _ = tx.send(Ok(PhpResponse {
@@ -334,9 +360,10 @@ impl WorkerPool {
             if f.byte10 & goridge::PING != 0 {
                 let pong = Frame {
                     byte10: goridge::PONG,
+                    options: vec![0, reg.id],
                     ..Default::default()
                 };
-                pong.write_to(stream).await.map_err(PhpError::Unavailable)?;
+                reg.link.send(&pong).await.map_err(PhpError::Unavailable)?;
             }
             if !body.is_empty() {
                 let gone = match &body_tx {
@@ -348,16 +375,44 @@ impl WorkerPool {
                     stopped = true;
                     let stop = Frame {
                         byte10: goridge::STOP,
+                        options: vec![0, reg.id],
                         ..Default::default()
                     };
-                    stop.write_to(stream).await.map_err(PhpError::Unavailable)?;
+                    reg.link.send(&stop).await.map_err(PhpError::Unavailable)?;
                 }
             }
             if !more {
-                return Ok(true);
+                return Ok(());
             }
         }
     }
+}
+
+/// Read a link's frames and route them to their requests. When the link
+/// closes, its requests fail (their channels close).
+async fn route(
+    pool: std::sync::Weak<WorkerPool>,
+    link: Arc<Link>,
+    rd: tokio::net::unix::OwnedReadHalf,
+) {
+    let mut r = tokio::io::BufReader::with_capacity(64 << 10, rd);
+    while let Ok(f) = goridge::read_frame(&mut r, MAX_FRAME).await {
+        let Some(id) = f.options.get(1).copied() else {
+            continue;
+        };
+        let tx = link.pending.lock().unwrap().get(&id).cloned();
+        if let Some(tx) = tx {
+            let _ = tx.send(f);
+        }
+    }
+    link.closed.store(true, Ordering::Relaxed);
+    if let Some(pool) = pool.upgrade() {
+        pool.links
+            .lock()
+            .unwrap()
+            .retain(|l| !Arc::ptr_eq(l, &link));
+    }
+    link.pending.lock().unwrap().clear();
 }
 
 impl Drop for WorkerPool {
@@ -603,43 +658,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exchange_with_a_fake_worker() {
+    async fn exchange_with_a_fake_manager() {
         let dir = std::env::temp_dir().join(format!("nova-wk-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let pool = WorkerPool::new(dir.join("w.sock"), vec![], 2, false, true, false, "t");
+        let pool = WorkerPool::new(dir.join("w.sock"), vec![], false, true, false, "t");
         pool.listen().unwrap();
-        // A worker that streams two chunks, then answers plainly.
-        let mut php = UnixStream::connect(pool.socket()).await.unwrap();
+        // A manager that takes two requests, then answers the second one
+        // first: the first streams two chunks.
+        let mut m = tokio::net::UnixStream::connect(pool.socket())
+            .await
+            .unwrap();
         let fake = tokio::spawn(async move {
-            for n in 0..2 {
-                let req = goridge::read_frame(&mut php, 1 << 20).await.unwrap();
-                let (h, _) = req.split().unwrap();
-                assert!(
-                    std::str::from_utf8(&h)
-                        .unwrap()
-                        .contains("\"method\":\"GET\"")
-                );
-                if n == 0 {
-                    let mut a = Frame::message(br#"{"status":200,"headers":{}}"#, b"one,");
-                    a.byte10 = goridge::STREAM;
-                    a.write_to(&mut php).await.unwrap();
-                    Frame::message(br#"{"status":200,"headers":{}}"#, b"two")
-                        .write_to(&mut php)
-                        .await
-                        .unwrap();
-                } else {
-                    Frame::message(br#"{"status":404,"headers":{}}"#, b"")
-                        .write_to(&mut php)
-                        .await
-                        .unwrap();
-                }
-            }
-            // max_requests = 2: NOVA asks this worker to stop.
-            let stop = goridge::read_frame(&mut php, 1 << 20).await.unwrap();
-            assert_eq!(stop.flags & goridge::CONTROL, goridge::CONTROL);
+            let a = goridge::read_frame(&mut m, 1 << 20).await.unwrap();
+            let b = goridge::read_frame(&mut m, 1 << 20).await.unwrap();
+            let (h, _) = a.split().unwrap();
+            assert!(
+                std::str::from_utf8(&h)
+                    .unwrap()
+                    .contains("\"method\":\"GET\"")
+            );
+            let (ida, idb) = (a.options[1], b.options[1]);
+            assert_ne!(ida, idb);
+            let mut r = Frame::message(br#"{"status":404,"headers":{}}"#, b"");
+            r.options.push(idb);
+            r.write_to(&mut m).await.unwrap();
+            let mut one = Frame::message(br#"{"status":200,"headers":{}}"#, b"one,");
+            one.byte10 = goridge::STREAM;
+            one.options.push(ida);
+            one.write_to(&mut m).await.unwrap();
+            let mut two = Frame::message(br#"{"status":200,"headers":{}}"#, b"two");
+            two.options.push(ida);
+            two.write_to(&mut m).await.unwrap();
+            // A third request times out: NOVA cancels it.
+            let c = goridge::read_frame(&mut m, 1 << 20).await.unwrap();
+            let cancel = goridge::read_frame(&mut m, 1 << 20).await.unwrap();
+            assert_eq!(cancel.flags & goridge::CONTROL, goridge::CONTROL);
+            assert_eq!(cancel.options[1], c.options[1]);
         });
         let headers = HeaderMap::new();
-        let req = || WorkerRequest {
+        let req = |timeout| WorkerRequest {
             method: "GET",
             uri: "http://t/".into(),
             query: "",
@@ -647,23 +704,28 @@ mod tests {
             remote_addr: "127.0.0.1".into(),
             headers: &headers,
             body: Bytes::new(),
-            timeout: Duration::from_secs(5),
+            timeout,
             server: None,
         };
-        let mut r = pool.execute(req()).await.unwrap();
-        assert_eq!(r.status, 200);
+        let s = Duration::from_secs(5);
+        let (a, b) = tokio::join!(pool.execute(req(s)), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            pool.execute(req(s)).await
+        });
+        assert_eq!(b.unwrap().status, 404);
+        let mut a = a.unwrap();
+        assert_eq!(a.status, 200);
         let mut body = Vec::new();
-        while let Some(c) = r.body.recv().await {
+        while let Some(c) = a.body.recv().await {
             body.extend_from_slice(&c.unwrap());
         }
         assert_eq!(body, b"one,two");
-        let r = pool.execute(req()).await.unwrap();
-        assert_eq!(r.status, 404);
-        fake.await.unwrap();
         assert!(matches!(
-            pool.take(Duration::from_millis(50)).await,
+            pool.execute(req(Duration::from_millis(100))).await,
             Err(PhpError::Timeout(_))
         ));
+        fake.await.unwrap();
+        assert_eq!(pool.in_flight(), 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

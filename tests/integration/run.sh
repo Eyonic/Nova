@@ -350,9 +350,34 @@ PIDS=$(for _ in $(seq 45); do wj "$BASE/hello" | jget 'd["pid"]'; done | sort -u
 check "workers recycled after max_requests" [ "$PIDS" -ge 3 ]
 C=$(seq 40 | xargs -P 8 -I{} curl -s -o /dev/null -w '%{http_code}\n' "${W[@]}" "$BASE/sleep?s=0.05" | sort | uniq -c | tr -s ' ' | tr '\n' ' ')
 eq "concurrent requests queue for the 2 workers" "$C" " 40 200 "
-WPS=$(dc exec -T nova sh -c 'for p in /proc/[0-9]*; do c=$(tr "\0" " " < $p/cmdline 2>/dev/null); case "$c" in "php "*worker.php*) awk "/^Uid:/{print \$2}" $p/status;; esac; done' | sort -u)
+WPS=$(dc exec -T nova sh -c 'for p in /proc/[0-9]*; do c=$(tr "\0" " " < $p/cmdline 2>/dev/null); case "$c" in "php "*/sites/worker/worker.php*) awk "/^Uid:/{print \$2}" $p/status;; esac; done' | sort -u)
 SITE_UID=$(dc exec -T nova sh -c 'stat -c %u /var/lib/nova/sites/worker')
 eq "PHP workers run as the site user" "$WPS" "$SITE_UID"
+
+section "PHP worker mode, native API (frankenphp_handle_request)"
+N=(-H "Host: native.localhost")
+nj() { curl -s "${N[@]}" "$@"; }
+A=$(nj "$BASE/hello?x=1")
+B=$(nj "$BASE/hello")
+eq "native worker answers with PHP's own superglobals" "$(echo "$A" | jget 'd["uri"] + " " + d["get"]["x"]')" "/hello?x=1 1"
+eq "native: application stays booted" "$(echo "$A" | jget 'd["pid"]') $(( $(echo "$A" | jget 'd["served"]') + 1 ))" "$(echo "$B" | jget 'd["pid"]') $(echo "$B" | jget 'd["served"]')"
+has "native: header() reaches the client" "$(curl -sI "${N[@]}" "$BASE/hello" | tr -d '\r')" "x-served-by: native-worker"
+F=$(nj -X POST -A 'Agent/2' -b 'k=a%3Db' --data 'a=1&b[]=x&b[]=y&e.f=g' "$BASE/form")
+eq "native: form parsed by PHP" "$(echo "$F" | jget 'json.dumps(d["post"], sort_keys=True)')" '{"a": "1", "b": ["x", "y"], "e_f": "g"}'
+eq "native: cookies and headers" "$(echo "$F" | jget 'd["cookies"]["k"] + " " + d["agent"]')" "a=b Agent/2"
+U=$(nj -X POST -F "f[]=@$WORK/up.bin" -F t=1 "$BASE/upload")
+eq "native: uploads arrive intact" "$(echo "$U" | jget '" ".join(d["uploads"])')" "$SUM"
+eq "native: uploads removed after the request" "$(for _ in 1 2 3 4; do nj "$BASE/after" | jget 'd["tmp_files"]'; done | sort -u)" 0
+eq "native: raw body readable" "$(nj -X POST -H 'Content-Type: application/json' --data '{"j":2}' "$BASE/json" | jget 'd["raw"]')" '{"j":2}'
+eq "native: flush() streams" "$(nj "$BASE/stream")" "one,two,three"
+eq "native: fatal error mid-request -> 502" "$(code "${N[@]}" "$BASE/fatal")" 502
+eq "native: replacement worker serves next request" "$(code "${N[@]}" "$BASE/hello")" 200
+C=$( (for i in $(seq 30); do [ $((i % 5)) = 0 ] && p=leave || p=sleep; echo "$p"; done) | xargs -P 6 -I{} curl -s -o /dev/null -w '%{http_code}\n' "${N[@]}" "$BASE/{}?s=0.05" | sort | uniq -c | tr -s ' ' | tr '\n' ' ')
+eq "native: workers leaving their loop lose no request" "$C" " 30 200 "
+eq "native: stuck worker -> 504 after timeout" "$(code -m 20 "${N[@]}" "$BASE/sleep?s=30")" 504
+eq "native: site recovers after a stuck worker" "$(code "${N[@]}" "$BASE/hello")" 200
+PIDS=$(for _ in $(seq 45); do nj "$BASE/hello" | jget 'd["pid"]'; done | sort -u | wc -l)
+check "native: workers recycled after max_requests" [ "$PIDS" -ge 3 ]
 
 section "Live reload (SIGHUP)"
 CONF=config/nova.toml

@@ -161,11 +161,18 @@ fn php_workers_spec(cfg: &Config, site: &SiteConfig, mode: Effective) -> Result<
         state.join("tmp").display().to_string(),
         "--grace".into(),
         cfg.server.shutdown_grace_secs.max(1).to_string(),
+        "--max-requests".into(),
+        php.max_requests.to_string(),
     ];
     if cfg.mode.is_dev() {
         // A booted application keeps its code: restart workers on changes.
         command.push("--watch".into());
         command.push(site.path.display().to_string());
+    }
+    let frankenphp = php.effective_worker_api() == nova_config::WorkerApi::Frankenphp;
+    if frankenphp {
+        // Workers on NOVA's extension announce when they wait for a request.
+        command.push("--ready".into());
     }
     command.push("--".into());
     command.push("php".into());
@@ -178,7 +185,6 @@ fn php_workers_spec(cfg: &Config, site: &SiteConfig, mode: Effective) -> Result<
     } else {
         site.path.join(script)
     };
-    let frankenphp = php.effective_worker_api() == nova_config::WorkerApi::Frankenphp;
     if frankenphp {
         // NOVA's PHP extension provides frankenphp_handle_request().
         command.push("-d".into());

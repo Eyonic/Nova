@@ -71,6 +71,12 @@ enum Command {
         /// Restart workers when PHP code below this directory changes.
         #[arg(long)]
         watch: Option<PathBuf>,
+        /// Replace a worker after this many requests (0: never).
+        #[arg(long, default_value_t = 0)]
+        max_requests: u64,
+        /// Workers announce when they wait for a request (NOVA's PHP extension).
+        #[arg(long)]
+        ready: bool,
         #[arg(last = true, required = true)]
         command: Vec<std::ffi::OsString>,
     },
@@ -166,6 +172,8 @@ fn main() -> ExitCode {
             tmp,
             grace,
             watch,
+            max_requests,
+            ready,
             command,
         } => tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -180,6 +188,8 @@ fn main() -> ExitCode {
                         tmp_dir: tmp,
                         grace: Duration::from_secs(grace),
                         watch,
+                        max_requests,
+                        ready,
                     },
                 ))
                 .context("php-workers")

@@ -95,7 +95,6 @@ impl Sites {
                     nova_runtime_php::WorkerPool::new(
                         php_worker_socket(cfg, s),
                         vec![cfg.site_uid(s), own],
-                        p.max_requests,
                         cfg.mode.is_dev(),
                         !frankenphp,
                         frankenphp,
