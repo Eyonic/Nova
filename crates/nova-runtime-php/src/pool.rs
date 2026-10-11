@@ -135,7 +135,7 @@ impl Slot {
 
 /// Peek without blocking: a closed connection reads EOF, a live idle one
 /// has nothing to read (FPM never sends unsolicited data).
-fn alive(stream: &UnixStream) -> bool {
+pub(crate) fn alive(stream: &UnixStream) -> bool {
     let mut b = 0u8;
     // SAFETY: valid fd, one-byte buffer, non-blocking peek.
     let n = unsafe {

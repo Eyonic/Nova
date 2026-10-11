@@ -38,6 +38,8 @@ pub struct SitePhp {
     pub micro_cache_grace: Duration,
     /// Kept-alive FastCGI connections to this site's FPM pool.
     pub pool: std::sync::Arc<nova_runtime_php::Pool>,
+    /// Worker mode: booted application workers for front-controller requests.
+    pub worker: Option<std::sync::Arc<nova_runtime_php::WorkerPool>>,
 }
 
 pub struct Sites {
@@ -78,6 +80,17 @@ impl Sites {
                     .then(|| Duration::from_secs(p.micro_cache_secs)),
                 micro_cache_grace: Duration::from_secs(p.micro_cache_grace_secs),
                 pool: nova_runtime_php::Pool::new(php_socket(cfg, s), p.max_children),
+                worker: p.worker.as_ref().map(|_| {
+                    // SAFETY: getuid has no preconditions.
+                    let own = unsafe { libc::getuid() };
+                    nova_runtime_php::WorkerPool::new(
+                        php_worker_socket(cfg, s),
+                        vec![cfg.site_uid(s), own],
+                        p.max_requests,
+                        cfg.mode.is_dev(),
+                        &s.name,
+                    )
+                }),
             });
             for h in &s.hosts {
                 by_host.insert(h.to_ascii_lowercase(), i);
@@ -114,6 +127,25 @@ impl Sites {
         self.sites.get(idx)
     }
 
+    /// Start listening for worker-mode PHP workers (in the serving process).
+    pub fn listen_workers(&self) -> std::io::Result<()> {
+        for s in &self.sites {
+            if let Some(w) = s.php.as_ref().and_then(|p| p.worker.as_ref()) {
+                w.listen().map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "site {:?}: listening on {}: {e}",
+                            s.name,
+                            w.socket().display()
+                        ),
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &Site> {
         self.sites.iter()
     }
@@ -140,6 +172,11 @@ pub fn php_run_dir(cfg: &Config, site: &SiteConfig) -> PathBuf {
 
 pub fn php_socket(cfg: &Config, site: &SiteConfig) -> PathBuf {
     php_run_dir(cfg, site).join("fpm.sock")
+}
+
+/// Where NOVA listens for the site's worker-mode PHP workers.
+pub fn php_worker_socket(cfg: &Config, site: &SiteConfig) -> PathBuf {
+    php_run_dir(cfg, site).join("worker.sock")
 }
 
 /// Generated FPM configuration (root-owned, world-readable, no secrets).

@@ -279,6 +279,67 @@ jit_buffer = "64MiB"
 Startup-only settings (`opcache.*`, `realpath_cache*`) can be overridden per
 site in `[site.php.ini]`; they are passed to that site's master.
 
+### PHP worker mode (opt-in)
+
+FPM boots the application for every request; for Laravel that is most of
+the time spent. In worker mode the application stays booted in
+long-running PHP processes that answer request after request:
+
+```toml
+[site.php]
+front_controller = "index.php"
+worker = "vendor/laravel/octane/bin/roadrunner-worker"   # composer require laravel/octane spiral/roadrunner-http spiral/roadrunner-cli
+max_children = 8          # workers
+max_requests = 10000      # each worker is replaced after this many requests
+```
+
+NOVA speaks the RoadRunner worker protocol (goridge frames over the
+worker's stdin/stdout, JSON request context), so anything written for
+RoadRunner runs unchanged: Laravel Octane's RoadRunner worker, Symfony with
+`runtime/roadrunner-symfony-nyholm`, Spiral, Yii, Mezzio or a plain
+`spiral/roadrunner-http` loop. No RoadRunner binary is involved.
+
+Measured on Laravel 13 (8 workers, same machine, uncompressed responses):
+
+| | JSON route | welcome page (70 KB) |
+|---|---:|---:|
+| NOVA + PHP-FPM | 2 270 req/s | 2 170 req/s |
+| RoadRunner 3.0 + Octane | 7 090 req/s | 5 210 req/s |
+| **NOVA worker mode + Octane** | **8 220 req/s** | **6 090 req/s** |
+
+How it works and what NOVA adds:
+
+* Only front-controller requests go to the workers; other `.php` files
+  still run in FPM, and the micro-cache, tag purges, NOVA Live, compression
+  and HTML features apply to worker responses as to any PHP response.
+* A per-site manager (`nova php-workers`) runs as the site's uid inside its
+  Landlock sandbox, like FPM, and keeps the workers alive. It connects to a
+  socket NOVA listens on; NOVA accepts only the site's uid (`SO_PEERCRED`).
+* Form bodies (`application/x-www-form-urlencoded`, `multipart/form-data`)
+  are parsed with PHP's own rules (`a[b][]`, `max_input_vars`,
+  `max_file_uploads`) inside the sandbox; uploads go to a private temp
+  directory per worker and are deleted after the request, including the
+  copies Symfony's PSR-7 bridge makes (which leak under RoadRunner).
+* A worker that exceeds `timeout_secs` is killed and replaced (504); one
+  that crashes is replaced (502), with backoff only if it dies before
+  serving anything. A client that disconnects does not cost a worker: the
+  response is read to the end and the worker reused.
+* `max_requests` recycles workers gracefully; reloads (SIGHUP) keep idle
+  workers warm and move them to the new NOVA process; no request is lost
+  (a request that crosses a closing connection is retried, as it never ran).
+* In development mode workers restart automatically when PHP code, `.env` or
+  `composer.lock` change (polled once a second), because a booted
+  application never sees new code otherwise.
+* The workers get FPM's limits: `memory_limit`, `disable_functions`,
+  `open_basedir` (when the kernel sandbox is optional), OPcache + JIT.
+  `max_execution_time` is not used (it would count the whole worker life);
+  NOVA's timeout replaces it.
+
+Worker mode keeps application state between requests: code must not leak
+per-request state into globals or singletons (Octane documents the rules).
+WordPress and other classic PHP apps are not built for that; keep them on
+FPM (the default), where they are unaffected.
+
 ### PHP micro-cache (opt-in)
 
 ```toml

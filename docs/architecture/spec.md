@@ -88,6 +88,20 @@ Sections: `[server]`, `[paths]`, `[php]`, `[optimize]`,
   generated names and referenced as `env[KEY] = $NOVA_POOL_<SITE>_<KEY>`,
   so no secret is written to disk and each pool sees only its own.
 
+* **Worker mode** (`[site.php] worker`, opt-in): front-controller requests
+  go to long-running workers instead of FPM. NOVA (`worker.rs`) listens on
+  `/run/nova/php/<site>/worker.sock` (dir mode 0730 so the worker uid can
+  create it; peers must be the site uid); the per-site manager
+  `nova php-workers` (`manager.rs`), started by the supervisor like a
+  `[[site.worker]]` under the site uid and sandbox, runs `max_children` PHP
+  CLI workers (`RR_RELAY=pipes`) and relays goridge frames (`goridge.rs`)
+  between each worker and its own connection. One request per connection
+  at a time; idle connections are LIFO (warm workers first). Form bodies
+  are parsed in the manager (`form.rs`). Timeout or crash → the connection
+  closes and the manager replaces the worker; `{"stop":true}` control
+  frames recycle workers (`max_requests`) and announce a closing idle
+  connection so NOVA can retry a request that never ran.
+
 ## 4a. Site isolation
 
 Configured under `[isolation]` (global) and `[site.isolation]` (per site).

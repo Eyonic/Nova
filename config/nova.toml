@@ -117,3 +117,18 @@ path = "/srv/sites/showcase"
 
 [site.php]
 max_children = 4
+
+# Worker mode: the application stays booted between requests. worker.php
+# speaks the RoadRunner protocol by hand; for Laravel use
+# worker = "vendor/laravel/octane/bin/roadrunner-worker".
+[[site]]
+name = "worker"
+hosts = ["worker.localhost"]
+path = "/srv/sites/worker"
+
+[site.php]
+front_controller = "index.php"
+worker = "worker.php"
+max_children = 2
+max_requests = 20
+timeout_secs = 2

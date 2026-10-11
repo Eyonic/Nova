@@ -121,6 +121,10 @@ pub fn start_all(cfg: &Config, mode: Effective) -> Result<Tasks> {
                 grace,
             )));
         }
+        if let Some(spec) = php_workers_spec(cfg, site, mode)? {
+            tracing::info!(site = site.name, "PHP worker mode started");
+            handles.push(tokio::spawn(run_worker(spec, stop_rx.clone(), grace)));
+        }
         for w in &site.workers {
             for i in 0..w.processes {
                 let mut spec = spec(cfg, site, mode, &w.name, &w.command)?;
@@ -133,6 +137,56 @@ pub fn start_all(cfg: &Config, mode: Effective) -> Result<Tasks> {
         }
     }
     Ok(Tasks { stop, handles })
+}
+
+/// Worker mode: `nova php-workers` (sandboxed, as the site) keeping
+/// `max_children` booted PHP workers connected to NOVA.
+fn php_workers_spec(cfg: &Config, site: &SiteConfig, mode: Effective) -> Result<Option<ProcSpec>> {
+    let Some(php) = site.php.as_ref().filter(|p| p.enabled) else {
+        return Ok(None);
+    };
+    let Some(script) = &php.worker else {
+        return Ok(None);
+    };
+    let nova = std::env::current_exe().context("locating the nova binary")?;
+    let state = sites::site_state_dir(cfg, site);
+    let mut command: Vec<String> = vec![
+        nova.display().to_string(),
+        "php-workers".into(),
+        "--socket".into(),
+        sites::php_worker_socket(cfg, site).display().to_string(),
+        "--processes".into(),
+        php.max_children.to_string(),
+        "--tmp".into(),
+        state.join("tmp").display().to_string(),
+        "--grace".into(),
+        cfg.server.shutdown_grace_secs.max(1).to_string(),
+    ];
+    if cfg.mode.is_dev() {
+        // A booted application keeps its code: restart workers on changes.
+        command.push("--watch".into());
+        command.push(site.path.display().to_string());
+    }
+    command.push("--".into());
+    command.push("php".into());
+    for (k, v) in php::worker_ini(cfg, site) {
+        command.push("-d".into());
+        command.push(format!("{k}={v}"));
+    }
+    command.push(site.path.join(script).display().to_string());
+    let mut spec = spec(cfg, site, mode, "php-workers", &command)?;
+    spec.env
+        .insert("APP_BASE_PATH".into(), site.path.display().to_string());
+    if script.contains("laravel/octane") {
+        spec.env.insert("LARAVEL_OCTANE".into(), "1".into());
+    }
+    // These are web workers even though PHP_SAPI is "cli": without this,
+    // Symfony picks its CLI error renderer, which prints full exception
+    // details into production responses.
+    spec.env
+        .entry("APP_RUNTIME_MODE".into())
+        .or_insert_with(|| "web=1&worker=1".into());
+    Ok(Some(spec))
 }
 
 fn spawn(spec: &ProcSpec) -> std::io::Result<Child> {

@@ -649,6 +649,12 @@ pub struct SitePhpConfig {
     /// After expiry, keep serving a cached page for this long while one
     /// request refreshes it, and whenever PHP fails (stale-if-error).
     pub micro_cache_grace_secs: u64,
+    /// Worker mode: a RoadRunner-compatible worker script, relative to the
+    /// project (e.g. `vendor/laravel/octane/bin/roadrunner-worker`). The
+    /// application stays booted in `max_children` long-running workers and
+    /// serves every front-controller request; other `.php` files still run
+    /// in FPM. Each worker is replaced after `max_requests`.
+    pub worker: Option<String>,
 }
 
 impl Default for SitePhpConfig {
@@ -664,6 +670,7 @@ impl Default for SitePhpConfig {
             ini: BTreeMap::new(),
             micro_cache_secs: 0,
             micro_cache_grace_secs: 10,
+            worker: None,
         }
     }
 }
@@ -815,6 +822,18 @@ impl Config {
                     errs.push(format!(
                         "site {n:?}: php.front_controller must be a relative .php path"
                     ));
+                }
+                if let Some(w) = &php.worker {
+                    if w.is_empty() || w.starts_with('/') || w.contains("..") {
+                        errs.push(format!(
+                            "site {n:?}: php.worker must be a path inside the project"
+                        ));
+                    }
+                    if php.front_controller.is_none() {
+                        errs.push(format!(
+                            "site {n:?}: php.worker needs php.front_controller (the requests it serves)"
+                        ));
+                    }
                 }
                 for (k, v) in &php.ini {
                     if !k

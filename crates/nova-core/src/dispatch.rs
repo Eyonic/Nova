@@ -855,35 +855,75 @@ impl App {
             Version::HTTP_3 => "HTTP/3.0",
             _ => "HTTP/1.1",
         };
-        let params = nova_runtime_php::build_params(&CgiRequest {
-            method: parts.method.as_str(),
-            request_uri,
-            query: parts.uri.query().unwrap_or(""),
-            script_name,
-            script_filename: script,
-            path_info,
-            document_root: &site.root,
-            server_name: strip_port(host),
-            server_port,
-            server_protocol: protocol,
-            remote_addr: SocketAddr::new(client.ip, 0),
-            https: client.https,
-            headers: &parts.headers,
-            content_length,
-            request_id: id,
-        });
-
-        let result = nova_runtime_php::execute_pooled(
-            PhpRequest {
-                socket: php.socket.clone(),
-                params,
-                body: stream,
-                header_timeout: php.timeout + Duration::from_secs(5),
-                site: site.name.clone(),
-            },
-            &php.pool,
-        )
-        .await;
+        let worker = php
+            .worker
+            .as_ref()
+            .filter(|_| php.front_controller.as_deref() == Some(script_name));
+        let result = match worker {
+            Some(pool) => {
+                // Workers take the whole body in one frame.
+                let mut stream = stream;
+                let mut body = bytes::BytesMut::new();
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(c) => body.extend_from_slice(&c),
+                        Err(e) => {
+                            return self.error(
+                                if e.kind() == io::ErrorKind::TimedOut {
+                                    StatusCode::REQUEST_TIMEOUT
+                                } else {
+                                    StatusCode::BAD_REQUEST
+                                },
+                                "Could not read request body.",
+                                None,
+                            );
+                        }
+                    }
+                }
+                let scheme = if client.https { "https" } else { "http" };
+                pool.execute(nova_runtime_php::WorkerRequest {
+                    method: parts.method.as_str(),
+                    uri: format!("{scheme}://{host}{request_uri}"),
+                    query: parts.uri.query().unwrap_or(""),
+                    protocol,
+                    remote_addr: client.ip.to_string(),
+                    headers: &parts.headers,
+                    body: body.freeze(),
+                    timeout: php.timeout + Duration::from_secs(5),
+                })
+                .await
+            }
+            None => {
+                let params = nova_runtime_php::build_params(&CgiRequest {
+                    method: parts.method.as_str(),
+                    request_uri,
+                    query: parts.uri.query().unwrap_or(""),
+                    script_name,
+                    script_filename: script,
+                    path_info,
+                    document_root: &site.root,
+                    server_name: strip_port(host),
+                    server_port,
+                    server_protocol: protocol,
+                    remote_addr: SocketAddr::new(client.ip, 0),
+                    https: client.https,
+                    headers: &parts.headers,
+                    content_length,
+                    request_id: id,
+                });
+                nova_runtime_php::execute_pooled(
+                    PhpRequest {
+                        socket: php.socket.clone(),
+                        params,
+                        body: stream,
+                        header_timeout: php.timeout + Duration::from_secs(5),
+                        site: site.name.clone(),
+                    },
+                    &php.pool,
+                )
+                .await
+            }
+        };
         let micros = started.elapsed().as_micros() as u64;
 
         let r = match result {
@@ -1732,6 +1772,7 @@ mod tests {
                 micro_cache: None,
                 micro_cache_grace: Duration::ZERO,
                 pool: nova_runtime_php::Pool::new("/nonexistent", 2),
+                worker: None,
             }),
             proxy: None,
             optimize: false,

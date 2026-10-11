@@ -2436,9 +2436,13 @@ name = "nova-runtime-php"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "crc32fast",
  "futures-util",
  "http",
  "libc",
+ "memchr",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

@@ -26,6 +26,7 @@ dropping a request, and shuts down gracefully.
 |---|---|---|
 | Static sites, SPAs, build output (Vite, Mix, Hugo, Astro static) | **yes** | served directly, optimized |
 | PHP (Laravel, Symfony, WordPress, plain PHP) | **yes** | supervised PHP-FPM per site over FastCGI |
+| PHP worker mode (Laravel Octane, Symfony Runtime, any RoadRunner worker) | **yes** | `[site.php] worker`: booted application, 2.8-3.6x FPM on Laravel |
 | Node.js, Python (ASGI/WSGI server), Go, Ruby, Java or any other HTTP app server | **yes** | `[site.proxy]`: reverse proxy over HTTP/1.1, static files still served by NOVA |
 | WebSocket backends | **yes** | tunneled through `[site.proxy]` |
 | gRPC backends, load balancing across several upstreams | **no** | one HTTP/1.1 upstream per site |
@@ -60,6 +61,7 @@ compose
 │   ├── nova serve          supervisor (root, 6 caps): ownership, process lifecycle
 │   ├── nova worker         uid 10001, no caps, Landlock: HTTP(S)/QUIC, routing, static, optimizer, ACME
 │   ├── php-fpm × site      one master per site, own uid, Landlock sandbox, FastCGI over unix sockets
+│   ├── php-workers × site  worker mode only: booted PHP workers, same uid and sandbox
 │   └── tasks/workers       per site: cron tasks and queue workers, same uid and sandbox as its PHP
 └── db (MariaDB 11.8)       one database + user per site
 volumes: nova-state (variants, sessions), db-data

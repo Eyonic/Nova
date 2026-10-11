@@ -314,6 +314,40 @@ has "live metrics exported" "$(curl -s "$BASE/_nova/metrics")" "nova_live_publis
 # State left by another identity (e.g. from shared mode) must be re-owned on start.
 dc exec -T nova sh -c 'touch /var/lib/nova/sites/showcase/sessions/sess_legacy && chown 10001:10001 /var/lib/nova/sites/showcase/sessions/sess_legacy'
 
+section "PHP worker mode"
+W=(-H "Host: worker.localhost")
+wj() { curl -s "${W[@]}" "$@"; }
+jget() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1]))" "$1"; }
+A=$(wj "$BASE/hello?x=1")
+B=$(wj "$BASE/hello")
+eq "worker answers the front controller" "$(echo "$A" | jget 'd["uri"]')" "http://worker.localhost/hello?x=1"
+eq "application stays booted (same process, state kept)" "$(echo "$A" | jget 'd["pid"]') $(( $(echo "$A" | jget 'd["served"]') + 1 ))" "$(echo "$B" | jget 'd["pid"]') $(echo "$B" | jget 'd["served"]')"
+eq "other scripts still run in FPM" "$(wj "$BASE/fpm.php")" "fpm fpm-fcgi"
+F=$(wj -X POST -A 'Agent/1' -b 'k=a%3Db; k=dup' --data 'a=1&b[]=x&b[]=y&c[d][]=z&e.f=g' "$BASE/form")
+eq "form body parsed like PHP" "$(echo "$F" | jget 'json.dumps(d["post"], sort_keys=True)')" '{"a": "1", "b": ["x", "y"], "c": {"d": ["z"]}, "e_f": "g"}'
+eq "cookies decoded, first one wins" "$(echo "$F" | jget 'd["cookies"]["k"]')" "a=b"
+eq "headers passed" "$(echo "$F" | jget 'd["agent"]')" "Agent/1"
+head -c 200000 /dev/urandom > "$WORK/up.bin"
+U=$(wj -X POST -F "f[]=@$WORK/up.bin" -F "f[]=@$WORK/up.bin" -F t=1 "$BASE/upload")
+SUM=$(md5sum < "$WORK/up.bin" | cut -d' ' -f1)
+eq "uploads arrive intact" "$(echo "$U" | jget '" ".join(d["uploads"])')" "$SUM $SUM"
+eq "uploads removed after the request" "$(wj "$BASE/after" | jget 'd["tmp_files"]')" 0
+eq "raw JSON body passed unparsed" "$(wj -X POST -H 'Content-Type: application/json' --data '{"j":1}' "$BASE/json" | jget 'd["raw"]')" '{"j":1}'
+eq "streamed response" "$(wj "$BASE/stream")" "one,two,three"
+eq "worker error frame -> 500" "$(code "${W[@]}" "$BASE/error")" 500
+eq "worker exit -> 502" "$(code "${W[@]}" "$BASE/die")" 502
+eq "replacement worker serves next request" "$(code "${W[@]}" "$BASE/hello")" 200
+BEFORE_PID=$(wj "$BASE/hello" | jget 'd["pid"]')
+eq "stuck worker -> 504 after timeout" "$(code -m 20 "${W[@]}" "$BASE/sleep?s=30")" 504
+eq "site recovers after a stuck worker" "$(code "${W[@]}" "$BASE/hello")" 200
+PIDS=$(for _ in $(seq 45); do wj "$BASE/hello" | jget 'd["pid"]'; done | sort -u | wc -l)
+check "workers recycled after max_requests" [ "$PIDS" -ge 3 ]
+C=$(seq 40 | xargs -P 8 -I{} curl -s -o /dev/null -w '%{http_code}\n' "${W[@]}" "$BASE/sleep?s=0.05" | sort | uniq -c | tr -s ' ' | tr '\n' ' ')
+eq "concurrent requests queue for the 2 workers" "$C" " 40 200 "
+WPS=$(dc exec -T nova sh -c 'for p in /proc/[0-9]*; do c=$(tr "\0" " " < $p/cmdline 2>/dev/null); case "$c" in "php "*worker.php*) awk "/^Uid:/{print \$2}" $p/status;; esac; done' | sort -u)
+SITE_UID=$(dc exec -T nova sh -c 'stat -c %u /var/lib/nova/sites/worker')
+eq "PHP workers run as the site user" "$WPS" "$SITE_UID"
+
 section "Live reload (SIGHUP)"
 CONF=config/nova.toml
 cp "$CONF" "$WORK/nova.toml.orig"

@@ -96,6 +96,42 @@ pub fn master_ini(cfg: &Config, site: &SiteConfig) -> BTreeMap<String, String> {
     ini
 }
 
+/// `php -d` settings for worker-mode PHP: the FPM master's startup
+/// settings plus what FPM sets per pool (`php_admin_value`), so a worker
+/// runs under the same limits. `max_execution_time` stays 0: it would
+/// count the worker's whole life; NOVA's timeout replaces a stuck worker.
+pub fn worker_ini(cfg: &Config, site: &SiteConfig) -> BTreeMap<String, String> {
+    let mut ini = master_ini(cfg, site);
+    ini.insert("opcache.enable_cli".into(), "1".into());
+    if let Ok(Some(p)) = pool_spec(cfg, site) {
+        // No sys_temp_dir / upload_tmp_dir: the manager gives each worker a
+        // private TMPDIR below the site's tmp (see nova_runtime_php::manager).
+        if p.open_basedir {
+            ini.insert(
+                "open_basedir".into(),
+                format!("{}:{}", p.project_dir.display(), p.state_dir.display()),
+            );
+        }
+        ini.insert(
+            "session.save_path".into(),
+            p.state_dir.join("sessions").display().to_string(),
+        );
+        ini.insert("memory_limit".into(), p.memory_limit);
+        ini.insert("max_execution_time".into(), "0".into());
+        ini.insert("upload_max_filesize".into(), p.upload_max.clone());
+        ini.insert("post_max_size".into(), p.upload_max);
+        ini.insert("disable_functions".into(), p.disable_functions.join(","));
+        ini.insert("expose_php".into(), "0".into());
+        ini.insert("log_errors".into(), "1".into());
+        ini.insert(
+            "display_errors".into(),
+            if p.display_errors { "stderr" } else { "0" }.into(),
+        );
+        ini.extend(p.ini);
+    }
+    ini
+}
+
 /// `nova sandbox <site policy> --`: the prefix every site process runs behind.
 pub fn sandbox_wrapper(cfg: &Config, site: &SiteConfig, nova: &std::path::Path) -> Vec<OsString> {
     let mut wrapper: Vec<OsString> = vec![nova.as_os_str().to_owned(), "sandbox".into()];

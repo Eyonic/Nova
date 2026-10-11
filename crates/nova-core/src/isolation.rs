@@ -112,9 +112,13 @@ pub fn prepare_dirs(cfg: &Config, mode: Effective) -> Result<()> {
         if n > 0 {
             tracing::info!(site = site.name, uid, changed = n, "re-owned site state");
         }
-        // Only the site (owner) and the worker (group, traverse only) can reach the socket.
+        // Only the site (owner) and the worker (group, traverse only) can
+        // reach the socket. In worker mode the worker also creates the
+        // socket the site's PHP workers connect to (group write).
         let rdir = sites::php_run_dir(cfg, site);
-        ensure_dir(&rdir, uid, wgid, 0o710).with_context(|| ctx(&rdir))?;
+        let worker_mode = site.php.as_ref().is_some_and(|p| p.worker.is_some());
+        let mode = if worker_mode { 0o730 } else { 0o710 };
+        ensure_dir(&rdir, uid, wgid, mode).with_context(|| ctx(&rdir))?;
     }
     Ok(())
 }

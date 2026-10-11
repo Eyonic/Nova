@@ -57,6 +57,23 @@ enum Command {
         #[arg(last = true, required = true)]
         command: Vec<std::ffi::OsString>,
     },
+    /// Internal: keep a site's worker-mode PHP workers connected to NOVA.
+    #[command(hide = true, name = "php-workers")]
+    PhpWorkers {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        processes: u32,
+        #[arg(long)]
+        tmp: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        grace: u64,
+        /// Restart workers when PHP code below this directory changes.
+        #[arg(long)]
+        watch: Option<PathBuf>,
+        #[arg(last = true, required = true)]
+        command: Vec<std::ffi::OsString>,
+    },
     /// Probe the readiness endpoint of a running instance (for container health checks).
     Health {
         /// Address to probe; defaults to the configured listen port on loopback.
@@ -143,6 +160,32 @@ fn main() -> ExitCode {
             require,
             command,
         } => sandbox_exec(read, write, connect, bind, require, command),
+        Command::PhpWorkers {
+            socket,
+            processes,
+            tmp,
+            grace,
+            watch,
+            command,
+        } => tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("nova-php-workers")
+            .build()
+            .map_err(anyhow::Error::from)
+            .and_then(|rt| {
+                rt.block_on(nova_runtime_php::manager::run(
+                    nova_runtime_php::manager::ManagerOptions {
+                        socket,
+                        processes,
+                        command,
+                        tmp_dir: tmp,
+                        grace: Duration::from_secs(grace),
+                        watch,
+                    },
+                ))
+                .context("php-workers")
+            }),
         Command::Optimize => load(&cli.config).and_then(|cfg| {
             let _log = init_logging(Mode::Development);
             runtime()?.block_on(optimize(cfg))
