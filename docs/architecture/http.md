@@ -535,6 +535,26 @@ any other response. An unreachable upstream gives `502`, a slow one `504`
 (both use the site's error pages). The worker's Landlock policy is widened
 by exactly the upstream ports.
 
+### Several upstreams (load balancing)
+
+```toml
+[site.proxy]
+upstreams = ["http://app1:8000", "http://app2:8000", "http://app3:8000"]
+balance = "least_conn"        # default; or "round_robin"
+health_path = "/health"       # optional active check (GET, 5xx or no answer = down)
+health_interval_secs = 5
+fail_timeout_secs = 10        # rest after a failed connection
+```
+
+Requests go to the upstream with the fewest requests in flight (ties in
+turn). An upstream that refuses a connection is skipped for
+`fail_timeout_secs`; with `health_path` it stays out until a check passes
+again. A `GET`/`HEAD` without a body that could not reach its upstream is
+sent once more to another one (it never arrived, so this is safe); other
+requests fail with `502` rather than risk running twice. When every
+upstream is down NOVA still tries the one that failed first. Killing one
+of three backends under load in the lab cost no request (200/200).
+
 ## Reload without downtime
 
 ```sh

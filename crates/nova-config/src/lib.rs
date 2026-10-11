@@ -10,7 +10,7 @@ pub mod cron;
 pub mod http;
 
 pub use http::{
-    AcmeChallenge, CacheRule, CertFiles, Cidr, ForwardedHeader, RateLimitConfig, Redirect,
+    AcmeChallenge, Balance, CacheRule, CertFiles, Cidr, ForwardedHeader, RateLimitConfig, Redirect,
     SiteAuth, SiteCache, SiteProxy, TlsConfig, glob_match,
 };
 use serde::{Deserialize, Serialize};

@@ -29,7 +29,8 @@ dropping a request, and shuts down gracefully.
 | PHP worker mode (Laravel Octane, Symfony Runtime, any RoadRunner worker) | **yes** | `[site.php] worker = "laravel"` (built in) or a RoadRunner worker: booted application, 3-4x FPM |
 | Node.js, Python (ASGI/WSGI server), Go, Ruby, Java or any other HTTP app server | **yes** | `[site.proxy]`: reverse proxy over HTTP/1.1, static files still served by NOVA |
 | WebSocket backends | **yes** | tunneled through `[site.proxy]` |
-| gRPC backends, load balancing across several upstreams | **no** | one HTTP/1.1 upstream per site |
+| Load balancing across several upstreams | **yes** | `[site.proxy] upstreams`: least connections or round robin, passive + active health checks, safe retry |
+| gRPC backends | **no** | upstreams speak HTTP/1.1 |
 
 ```toml
 [site.proxy]

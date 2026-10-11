@@ -328,6 +328,7 @@ async fn run_worker(
     }
     let sites = Sites::new(&cfg).map_err(anyhow::Error::msg)?;
     sites.listen_workers()?;
+    sites.start_health_checks();
     let (stop_tx, stop_rx) = watch::channel(false);
 
     let optimizer = optimizer_for(&cfg);

@@ -492,14 +492,14 @@ impl App {
         let proxied = site.proxy.as_ref().filter(|p| p.matches(req.uri().path()));
         let target = match proxied {
             Some(p) if !p.static_first => {
-                return (self.proxy(p, req, client).await, Kind::Proxy, name);
+                return (self.proxy(site, p, req, client).await, Kind::Proxy, name);
             }
             _ => resolve_target(site, &safe, req.uri().query()).await,
         };
         if let Some(p) = proxied
             && !matches!(target, Target::Static(..))
         {
-            return (self.proxy(p, req, client).await, Kind::Proxy, name);
+            return (self.proxy(site, p, req, client).await, Kind::Proxy, name);
         }
         match target {
             Target::Redirect(location) => {
@@ -1331,27 +1331,75 @@ impl App {
 
     async fn proxy(
         &self,
+        site: &Site,
         p: &nova_config::SiteProxy,
         req: Request<ReqBody>,
         client: Client,
     ) -> Response<Body> {
-        let base = p.upstream.trim_end_matches('/');
         let timeout = Duration::from_secs(p.timeout_secs);
-        match crate::upstream::forward(&self.upstream, base, req, client, timeout).await {
+        let Some(balancer) = &site.balancer else {
+            return self.error(StatusCode::BAD_GATEWAY, "No upstream configured.", None);
+        };
+        // A request without a body can be sent again if its upstream turns
+        // out to be unreachable (it never got it); others go out once.
+        let retry = (matches!(*req.method(), Method::GET | Method::HEAD)
+            && req.body().is_end_stream()
+            && !req.headers().contains_key(header::UPGRADE)
+            && balancer.backends().len() > 1)
+            .then(|| {
+                (
+                    req.method().clone(),
+                    req.uri().clone(),
+                    req.headers().clone(),
+                    req.version(),
+                )
+            });
+        let Some((index, lease)) = balancer.pick(None) else {
+            return self.error(StatusCode::BAD_GATEWAY, "No upstream configured.", None);
+        };
+        let mut result =
+            crate::upstream::forward(&self.upstream, &lease.backend.base, req, client, timeout)
+                .await;
+        if let Err(crate::upstream::ProxyError::Unavailable(e)) = &result {
+            lease.failed();
+            tracing::warn!(upstream = lease.backend.base, error = %e, "upstream unreachable");
+            if let Some((method, uri, headers, version)) = retry
+                && let Some((_, second)) = balancer.pick(Some(index))
+            {
+                let mut again = Request::new(
+                    http_body_util::Empty::new()
+                        .map_err(|never| match never {})
+                        .boxed(),
+                );
+                *again.method_mut() = method;
+                *again.uri_mut() = uri;
+                *again.headers_mut() = headers;
+                *again.version_mut() = version;
+                result = crate::upstream::forward(
+                    &self.upstream,
+                    &second.backend.base,
+                    again,
+                    client,
+                    timeout,
+                )
+                .await;
+                if matches!(result, Err(crate::upstream::ProxyError::Unavailable(_))) {
+                    second.failed();
+                }
+            }
+        }
+        match result {
             Ok(resp) => resp,
             Err(crate::upstream::ProxyError::Timeout) => self.error(
                 StatusCode::GATEWAY_TIMEOUT,
                 "The application did not respond in time.",
                 None,
             ),
-            Err(crate::upstream::ProxyError::Unavailable(e)) => {
-                tracing::warn!(upstream = base, error = %e, "upstream request failed");
-                self.error(
-                    StatusCode::BAD_GATEWAY,
-                    "The application is not available.",
-                    Some(e),
-                )
-            }
+            Err(crate::upstream::ProxyError::Unavailable(e)) => self.error(
+                StatusCode::BAD_GATEWAY,
+                "The application is not available.",
+                Some(e),
+            ),
         }
     }
 
@@ -1836,6 +1884,7 @@ mod tests {
                 worker: None,
             }),
             proxy: None,
+            balancer: None,
             optimize: false,
             html_rewrite: false,
             speculation_rules: false,

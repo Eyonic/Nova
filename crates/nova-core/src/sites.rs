@@ -15,6 +15,8 @@ pub struct Site {
     pub php: Option<SitePhp>,
     /// `[site.proxy]`: application server behind this site.
     pub proxy: Option<nova_config::SiteProxy>,
+    /// The proxy's upstreams and their health.
+    pub balancer: Option<std::sync::Arc<crate::upstream::Balancer>>,
     pub optimize: bool,
     pub html_rewrite: bool,
     pub speculation_rules: bool,
@@ -107,6 +109,10 @@ impl Sites {
                 project_dir,
                 php,
                 proxy: s.proxy.clone(),
+                balancer: s
+                    .proxy
+                    .as_ref()
+                    .map(|p| std::sync::Arc::new(crate::upstream::Balancer::new(p))),
                 optimize: s.optimize,
                 html_rewrite: s.html_rewrite,
                 speculation_rules: s.speculation_rules,
@@ -128,6 +134,20 @@ impl Sites {
             .and_then(|h| self.by_host.get(&h).copied())
             .or(self.default)?;
         self.sites.get(idx)
+    }
+
+    /// Start the proxies' active health checks (in the serving process).
+    pub fn start_health_checks(&self) {
+        for s in &self.sites {
+            if let (Some(p), Some(b)) = (&s.proxy, &s.balancer)
+                && let Some(path) = &p.health_path
+            {
+                tokio::spawn(std::sync::Arc::clone(b).check_health(
+                    path.clone(),
+                    Duration::from_secs(p.health_interval_secs.max(1)),
+                ));
+            }
+        }
     }
 
     /// Start listening for worker-mode PHP workers (in the serving process).

@@ -403,8 +403,16 @@ pub(crate) fn validate_site(site: &crate::SiteConfig, errs: &mut Vec<String>) {
         }
     }
     if let Some(p) = &site.proxy {
-        if let Err(e) = p.upstream_addr() {
+        if let Err(e) = p.upstream_addrs() {
             errs.push(format!("site {n:?}: [site.proxy] {e}"));
+        }
+        if p.health_path
+            .as_deref()
+            .is_some_and(|h| !h.starts_with('/') || h.contains(char::is_whitespace))
+        {
+            errs.push(format!(
+                "site {n:?}: [site.proxy] health_path must be a path like /health"
+            ));
         }
         if p.paths.is_empty() {
             errs.push(format!("site {n:?}: [site.proxy] paths must not be empty"));
@@ -433,7 +441,24 @@ pub(crate) fn validate_site(site: &crate::SiteConfig, errs: &mut Vec<String>) {
 #[serde(deny_unknown_fields)]
 pub struct SiteProxy {
     /// `http://host:port`, e.g. `http://127.0.0.1:3000` or `http://app:8000`.
+    #[serde(default)]
     pub upstream: String,
+    /// Several application servers (instead of `upstream`): requests are
+    /// balanced across those that are up.
+    #[serde(default)]
+    pub upstreams: Vec<String>,
+    /// `least_conn` (default: fewest requests in flight) or `round_robin`.
+    #[serde(default)]
+    pub balance: Balance,
+    /// Optional active health check: `GET` this path on every upstream
+    /// every `health_interval_secs`; a 5xx or no answer takes it out.
+    #[serde(default)]
+    pub health_path: Option<String>,
+    #[serde(default = "default_health_interval")]
+    pub health_interval_secs: u64,
+    /// After a failed connection an upstream gets no requests for this long.
+    #[serde(default = "default_fail_timeout")]
+    pub fail_timeout_secs: u64,
     /// URL path globs sent upstream; the rest is served by NOVA.
     #[serde(default = "default_proxy_paths")]
     pub paths: Vec<String>,
@@ -446,6 +471,22 @@ pub struct SiteProxy {
     pub timeout_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Balance {
+    #[default]
+    LeastConn,
+    RoundRobin,
+}
+
+fn default_health_interval() -> u64 {
+    5
+}
+
+fn default_fail_timeout() -> u64 {
+    10
+}
+
 fn default_proxy_paths() -> Vec<String> {
     vec!["/**".into()]
 }
@@ -455,31 +496,51 @@ fn default_proxy_timeout() -> u64 {
 }
 
 impl SiteProxy {
+    /// Every configured upstream base URL (`upstreams`, or `upstream`).
+    pub fn upstream_list(&self) -> Vec<&str> {
+        if self.upstreams.is_empty() {
+            vec![self.upstream.as_str()]
+        } else {
+            self.upstreams.iter().map(String::as_str).collect()
+        }
+    }
+
+    /// `(host, port)` of every upstream.
+    pub fn upstream_addrs(&self) -> Result<Vec<(String, u16)>, String> {
+        if !self.upstream.is_empty() && !self.upstreams.is_empty() {
+            return Err("set either upstream or upstreams, not both".into());
+        }
+        self.upstream_list()
+            .into_iter()
+            .map(parse_upstream)
+            .collect()
+    }
+
     /// `(host, port)` of `upstream`; only plain `http://host:port[/]`.
     pub fn upstream_addr(&self) -> Result<(String, u16), String> {
-        let rest = self
-            .upstream
-            .strip_prefix("http://")
-            .ok_or_else(|| format!("upstream {:?} must start with http://", self.upstream))?;
-        let authority = rest.trim_end_matches('/');
-        if authority.contains('/') || authority.contains('@') || authority.is_empty() {
-            return Err(format!(
-                "upstream {:?} must be http://host:port",
-                self.upstream
-            ));
-        }
-        let (host, port) = authority
-            .rsplit_once(':')
-            .ok_or_else(|| format!("upstream {:?} needs an explicit port", self.upstream))?;
-        let port: u16 = port
-            .parse()
-            .map_err(|_| format!("upstream {:?} has an invalid port", self.upstream))?;
-        Ok((host.trim_matches(['[', ']']).to_string(), port))
+        parse_upstream(&self.upstream)
     }
 
     pub fn matches(&self, path: &str) -> bool {
         self.paths.iter().any(|g| glob_match(g, path))
     }
+}
+
+fn parse_upstream(upstream: &str) -> Result<(String, u16), String> {
+    let rest = upstream
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("upstream {upstream:?} must start with http://"))?;
+    let authority = rest.trim_end_matches('/');
+    if authority.contains('/') || authority.contains('@') || authority.is_empty() {
+        return Err(format!("upstream {:?} must be http://host:port", upstream));
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| format!("upstream {:?} needs an explicit port", upstream))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("upstream {:?} has an invalid port", upstream))?;
+    Ok((host.trim_matches(['[', ']']).to_string(), port))
 }
 
 /// Default `server.admin_allow`: loopback and private networks.
@@ -531,6 +592,11 @@ mod tests {
     fn proxy_upstreams() {
         let p = |u: &str| SiteProxy {
             upstream: u.into(),
+            upstreams: vec![],
+            balance: Balance::LeastConn,
+            health_path: None,
+            health_interval_secs: 5,
+            fail_timeout_secs: 10,
             paths: vec!["/api/**".into()],
             static_first: true,
             timeout_secs: 60,

@@ -15,7 +15,9 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use nova_http::{Body, ReqBody};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 pub type HttpClient = Client<HttpConnector, ReqBody>;
 
@@ -179,6 +181,149 @@ pub async fn forward(
     ))
 }
 
+/// The upstreams of one site's `[site.proxy]` and their health.
+#[derive(Debug)]
+pub struct Balancer {
+    backends: Vec<Backend>,
+    balance: nova_config::Balance,
+    fail_timeout: Duration,
+    next: AtomicUsize,
+}
+
+#[derive(Debug)]
+pub struct Backend {
+    pub base: String,
+    in_flight: AtomicUsize,
+    /// Not chosen before this instant (failed connection or health check).
+    down_until: Mutex<Option<Instant>>,
+}
+
+/// A chosen upstream; counts as in flight until dropped.
+pub struct Lease<'a> {
+    pub backend: &'a Backend,
+    balancer: &'a Balancer,
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        self.backend.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Lease<'_> {
+    /// The upstream could not be reached: rest it for `fail_timeout`.
+    pub fn failed(&self) {
+        self.balancer
+            .mark_down(self.backend, self.balancer.fail_timeout);
+    }
+}
+
+impl Balancer {
+    pub fn new(p: &nova_config::SiteProxy) -> Self {
+        Balancer {
+            backends: p
+                .upstream_list()
+                .into_iter()
+                .map(|u| Backend {
+                    base: u.trim_end_matches('/').to_string(),
+                    in_flight: AtomicUsize::new(0),
+                    down_until: Mutex::new(None),
+                })
+                .collect(),
+            balance: p.balance,
+            fail_timeout: Duration::from_secs(p.fail_timeout_secs.max(1)),
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn backends(&self) -> &[Backend] {
+        &self.backends
+    }
+
+    fn up(b: &Backend, now: Instant) -> bool {
+        b.down_until.lock().unwrap().is_none_or(|t| now >= t)
+    }
+
+    fn mark_down(&self, b: &Backend, for_: Duration) {
+        *b.down_until.lock().unwrap() = Some(Instant::now() + for_);
+    }
+
+    /// Bring an upstream back (its health check passed).
+    pub fn mark_up(&self, b: &Backend) {
+        *b.down_until.lock().unwrap() = None;
+    }
+
+    /// Choose an upstream, skipping `exclude` (an index already tried).
+    /// When none is up, the one that went down first is tried anyway:
+    /// better a request that may fail than none at all.
+    pub fn pick(&self, exclude: Option<usize>) -> Option<(usize, Lease<'_>)> {
+        let n = self.backends.len();
+        let now = Instant::now();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        let candidates = (0..n)
+            .map(|i| (start + i) % n)
+            .filter(|&i| Some(i) != exclude);
+        let up: Vec<usize> = candidates
+            .clone()
+            .filter(|&i| Self::up(&self.backends[i], now))
+            .collect();
+        let chosen = if up.is_empty() {
+            candidates.min_by_key(|&i| *self.backends[i].down_until.lock().unwrap())?
+        } else {
+            match self.balance {
+                nova_config::Balance::RoundRobin => up[0],
+                // Fewest in flight; ties go round-robin (iteration order).
+                nova_config::Balance::LeastConn => *up
+                    .iter()
+                    .min_by_key(|&&i| self.backends[i].in_flight.load(Ordering::Relaxed))
+                    .unwrap(),
+            }
+        };
+        let backend = &self.backends[chosen];
+        backend.in_flight.fetch_add(1, Ordering::Relaxed);
+        Some((
+            chosen,
+            Lease {
+                backend,
+                balancer: self,
+            },
+        ))
+    }
+
+    /// Active health checks (`health_path`) until the process ends.
+    pub async fn check_health(self: std::sync::Arc<Self>, path: String, every: Duration) {
+        let client = http_client();
+        loop {
+            for b in &self.backends {
+                let ok = async {
+                    let req = Request::get(format!("{}{path}", b.base))
+                        .header(header::USER_AGENT, "nova-health-check")
+                        .body(http_body_util::Empty::new().map_err(|n| match n {}).boxed())
+                        .ok()?;
+                    let resp = tokio::time::timeout(Duration::from_secs(2), client.request(req))
+                        .await
+                        .ok()?
+                        .ok()?;
+                    Some(!resp.status().is_server_error())
+                }
+                .await
+                .unwrap_or(false);
+                let was_up = Self::up(b, Instant::now());
+                if ok {
+                    self.mark_up(b);
+                } else {
+                    // Down until the next check that passes.
+                    self.mark_down(b, Duration::from_secs(3600));
+                }
+                if ok != was_up {
+                    tracing::warn!(upstream = b.base, healthy = ok, "upstream health changed");
+                }
+            }
+            tokio::time::sleep(every).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +446,64 @@ mod tests {
         drop(closed);
         let err = forward(&client, &dead, req(&[]), peer(), Duration::from_secs(5)).await;
         assert!(matches!(err, Err(ProxyError::Unavailable(_))));
+    }
+
+    fn proxy(ups: &[&str], balance: nova_config::Balance) -> nova_config::SiteProxy {
+        nova_config::SiteProxy {
+            upstream: String::new(),
+            upstreams: ups.iter().map(|u| u.to_string()).collect(),
+            balance,
+            health_path: None,
+            health_interval_secs: 5,
+            fail_timeout_secs: 10,
+            paths: vec!["/**".into()],
+            static_first: true,
+            timeout_secs: 60,
+        }
+    }
+
+    #[test]
+    fn balancing_and_failover() {
+        use nova_config::Balance;
+        let b = Balancer::new(&proxy(
+            &["http://a:1", "http://b:1", "http://c:1"],
+            Balance::LeastConn,
+        ));
+        // Three requests in flight land on three different upstreams.
+        let l1 = b.pick(None).unwrap();
+        let l2 = b.pick(None).unwrap();
+        let l3 = b.pick(None).unwrap();
+        let mut used = [l1.0, l2.0, l3.0];
+        used.sort();
+        assert_eq!(used, [0, 1, 2]);
+        // b is busier: the next request avoids it.
+        drop(l1);
+        drop(l3);
+        let next = b.pick(None).unwrap();
+        assert_ne!(next.0, l2.0);
+        drop((l2, next));
+
+        // A failed upstream is skipped, and never chosen for a retry.
+        let (i, lease) = b.pick(None).unwrap();
+        lease.failed();
+        drop(lease);
+        for _ in 0..10 {
+            let (j, _l) = b.pick(None).unwrap();
+            assert_ne!(i, j);
+        }
+        let (k, _l) = b.pick(Some((i + 1) % 3)).unwrap();
+        assert!(k != i && k != (i + 1) % 3);
+
+        // All down: still try one (the earliest to fail) instead of none.
+        for bk in b.backends() {
+            b.mark_down(bk, Duration::from_secs(60));
+        }
+        assert!(b.pick(None).is_some());
+
+        // Round robin cycles through all.
+        let rr = Balancer::new(&proxy(&["http://a:1", "http://b:1"], Balance::RoundRobin));
+        let a = rr.pick(None).unwrap().0;
+        let c = rr.pick(None).unwrap().0;
+        assert_ne!(a, c);
     }
 }

@@ -187,7 +187,8 @@ pub fn worker_sandbox(cfg: &Config, config_path: &std::path::Path) -> Sandbox {
     connect.extend(
         cfg.sites
             .iter()
-            .filter_map(|s| s.proxy.as_ref()?.upstream_addr().ok())
+            .filter_map(|s| s.proxy.as_ref()?.upstream_addrs().ok())
+            .flatten()
             .map(|(_, port)| port),
     );
     let mut bind = vec![cfg.server.listen.port()];
