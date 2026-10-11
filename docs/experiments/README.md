@@ -37,6 +37,7 @@ clearly better (or a deliberate trade-off). Stable baseline: tag
 | 21 | OPcache file cache for worker cold starts | new CLI workers recompile the framework (recycle every 50: 535 req/s) | local x1 | PHP writes no file cache while the JIT is on; recycles are rare at max_requests 10,000, so steady-state JIT wins | rejected |
 | 22 | Least-recently-used worker selection (FIFO) instead of most-recently-used | idea: frameworks work after responding, so the warm worker may still be busy | local x2 (c=1/4/32) | c=1: 0.67 ms (LIFO) vs 2.4 ms (FIFO); welcome page c=32: 6,017 vs 5,526 req/s | rejected (keep LIFO) |
 | 23 | zstd first for on-the-fly compression (brotli stays first for precompressed files) | microbench on real 70 KB pages: br q5 1.2 ms, zstd 3 0.12 ms, +12% bytes; Cloudflare prefers zstd for dynamic content | microbench, local Laravel x3, Unraid x3 (Chrome Accept-Encoding) | Laravel welcome page (worker mode) 1,030 -> 4,700 req/s; Unraid phpinfo +14%; uncached WordPress unchanged (PHP-bound) | kept |
+| 24 | Compression window sized to the body (known length, else 512 KiB) instead of brotli 4 MiB / zstd 2 MiB | in-server brotli cost 5x the microbenchmark: a fresh multi-MiB window per response means page faults and zeroing | local Laravel x3 (br-only and Chrome Accept-Encoding) | brotli (Safari) 1,000 -> 2,230 req/s with identical bytes; zstd +5% | kept |
 
 Considered and skipped this round: `Link: rel=preload` hints without 103
 Early Hints (hyper cannot send 1xx; the browser's preload scanner already

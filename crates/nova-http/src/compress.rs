@@ -228,15 +228,36 @@ pub fn apply(
     }
     // The encoded body replaces the file's bytes: never send the file raw.
     resp.extensions_mut().remove::<hyper::ext::SendFile>();
-    resp.map(|body| encode(body, encoding))
+    resp.map(|body| encode(body, encoding, length))
 }
 
-fn encode(body: Body, encoding: Encoding) -> Body {
+/// Window for on-the-fly compression: the body's size when known, 512 KiB
+/// otherwise. The encoders' defaults (brotli 4 MiB, zstd 2 MiB) gain
+/// nothing on pages but cost a large allocation, page faults included,
+/// on every response.
+fn window_log(length: Option<u64>) -> u32 {
+    match length {
+        Some(l) => (64 - l.max(1).saturating_sub(1).leading_zeros()).clamp(16, 22),
+        None => 19,
+    }
+}
+
+fn encode(body: Body, encoding: Encoding, length: Option<u64>) -> Body {
     let reader = StreamReader::new(body.into_data_stream());
+    let window = window_log(length);
     // Levels tuned for on-the-fly use: close to the best ratio per CPU cycle.
     let encoder: Pin<Box<dyn AsyncRead + Send>> = match encoding {
-        Encoding::Brotli => Box::pin(BrotliEncoder::with_quality(reader, Level::Precise(5))),
-        Encoding::Zstd => Box::pin(ZstdEncoder::with_quality(reader, Level::Precise(3))),
+        Encoding::Brotli => Box::pin(BrotliEncoder::with_params(
+            reader,
+            async_compression::brotli::EncoderParams::default()
+                .quality(Level::Precise(5))
+                .window_size(window as i32),
+        )),
+        Encoding::Zstd => Box::pin(ZstdEncoder::with_quality_and_params(
+            reader,
+            Level::Precise(3),
+            &[async_compression::zstd::CParameter::window_log(window)],
+        )),
         Encoding::Gzip => Box::pin(GzipEncoder::with_quality(reader, Level::Precise(6))),
     };
     let stream = ReaderStream::with_capacity(encoder, 32 * 1024).map_ok(Frame::data);
@@ -286,6 +307,11 @@ mod tests {
         assert_eq!(accepted(Some("identity")), vec![]);
         assert_eq!(accepted(Some("x-gzip")), vec![Gzip]);
         assert_eq!(accepted(Some("*;q=0")), vec![]);
+        assert_eq!(window_log(Some(70_000)), 17);
+        assert_eq!(window_log(Some(65_536)), 16);
+        assert_eq!(window_log(Some(10)), 16);
+        assert_eq!(window_log(Some(100 << 20)), 22);
+        assert_eq!(window_log(None), 19);
         // On the fly, zstd wins ties; explicit q-values still decide.
         assert_eq!(
             accepted_dynamic(Some("gzip, deflate, br, zstd")),
