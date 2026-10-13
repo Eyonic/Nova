@@ -12,6 +12,7 @@
   const controllers = new Map(); // target id -> AbortController of the newest request
   const latest = new Map();      // target id -> number of the newest request
   const busyForms = new WeakSet();
+  const formSeq = new WeakMap(); // latest submission per form (GET forms overlap)
   let requestCounter = 0;
 
   const sameOrigin = (url) => url.origin === location.origin;
@@ -155,7 +156,8 @@
     if (!target) return; // misconfigured: behave like a normal link
     e.preventDefault();
     const push = link.getAttribute('data-nova-history') !== 'false';
-    load(target, url, { source: 'link', push, moveFocus: true }).then((r) => {
+    const moveFocus = link.getAttribute('data-nova-focus') !== 'false';
+    load(target, url, { source: 'link', push, moveFocus }).then((r) => {
       // Anything unexpected: fall back to an ordinary page load.
       if (!r.ok && r.reason !== 'stale' && r.reason !== 'cancelled') location.assign(url.href);
     });
@@ -175,10 +177,17 @@
     if (!sameOrigin(action) || !['GET', 'POST'].includes(method)) return;
 
     e.preventDefault();
-    if (busyForms.has(form)) return; // duplicate submission
-    busyForms.add(form);
+    // POST: ignore re-submission while in flight. GET is a navigation: a
+    // newer submission (e.g. the next filter click) aborts the older one.
+    const guarded = method !== 'GET';
+    if (guarded && busyForms.has(form)) return; // duplicate submission
+    if (guarded) busyForms.add(form);
+    const seq = (formSeq.get(form) || 0) + 1;
+    formSeq.set(form, seq);
     form.setAttribute('aria-busy', 'true');
-    const buttons = Array.from(form.querySelectorAll('button, input[type=submit], input[type=image]')).filter((b) => !b.disabled);
+    const buttons = guarded
+      ? Array.from(form.querySelectorAll('button, input[type=submit], input[type=image]')).filter((b) => !b.disabled)
+      : [];
     buttons.forEach((b) => { b.disabled = true; });
 
     const data = new FormData(form, submitter);
@@ -196,7 +205,7 @@
         method,
         body,
         source: 'form',
-        moveFocus: true,
+        moveFocus: form.getAttribute('data-nova-focus') !== 'false',
         // GET forms are navigations; POST only updates the URL after a redirect (PRG).
         push: historyAttr !== 'false' && method === 'GET',
         // Validation errors (4xx with HTML) are rendered in place.
@@ -215,8 +224,8 @@
       }
     } finally {
       buttons.forEach((b) => { b.disabled = false; });
-      form.removeAttribute('aria-busy');
-      busyForms.delete(form);
+      if (formSeq.get(form) === seq) form.removeAttribute('aria-busy');
+      if (guarded) busyForms.delete(form);
     }
   });
 

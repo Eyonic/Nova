@@ -31,6 +31,7 @@ Status legend: **implemented** (tested), *planned*.
 | `data-nova-target="#id"` | `a`, `form`, submit button | update that region instead of navigating | implemented |
 | `data-nova-history="false"` | link, form | don't push a history entry | implemented |
 | `data-nova-reset` | form | reset after a 2xx response | implemented |
+| `data-nova-focus="false"` | link, form | keep focus where it is (filters, search-as-you-type) | implemented |
 | `data-nova-poll="10s"` | region | refetch periodically (min 2 s, paused in hidden tabs) | implemented |
 | `data-nova-src="/url"` | region | URL to refetch for poll/subscribe (default: current page) | implemented |
 | `data-nova-subscribe="a b"` | region | refetch when the server publishes one of these channels | implemented |
@@ -132,7 +133,9 @@ MariaDB needs a row-based binary log:
   after redirects. Only `text/html` responses are swapped.
 * `<script>` elements in fetched HTML are removed and never run.
 * A newer request for a region aborts the older one; stale responses are discarded.
-* Forms ignore re-submission while a request is in flight.
+* POST forms ignore re-submission while a request is in flight; GET forms
+  are navigations, so a newer submission (the next filter click) aborts the
+  older one and the latest always wins.
 * The runtime initializes once even if included twice; listeners are
   delegated at the document, so swapped-in content needs no re-binding.
 * Focus moves to the updated region after user-initiated updates
@@ -145,11 +148,12 @@ MariaDB needs a row-based binary log:
 ## Tests
 
 * `tests/browser/live.test.mjs` (headless Chromium, `tests/browser/run.sh`):
-  14 tests: region swap without reload, Back/Forward, stale-response race,
+  16 tests: region swap without reload, Back/Forward, stale-response race,
   request headers, 422 validation + focus, duplicate-submit prevention,
   cross-tab update via SSE, polling, multi-node fragments, script stripping,
   cross-origin and non-opted-in targets ignored, non-HTML fallback,
-  double initialization, full functionality with JavaScript disabled.
+  double initialization, full functionality with JavaScript disabled,
+  overlapping GET form submissions (latest wins), focus opt-out.
 * `tests/integration/run.sh` "NOVA Live" section: runtime serving and
   caching, fragment responses, `Vary`, channel validation, CSRF and
   validation in the demo, publish header stripped, cross-site channel

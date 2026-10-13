@@ -237,6 +237,51 @@ await test('without JavaScript everything works as normal links and forms', asyn
   await ctx.close();
 });
 
+/** Add a GET filter form (as a catalog page would have) to the demo. */
+async function addFilterForm(page, attrs = '') {
+  await page.evaluate((attrs) => {
+    const holder = document.createElement('div');
+    holder.innerHTML = `<form id="filter" method="get" action="/live.php" data-nova-target="#products" ${attrs}>
+      <input id="filter-q" name="q"><select name="category">
+      <option>all</option><option>lighting</option><option>textiles</option></select></form>`;
+    document.body.prepend(holder);
+  }, attrs);
+}
+const submitCategory = (page, value) => page.evaluate((value) => {
+  const form = document.getElementById('filter');
+  form.category.value = value;
+  form.requestSubmit();
+}, value);
+
+await test('GET forms: a newer submission replaces one still in flight', async () => {
+  const page = await open();
+  await addFilterForm(page);
+  await page.route('**/live.php?q=&category=lighting', async (route) => {
+    await new Promise((r) => setTimeout(r, 1200));
+    await route.continue().catch(() => {});
+  });
+  await submitCategory(page, 'lighting');
+  await page.waitForTimeout(100);
+  await submitCategory(page, 'textiles'); // must not be dropped as a "duplicate"
+  await page.waitForFunction(() => document.querySelector('#products').innerText.includes('Showing textiles'));
+  await page.waitForTimeout(1500); // the slow, older response must not win afterwards
+  assert((await productsText(page)).includes('Showing textiles'), 'older response overwrote the newer one');
+  assert(new URL(page.url()).searchParams.get('category') === 'textiles', 'URL not updated: ' + page.url());
+  assert(await page.evaluate(() => !document.getElementById('filter').hasAttribute('aria-busy')), 'form still busy');
+  assert(await noReload(page), 'page reloaded');
+  await page.close();
+});
+
+await test('data-nova-focus="false" keeps focus where the user is typing', async () => {
+  const page = await open();
+  await addFilterForm(page, 'data-nova-focus="false"');
+  await page.focus('#filter-q');
+  await submitCategory(page, 'lighting');
+  await page.waitForFunction(() => document.querySelector('#products').innerText.includes('Showing lighting'));
+  assert(await page.evaluate(() => document.activeElement && document.activeElement.id === 'filter-q'), 'focus moved away from the input');
+  await page.close();
+});
+
 await browser.close();
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
