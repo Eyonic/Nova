@@ -397,6 +397,17 @@ async fn route(
 ) {
     let mut r = tokio::io::BufReader::with_capacity(64 << 10, rd);
     while let Ok(f) = goridge::read_frame(&mut r, MAX_FRAME).await {
+        if f.flags & goridge::CONTROL != 0 && f.payload.windows(5).any(|w| w == b"drain") {
+            // The manager is stopping (reload, shutdown): send it nothing new,
+            // but keep reading the answers it still owes on this link.
+            if let Some(pool) = pool.upgrade() {
+                pool.links
+                    .lock()
+                    .unwrap()
+                    .retain(|l| !Arc::ptr_eq(l, &link));
+            }
+            continue;
+        }
         let Some(id) = f.options.get(1).copied() else {
             continue;
         };

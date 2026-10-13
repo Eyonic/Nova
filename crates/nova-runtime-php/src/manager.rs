@@ -28,7 +28,11 @@
 //!   the site's own tmp; each worker gets a private `TMPDIR`, and after a
 //!   request with uploads the copies frameworks make of them (Symfony's
 //!   PSR-7 bridge leaves `symfony*` files behind) are deleted;
-//! * on SIGTERM queued and running requests finish, then workers stop.
+//! * on SIGTERM the manager tells NOVA `{"drain":true}` on every link, so
+//!   no new request is sent to it, keeps serving for [`DRAIN_SETTLE`] (a
+//!   request already on its way still gets an answer), lets queued and
+//!   running requests finish, then stops its workers. A replacement
+//!   manager (configuration reload) takes the new requests meanwhile.
 //!
 //! Frames between NOVA and the manager carry the request id as their
 //! second option (`[header length, id]`); the manager strips it towards
@@ -49,6 +53,9 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 const MAX_FRAME: usize = 1 << 30;
+
+/// After announcing a drain, keep accepting what NOVA had already sent.
+const DRAIN_SETTLE: Duration = Duration::from_millis(500);
 
 /// Connections to NOVA (requests are multiplexed over them).
 const LINKS: usize = 2;
@@ -114,6 +121,8 @@ enum Ev {
     KillIfStill(usize, u64),
     CodeChanged,
     Stop,
+    /// Re-check whether a stopping manager may stop its workers.
+    Tick,
 }
 
 /// Keep one link to NOVA up: connect (retrying while NOVA starts), read
@@ -258,6 +267,8 @@ struct Dispatcher {
     queue: VecDeque<Pending>,
     slots: Vec<Slot>,
     stopping: bool,
+    /// While stopping: workers keep serving until this instant.
+    drain_until: Option<Instant>,
 }
 
 impl Dispatcher {
@@ -289,6 +300,7 @@ impl Dispatcher {
             queue: VecDeque::new(),
             slots,
             stopping: false,
+            drain_until: None,
         }
     }
 
@@ -298,7 +310,15 @@ impl Dispatcher {
         }
         while let Some(ev) = rx.recv().await {
             match ev {
-                Ev::Connected(link, wr) => self.links[link] = Some(wr),
+                Ev::Connected(link, wr) => {
+                    self.links[link] = Some(wr);
+                    if self.stopping {
+                        // Reconnected while draining: this link gets nothing new either.
+                        let mut drain = Frame::control(r#"{"drain":true}"#);
+                        drain.options = vec![0, 0];
+                        self.reply(link, &drain).await;
+                    }
+                }
                 Ev::FromNova(link, f) => self.on_request_frame(link, f).await,
                 Ev::NovaClosed(link) => self.nova_closed(link),
                 Ev::FromWorker(n, generation, f) => {
@@ -332,10 +352,17 @@ impl Dispatcher {
                         }
                     }
                 }
-                Ev::Stop => self.stopping = true,
+                Ev::Stop => {
+                    if !self.stopping {
+                        self.stopping = true;
+                        self.announce_drain().await;
+                    }
+                }
+                Ev::Tick => {}
             }
             self.dispatch().await;
-            if self.stopping {
+            let settled = self.drain_until.is_none_or(|t| Instant::now() >= t);
+            if self.stopping && settled {
                 // Queued requests are served first.
                 for n in 0..self.slots.len() {
                     if matches!(self.slots[n].state, State::Idle { .. })
@@ -475,6 +502,22 @@ impl Dispatcher {
                 *orphan = true;
             }
         }
+    }
+
+    /// Tell NOVA to send no new requests over our links, and come back
+    /// after [`DRAIN_SETTLE`] to stop the workers.
+    async fn announce_drain(&mut self) {
+        let mut drain = Frame::control(r#"{"drain":true}"#);
+        drain.options = vec![0, 0];
+        for link in 0..self.links.len() {
+            self.reply(link, &drain).await;
+        }
+        self.drain_until = Some(Instant::now() + DRAIN_SETTLE);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(DRAIN_SETTLE).await;
+            let _ = tx.send(Ev::Tick);
+        });
     }
 
     async fn reply(&mut self, link: usize, f: &Frame) {

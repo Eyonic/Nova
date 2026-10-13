@@ -360,8 +360,7 @@ async fn reload(rt: &mut Runtime, config_path: &Path) -> Result<()> {
     Sites::new(&cfg).map_err(anyhow::Error::msg)?;
     isolation::prepare_dirs(&cfg, mode)?;
     php::reconcile(&cfg, mode, &mut rt.pools).await?;
-    let old_tasks = std::mem::replace(&mut rt.tasks, tasks::start_all(&cfg, mode)?);
-    old_tasks.stop().await;
+    rt.tasks.reconcile(&cfg, mode).await?;
     rt.cfg = cfg;
     Ok(())
 }

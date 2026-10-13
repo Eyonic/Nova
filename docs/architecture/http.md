@@ -669,10 +669,21 @@ docker compose kill -s HUP nova
 
 The supervisor validates the new file (an invalid one changes nothing),
 reconciles PHP pools (only changed pools restart; FastCGI connects retry for
-3 s meanwhile), restarts tasks and workers, then starts a new HTTP worker on
+3 s meanwhile) and background processes, then starts a new HTTP worker on
 the same ports (`SO_REUSEPORT`). Once it reports ready, the old worker stops
 accepting and drains. Requires strict isolation (NOVA started as root, the
 default in Compose).
+
+Tasks, `[[site.worker]]` processes and worker-mode managers (`worker = ...`)
+are compared by their complete launch specification: unchanged ones keep
+running, so a booted application is not restarted for an unrelated change.
+A changed one starts its replacement first; the old manager then announces
+`{"drain":true}` to NOVA, which sends it nothing new, answers what it already
+received and exits. Measured on a Laravel site in worker mode under load
+(16 concurrent clients): 0 failed requests per reload, including switching
+between FPM and worker mode (previously 16 errors per reload). Clients on
+HTTP/1.1 keep-alive may still see the old worker close an idle connection
+as they reuse it; browsers retry such a request on a new connection.
 
 ## Tracing (OpenTelemetry)
 

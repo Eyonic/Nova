@@ -32,20 +32,99 @@ struct ProcSpec {
     user: Option<(u32, u32)>,
 }
 
-pub struct Tasks {
+/// One running schedule, worker or worker-mode manager.
+struct Unit {
+    /// `site/kind/name`: what a reload compares.
+    key: String,
+    /// Everything it was started from; a change means a restart.
+    fingerprint: String,
     stop: watch::Sender<bool>,
-    handles: Vec<JoinHandle<()>>,
+    handle: JoinHandle<()>,
+}
+
+impl Unit {
+    async fn stop(self) {
+        let _ = self.stop.send(true);
+        let _ = self.handle.await;
+    }
+}
+
+/// What the configuration asks to run.
+#[derive(Debug)]
+enum Plan {
+    Task {
+        spec: ProcSpec,
+        schedule: Schedule,
+        timeout: Duration,
+    },
+    Worker(ProcSpec),
+}
+
+pub struct Tasks {
+    units: Vec<Unit>,
+    grace: Duration,
 }
 
 impl Tasks {
     pub fn is_empty(&self) -> bool {
-        self.handles.is_empty()
+        self.units.is_empty()
     }
 
     /// Stop schedules and workers; running commands get SIGTERM, then SIGKILL.
     pub async fn stop(self) {
-        let _ = self.stop.send(true);
-        futures_util::future::join_all(self.handles).await;
+        futures_util::future::join_all(self.units.into_iter().map(Unit::stop)).await;
+    }
+
+    /// Apply a new configuration: unchanged units keep running (a booted
+    /// PHP worker pool is not restarted for an unrelated change), changed
+    /// ones start their replacement first and are stopped after it, removed
+    /// ones stop. Worker-mode managers drain on SIGTERM while the new one
+    /// takes the requests, so a reload loses none.
+    pub async fn reconcile(&mut self, cfg: &Config, mode: Effective) -> Result<()> {
+        let planned = plan(cfg, mode)?;
+        self.grace = Duration::from_secs(cfg.server.shutdown_grace_secs);
+        let mut keep = Vec::new();
+        let mut retire = Vec::new();
+        for unit in self.units.drain(..) {
+            let same = planned
+                .iter()
+                .any(|(key, fp, _)| *key == unit.key && *fp == unit.fingerprint);
+            if same {
+                keep.push(unit)
+            } else {
+                retire.push(unit)
+            }
+        }
+        for (key, fingerprint, p) in planned {
+            if !keep.iter().any(|u| u.key == key) {
+                tracing::info!(unit = key, "starting (new or changed)");
+                keep.push(start(key, fingerprint, p, self.grace));
+            }
+        }
+        for unit in &retire {
+            tracing::info!(unit = unit.key, "stopping (changed or removed)");
+        }
+        self.units = keep;
+        futures_util::future::join_all(retire.into_iter().map(Unit::stop)).await;
+        Ok(())
+    }
+}
+
+fn start(key: String, fingerprint: String, plan: Plan, grace: Duration) -> Unit {
+    let (stop, stop_rx) = watch::channel(false);
+    let handle = match plan {
+        Plan::Task {
+            spec,
+            schedule,
+            timeout,
+        } => tokio::spawn(run_task(spec, schedule, timeout, stop_rx, grace)),
+        Plan::Worker(spec) => tokio::spawn(run_worker(spec, stop_rx, grace)),
+    };
+    Unit {
+        key,
+        fingerprint,
+        stop,
+        handle,
     }
 }
 
@@ -97,33 +176,30 @@ fn spec(
     })
 }
 
-/// Start every configured task schedule and worker.
-pub fn start_all(cfg: &Config, mode: Effective) -> Result<Tasks> {
-    let (stop, stop_rx) = watch::channel(false);
-    let grace = Duration::from_secs(cfg.server.shutdown_grace_secs);
-    let mut handles = Vec::new();
+/// Every schedule and worker the configuration asks for, with its key and
+/// fingerprint.
+fn plan(cfg: &Config, mode: Effective) -> Result<Vec<(String, String, Plan)>> {
+    let mut out = Vec::new();
+    let mut add = |key: String, plan: Plan| {
+        let fingerprint = format!("{plan:?}");
+        out.push((key, fingerprint, plan));
+    };
     for site in &cfg.sites {
         for t in &site.tasks {
             let schedule: Schedule = t.schedule.parse().map_err(anyhow::Error::msg)?;
             let spec = spec(cfg, site, mode, &t.name, &t.command)?;
             let timeout = Duration::from_secs(t.timeout_secs.max(1));
-            tracing::info!(
-                site = site.name,
-                task = t.name,
-                schedule = t.schedule,
-                "task scheduled"
+            add(
+                format!("{}/task/{}", site.name, t.name),
+                Plan::Task {
+                    spec,
+                    schedule,
+                    timeout,
+                },
             );
-            handles.push(tokio::spawn(run_task(
-                spec,
-                schedule,
-                timeout,
-                stop_rx.clone(),
-                grace,
-            )));
         }
         if let Some(spec) = php_workers_spec(cfg, site, mode)? {
-            tracing::info!(site = site.name, "PHP worker mode started");
-            handles.push(tokio::spawn(run_worker(spec, stop_rx.clone(), grace)));
+            add(format!("{}/php-workers", site.name), Plan::Worker(spec));
         }
         for w in &site.workers {
             for i in 0..w.processes {
@@ -131,12 +207,27 @@ pub fn start_all(cfg: &Config, mode: Effective) -> Result<Tasks> {
                 if w.processes > 1 {
                     spec.name = format!("{}#{i}", w.name);
                 }
-                tracing::info!(site = site.name, worker = spec.name, "worker started");
-                handles.push(tokio::spawn(run_worker(spec, stop_rx.clone(), grace)));
+                add(
+                    format!("{}/worker/{}", site.name, spec.name),
+                    Plan::Worker(spec),
+                );
             }
         }
     }
-    Ok(Tasks { stop, handles })
+    Ok(out)
+}
+
+/// Start every configured task schedule and worker.
+pub fn start_all(cfg: &Config, mode: Effective) -> Result<Tasks> {
+    let grace = Duration::from_secs(cfg.server.shutdown_grace_secs);
+    let units = plan(cfg, mode)?
+        .into_iter()
+        .map(|(key, fingerprint, p)| {
+            tracing::info!(unit = key, "started");
+            start(key, fingerprint, p, grace)
+        })
+        .collect();
+    Ok(Tasks { units, grace })
 }
 
 /// Worker mode: `nova php-workers` (sandboxed, as the site) keeping

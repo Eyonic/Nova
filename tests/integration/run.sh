@@ -397,6 +397,11 @@ curl -s -m 20 "$BASE/slow.php?s=3" > "$WORK/reload-slow" &
 RSLOW=$!
 ( for _ in $(seq 150); do curl -s -o /dev/null -w '%{http_code}\n' "$BASE/"; sleep 0.02; done ) > "$WORK/reload-codes" &
 LOAD=$!
+# A worker-mode site under load at the same time: its booted workers must
+# survive a reload that does not concern them.
+( for _ in $(seq 150); do curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: worker.localhost' "$BASE/"; sleep 0.02; done ) > "$WORK/reload-worker-codes" &
+WLOAD=$!
+WSTARTS=$(dc logs nova 2>&1 | grep 'worker/php-workers' | grep -c 'starting')
 sleep 0.5
 # In-place edit (same inode): the file is bind-mounted into the container.
 python3 - "$CONF" <<'PY'
@@ -408,8 +413,10 @@ PY
 BEFORE=$(dc logs nova 2>&1 | grep -c "configuration reloaded")
 dc kill -s HUP nova >/dev/null 2>&1
 check "reload completed" reloaded $((BEFORE + 1)) "configuration reloaded"
-wait $LOAD; wait $RSLOW
+wait $LOAD; wait $RSLOW; wait $WLOAD
 eq "no failed requests during reload" "$(sort -u "$WORK/reload-codes" | tr '\n' ' ')" "200 "
+eq "worker-mode site: no failed requests during reload" "$(sort -u "$WORK/reload-worker-codes" | tr '\n' ' ')" "200 "
+eq "worker-mode site: workers kept on an unrelated reload" "$(dc logs nova 2>&1 | grep 'worker/php-workers' | grep -c 'starting')" "$WSTARTS"
 eq "in-flight request survived the reload" "$(cat "$WORK/reload-slow")" done
 has "new configuration applied" "$(curl -sI "$BASE/" | tr -d '\r')" "x-reload-test: applied"
 eq "PHP still answers after reload" "$(code "$BASE/info.php")" 200
@@ -419,9 +426,29 @@ dc kill -s HUP nova >/dev/null 2>&1
 check "invalid configuration rejected" reloaded $((REJ + 1)) "reload rejected"
 has "previous configuration keeps serving" "$(curl -sI "$BASE/" | tr -d '\r')" "x-reload-test: applied"
 restore_conf
+# Restoring also changes the worker site's pool: its manager is replaced
+# (new one first, old one drains) while requests keep coming.
+python3 - "$CONF" <<'PY'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+i = s.index('name = "worker"')
+j = s.index('max_requests = 20', i)
+open(p, 'r+').write(s[:j] + 'max_requests = 21' + s[j + len('max_requests = 20'):])
+PY
+( for _ in $(seq 150); do curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: worker.localhost' "$BASE/"; sleep 0.02; done ) > "$WORK/reload-worker-codes2" &
+WLOAD=$!
+sleep 0.5
 BEFORE=$(dc logs nova 2>&1 | grep -c "configuration reloaded")
 dc kill -s HUP nova >/dev/null 2>&1
 check "restored configuration reloaded" reloaded $((BEFORE + 1)) "configuration reloaded"
+wait $WLOAD
+eq "worker-mode site: no failed requests while its workers are replaced" "$(sort -u "$WORK/reload-worker-codes2" | tr '\n' ' ')" "200 "
+check "worker-mode site: changed pool restarted" [ "$(dc logs nova 2>&1 | grep 'worker/php-workers' | grep -c 'starting')" -gt "$WSTARTS" ]
+restore_conf
+BEFORE=$(dc logs nova 2>&1 | grep -c "configuration reloaded")
+dc kill -s HUP nova >/dev/null 2>&1
+reloaded $((BEFORE + 1)) "configuration reloaded"
 hasnt "header gone again" "$(curl -sI "$BASE/" | tr -d '\r')" "x-reload-test"
 
 section "Graceful shutdown"
