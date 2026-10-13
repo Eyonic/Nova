@@ -175,6 +175,20 @@ impl TlsPublic {
     }
 }
 
+/// A request for part of a page (`fetch()`/XHR, NOVA Live) rather than a
+/// navigation: its first images are not at the top of the viewport, so the
+/// rewriter must not treat them as the hero image.
+fn is_fragment_request<B>(req: &Request<B>) -> bool {
+    let h = req.headers();
+    if h.contains_key("nova-live") || h.contains_key("x-requested-with") {
+        return true;
+    }
+    // Sent by every current browser: `document` for navigations.
+    h.get("sec-fetch-dest")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|d| !matches!(d, "document" | "iframe" | "frame" | "embed" | "object"))
+}
+
 /// Marks error responses NOVA generated itself (eligible for site error pages).
 #[derive(Debug, Clone, Copy)]
 struct NovaError;
@@ -233,6 +247,7 @@ impl nova_http::Handler for App {
                 header(header::REFERER),
             )
         };
+        let fragment = is_fragment_request(&req);
         let (mut resp, kind, site) = self.route(req, client, &id).await;
 
         if let Some(site) = site {
@@ -270,7 +285,7 @@ impl nova_http::Handler for App {
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.starts_with("text/html"))
         {
-            resp = self.rewrite_html(site, resp, &uri_path);
+            resp = self.rewrite_html(site, resp, &uri_path, fragment);
         }
         if let Some(opts) = &self.compression {
             resp = compress::apply(resp, &method, accept_encoding.as_deref(), opts);
@@ -1421,7 +1436,13 @@ impl App {
 
     /// `html_rewrite`: stream the page through the `<img>` rewriter with the
     /// site's image metadata from the Optimizer.
-    fn rewrite_html(&self, site: &Site, resp: Response<Body>, path: &str) -> Response<Body> {
+    fn rewrite_html(
+        &self,
+        site: &Site,
+        resp: Response<Body>,
+        path: &str,
+        fragment: bool,
+    ) -> Response<Body> {
         let lookup = self.image_lookup(site);
         let (mut parts, body) = resp.into_parts();
         // The body changes: its length and strong validator no longer apply.
@@ -1439,6 +1460,7 @@ impl App {
         let opts = crate::htmlrewrite::Options {
             images: site.html_rewrite,
             speculation: site.speculation_rules,
+            fragment,
         };
         let body = crate::htmlrewrite::rewrite(body, path.to_string(), opts, lookup);
         Response::from_parts(parts, body)
@@ -1456,6 +1478,7 @@ impl App {
         cache_control: &str,
     ) -> Option<Response<Body>> {
         use std::hash::{Hash, Hasher};
+        let fragment = is_fragment_request(req);
         let generation = self
             .optimizer
             .as_ref()
@@ -1485,6 +1508,7 @@ impl App {
             encoding.map_or("identity", |e| e.token()),
             site.html_rewrite,
             site.speculation_rules,
+            fragment,
         );
         let hit = REWRITE_CACHE.lock().unwrap().get(&key).cloned();
         let (body, etag) = match hit {
@@ -1495,6 +1519,7 @@ impl App {
                 let opts = crate::htmlrewrite::Options {
                     images: site.html_rewrite,
                     speculation: site.speculation_rules,
+                    fragment,
                 };
                 let rewritten = crate::htmlrewrite::rewrite(
                     full(Bytes::from(raw)),
@@ -2290,8 +2315,8 @@ enum Probe {
 /// Unraid's /mnt/user. Entries live [`PROBE_TTL`]; missing paths are never
 /// cached, so new files appear immediately.
 /// Rewritten static HTML, by (file, mtime, length, manifest generation,
-/// encoding, rewrite options): body and ETag.
-type RewriteKey = (PathBuf, u128, u64, u64, &'static str, bool, bool);
+/// encoding, rewrite options, fragment request): body and ETag.
+type RewriteKey = (PathBuf, u128, u64, u64, &'static str, bool, bool, bool);
 static REWRITE_CACHE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<RewriteKey, (Bytes, HeaderValue)>>,
 > = std::sync::LazyLock::new(Default::default);

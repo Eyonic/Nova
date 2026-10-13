@@ -48,6 +48,10 @@ pub struct Options {
     /// Append [`SPECULATION_RULES`] before `</body>` unless the page has
     /// its own `<script type="speculationrules">` (`speculation_rules`).
     pub speculation: bool,
+    /// The response is a fragment fetched into a page (infinite scroll,
+    /// NOVA Live): none of its images is at the top, so all are lazy and
+    /// none gets `fetchpriority="high"`.
+    pub fragment: bool,
 }
 
 /// Rewrite an HTML body. `lookup` maps an image URL path (`/images/a.jpg`)
@@ -60,7 +64,8 @@ pub fn rewrite(
 ) -> Body {
     let out = Arc::new(Mutex::new(Vec::<u8>::new()));
     let sink = Arc::clone(&out);
-    let mut index = 0usize;
+    // A fragment's images all count as below the fold.
+    let mut index = if opts.fragment { EAGER } else { 0 };
     let has_rules = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut handlers = Vec::new();
     if opts.speculation {
@@ -195,6 +200,10 @@ mod tests {
     use nova_http::full;
 
     async fn run(html: &'static str) -> String {
+        run_with(html, false).await
+    }
+
+    async fn run_with(html: &'static str, fragment: bool) -> String {
         let lookup = |p: &str| {
             (p == "/images/a.jpg").then(|| ImageInfo {
                 width: 1600,
@@ -205,6 +214,7 @@ mod tests {
         let opts = Options {
             images: true,
             speculation: true,
+            fragment,
         };
         let body = rewrite(full(html), "/blog/post".into(), opts, lookup);
         String::from_utf8(body.collect().await.unwrap().to_bytes().to_vec()).unwrap()
@@ -230,6 +240,23 @@ mod tests {
             "{out}"
         );
         assert!(imgs.iter().all(|i| i.contains(r#"decoding="async""#)));
+    }
+
+    #[tokio::test]
+    async fn fragments_have_no_hero_image() {
+        // Infinite scroll / NOVA Live: the fragment's first image is far below the fold.
+        let out = run_with(
+            r#"<div><img src="/images/a.jpg"><img src="/images/a.jpg"></div>"#,
+            true,
+        )
+        .await;
+        let imgs: Vec<&str> = out.split("<img").skip(1).collect();
+        assert!(
+            imgs.iter().all(|i| i.contains(r#"loading="lazy""#)),
+            "{out}"
+        );
+        assert!(!out.contains("fetchpriority"), "{out}");
+        assert!(imgs[0].contains(r#"sizes="auto, 100vw""#), "{out}");
     }
 
     #[tokio::test]

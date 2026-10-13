@@ -555,7 +555,11 @@ markup does not set it already: `loading="lazy"` after the first two
 images, `decoding="async"`, `fetchpriority="high"` on the first image,
 `width`/`height` from the Optimizer (no layout shift) and a `srcset` over
 the Optimizer's responsive widths (`sizes="auto, 100vw"` for lazy images).
-`data-nova-keep` leaves an image alone. Sites the Optimizer has no images
+`data-nova-keep` leaves an image alone. Fragments fetched into a page
+(`Sec-Fetch-Dest` other than `document`, `X-Requested-With`, NOVA Live
+requests: infinite scroll, partial updates) have no image at the top of the
+viewport, so all their images are lazy and none gets `fetchpriority`.
+Sites the Optimizer has no images
 for are not parsed at all; on a 70 KB page with images the rewriter costs
 no measurable CPU (lol_html streams it). Static HTML of such sites is
 rewritten and then compressed per response, instead of being served from
